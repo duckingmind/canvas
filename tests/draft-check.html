@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Canvas 本机草稿验证</title>
+<style>
+  body{font:15px/1.7 system-ui;background:#202022;color:#eee;padding:32px;max-width:840px;margin:auto}
+  button{font:inherit;padding:10px 16px;margin:0 8px 12px 0;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}
+</style>
+<h1>本机草稿浏览器验证</h1>
+<p>只读写验证专用 scope。覆盖真实图片与大文档持久化、并发覆盖、scope 隔离和刷新恢复。</p>
+<button id="run">运行 IndexedDB 验证</button>
+<button id="read">读取刷新前的草稿</button>
+<button id="clear">清理验证草稿</button>
+<pre id="result" role="status">正在检查上次验证的草稿…</pre>
+<script type="module">
+import {writeDraft,readDraft,removeDraft} from '../src/draft-store.ts'
+const scope='canvas:test:draft-browser:v1'
+const otherScope=scope+':isolated'
+const output=document.querySelector('#result')
+const assert=(condition,message)=>{if(!condition)throw new Error(message)}
+async function readSaved(){
+  const draft=await readDraft(scope)
+  if(!draft){output.textContent='尚无验证草稿。点击运行验证后可刷新页面检查恢复。';return}
+  assert(draft.revision===2,'恢复了过期版本')
+  assert(draft.nodes[0].image.startsWith('data:image/png;base64,'),'内嵌图片丢失')
+  assert(draft.description.length===6*1024*1024,'大文档内容不完整')
+  output.textContent='PASS：已恢复最后一版草稿（含原图及 6 MiB 内容）。\n保存于：'+draft.savedAt+'\n可再次刷新页面检查持久化。'
+}
+async function run(action){
+  const buttons=[...document.querySelectorAll('button')]
+  buttons.forEach(button=>button.disabled=true)
+  try{await action()}catch(error){output.textContent='FAIL：'+error.message}
+  finally{buttons.forEach(button=>button.disabled=false)}
+}
+document.querySelector('#run').onclick=()=>run(async()=>{
+  output.textContent='正在验证…'
+  const blob=await (await fetch('./fixtures/aspect-ratio.png')).blob()
+  const image=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(blob)})
+  const original={revision:1,nodes:[{id:'draft-test-image',image}],description:'x'.repeat(6*1024*1024),savedAt:new Date().toLocaleString()}
+  const first=writeDraft(scope,original)
+  original.revision=2
+  const second=writeDraft(scope,original)
+  original.revision=99
+  const loaded=readDraft(scope)
+  await Promise.all([first,second])
+  const draft=await loaded
+  assert(draft.revision===2,'并发写入顺序或快照隔离错误')
+  assert(draft.nodes[0].image===image,'图片字节不一致')
+  await writeDraft(otherScope,{title:'独立范围'})
+  await removeDraft(otherScope)
+  assert(await readDraft(otherScope)===null,'草稿移除失败')
+  assert((await readDraft(scope)).revision===2,'移除其他范围影响当前草稿')
+  await readSaved()
+  output.textContent='PASS：并发写入、调用时快照、精确图片恢复、6 MiB 大文档、范围隔离及删除。\n'+output.textContent
+})
+document.querySelector('#read').onclick=()=>run(readSaved)
+document.querySelector('#clear').onclick=()=>run(async()=>{await removeDraft(scope);await removeDraft(otherScope);output.textContent='验证草稿已清理。'})
+run(readSaved)
+</script>
+</html>

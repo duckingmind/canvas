@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dist-electron/
+tests/artifacts/
+*.zip
+.DS_Store
+.proxy-app-build/

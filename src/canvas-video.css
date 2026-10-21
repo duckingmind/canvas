@@ -1,0 +1,148 @@
+/* The media is the surface; controls never add another card or change its size. */
+.canvas-video {
+  --video-ink: #fff;
+  --video-muted: #ffffffb3;
+  --video-control: #161719cc;
+  --video-border: #ffffff29;
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  container-type: inline-size;
+  color: var(--video-ink);
+  background: #09090a;
+  isolation: isolate;
+}
+.canvas-video[data-interactive="false"] { pointer-events: none; }
+.canvas-video .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.canvas-video > video { position: absolute; inset: 0; }
+.canvas-video video:focus-visible { outline: 2px solid var(--video-ink); outline-offset: -4px; }
+.canvas-video button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--video-ink);
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background 160ms ease, opacity 160ms ease, border-color 160ms ease;
+}
+.canvas-video button:hover:not(:disabled) { background: #ffffff24; }
+.canvas-video button:active:not(:disabled) { background: #ffffff38; }
+.canvas-video button:disabled { opacity: .45; cursor: default; }
+.canvas-video button:focus-visible,
+.canvas-video input:focus-visible { outline: 2px solid var(--video-ink); outline-offset: 2px; }
+.canvas-video .canvas-video-replace,
+.node-surface > .canvas-video-replace {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--video-border, #ffffff29);
+  border-radius: 8px;
+  background: var(--video-control, #161719cc);
+  color: #fff;
+  cursor: pointer;
+}
+.canvas-video-controls {
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 32px 12px 10px;
+  background: linear-gradient(transparent, #0008 45%, #000c);
+  opacity: .88;
+  transition: opacity 180ms ease;
+}
+.canvas-video:hover .canvas-video-controls,
+.canvas-video:focus-within .canvas-video-controls,
+.canvas-video.is-paused .canvas-video-controls { opacity: 1; }
+.canvas-video-time { flex: 0 0 auto; white-space: nowrap; font-size: 12px; font-variant-numeric: tabular-nums; line-height: 1; }
+.canvas-video-time > span { color: var(--video-muted); }
+.canvas-video input[type="range"] {
+  display: block;
+  appearance: none;
+  -webkit-appearance: none;
+  min-width: 0;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+  touch-action: none;
+}
+.canvas-video-progress { flex: 1 1 80px; width: 100%; }
+.canvas-video input[type="range"]::-webkit-slider-runnable-track { height: 3px; border-radius: 4px; background: #ffffff4d; }
+.canvas-video .canvas-video-progress::-webkit-slider-runnable-track { background: linear-gradient(to right, #fff var(--video-progress), #ffffff4d var(--video-progress)); }
+.canvas-video input[type="range"]::-moz-range-track { height: 3px; border-radius: 4px; background: #ffffff4d; }
+.canvas-video input[type="range"]::-moz-range-progress { height: 3px; border-radius: 4px; background: #fff; }
+.canvas-video input[type="range"]::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; width: 11px; height: 11px; margin-top: -4px; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px #0005; }
+.canvas-video input[type="range"]::-moz-range-thumb { width: 11px; height: 11px; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px #0005; }
+.canvas-video input:disabled { opacity: .45; cursor: default; }
+.canvas-video-volume { position: relative; flex: 0 0 auto; }
+.canvas-video-volume-popup {
+  position: absolute;
+  bottom: 100%;
+  right: -6px;
+  width: 100px;
+  padding: 8px 12px;
+  border: 1px solid var(--video-border);
+  border-radius: 8px;
+  background: #161719f5;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
+.canvas-video-volume-popup input { width: 100%; }
+.canvas-video-volume:hover .canvas-video-volume-popup,
+.canvas-video-volume:focus-within .canvas-video-volume-popup { opacity: 1; pointer-events: auto; }
+.canvas-video .canvas-video-capture { gap: 6px; padding-inline: 10px; background: #ffffff18; border-color: #ffffff20; font-size: 12px; white-space: nowrap; }
+.canvas-video-loading { position: absolute; inset: 0; display: grid; place-items: center; background: #0002; pointer-events: none; }
+.canvas-video-error { position: absolute; inset: 48px 12px auto; z-index: 3; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; padding: 10px; border: 1px solid var(--video-border); border-radius: 8px; background: #171719f0; font-size: 12px; line-height: 1.6; text-align: center; }
+.canvas-video-diagnostic { flex-basis: 100%; color: var(--video-muted); font-size: 11px; overflow-wrap: anywhere; }
+.canvas-video-error button { gap: 5px; font-size: 12px; }
+/* Node widths, not the browser viewport, determine the control layout. */
+@container (max-width: 440px) {
+  .canvas-video-controls { display: grid; grid-template-columns: 32px minmax(0, 1fr) 32px auto; gap: 2px 6px; padding: 26px 10px 6px; }
+  .canvas-video-progress { grid-column: 1 / -1; grid-row: 1; }
+  .canvas-video-time { justify-self: start; }
+  .canvas-video .canvas-video-capture { padding-inline: 7px; }
+}
+@container (max-width: 260px) {
+  .canvas-video-controls { grid-template-columns: 28px minmax(0, 1fr) 28px 28px; padding-inline: 6px; gap: 2px; }
+  .canvas-video-controls button { min-width: 28px; padding-inline: 4px; }
+  .canvas-video-time { font-size: 10px; }
+  .canvas-video-capture span { display: none; }
+}
+@media (pointer: coarse) {
+  .canvas-video-controls { gap: 4px; }
+  .canvas-video-controls button { min-width: 44px; min-height: 44px; }
+  .canvas-video-error button { min-height: 44px; }
+  .canvas-video input[type="range"] { height: 44px; }
+  .canvas-video .canvas-video-replace { width: 44px; height: 44px; }
+  @container (max-width: 440px) {
+    .canvas-video-controls { grid-template-columns: 44px minmax(0, 1fr) 44px auto; }
+  }
+  @container (max-width: 300px) {
+    .canvas-video-capture span { display: none; }
+    .canvas-video-time { font-size: 10px; }
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .canvas-video *, .node-surface > .canvas-video-replace { transition: none !important; animation: none !important; }
+}

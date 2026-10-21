@@ -1,0 +1,21 @@
+.image-tool-modal.audio-tool-modal { width: min(430px, 100%); }
+.audio-tool-form { gap: 8px; }
+.audio-tool-range-heading, .audio-tool-scale { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 10px; font-variant-numeric: tabular-nums; }
+.audio-tool-range-heading strong { color: #eeeef2; font-size: 11px; font-weight: 600; }
+.audio-tool-range-heading span, .audio-tool-scale { color: #9696a0; }
+.image-tool-form .audio-tool-time-input { display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; gap: 7px; }
+.audio-tool-time-input > span { color: #cfcfd7; }
+.audio-tool-time-input input { width: 100%; min-width: 0; box-sizing: border-box; }
+.audio-tool-time-input button { min-height: 30px; padding: 0 8px; border: 1px solid #494950; border-radius: 5px; background: #29292e; color: #c5c5ce; font-size: 10px; white-space: nowrap; cursor: pointer; }
+.audio-tool-time-input button:hover:not(:disabled) { background: #38383f; color: #fff; }
+.audio-tool-time-input button:disabled { opacity: .5; cursor: not-allowed; }
+.audio-tool-slider { width: 100%; margin: -2px 0 2px; accent-color: #b9bfff; }
+.audio-tool-note { margin: 0; color: #9696a0; font-size: 10px; line-height: 1.5; }
+.audio-tool-progress { display: grid; gap: 6px; margin-top: 4px; color: #c4e4d5; font-size: 11px; }
+.audio-tool-progress > span { display: block; width: 34%; height: 5px; border-radius: 99px; background: #78d5b1; animation: audio-tool-progress 1.2s ease-in-out infinite alternate; }
+.audio-tool-progress small { color: #9999a3; }
+@keyframes audio-tool-progress { from { transform: translateX(0); } to { transform: translateX(190%); } }
+@media (max-width: 420px) {
+  .image-tool-form .audio-tool-time-input { grid-template-columns: 40px minmax(0, 1fr); }
+  .audio-tool-time-input button { grid-column: 2; justify-self: start; }
+}

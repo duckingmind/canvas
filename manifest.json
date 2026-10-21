@@ -1,0 +1,7 @@
+{
+  "schema": "proxy.app/v1",
+  "id": "canvas",
+  "version": "0.2.6",
+  "name": "无限画布",
+  "description": "把素材、提示词以及图片和视频生成任务组织在一个可恢复的创作画布中。"
+}

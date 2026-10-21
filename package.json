@@ -1,0 +1,40 @@
+{
+  "name": "proxy-canvas-app",
+  "private": true,
+  "license": "MIT",
+  "description": "A node-based canvas for organizing creative assets and media generation tasks.",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "proxy-app dev .",
+    "dev:server": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build && node scripts/write-agent-contract.mjs . dist",
+    "validate": "proxy-app validate .",
+    "pack": "proxy-app pack . --output dist/canvas.zip",
+    "test:unit": "node --test tests/*.test.ts",
+    "test": "npm run test:unit",
+    "test:e2e:creator": "node tests/creator-e2e.mjs",
+    "canvas:dev": "npm run dev",
+    "canvas:build": "npm run build",
+    "canvas:validate": "npm run validate",
+    "canvas:pack": "npm run pack"
+  },
+  "dependencies": {
+    "@ducking-mind/proxy-app-sdk": "^0.1.1",
+    "lucide-react": "^0.468.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@ducking-mind/proxy-app-cli": "^0.1.2",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "playwright": "^1.64.1",
+    "typescript": "^5.2.2",
+    "vite": "^8.2.2"
+  }
+}

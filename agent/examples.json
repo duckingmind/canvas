@@ -1,0 +1,239 @@
+[
+  {
+    "capability": "list_documents",
+    "input": {},
+    "output": {
+      "activeDocumentId": "",
+      "documents": [],
+      "nextOffset": null
+    }
+  },
+  {
+    "capability": "read_state",
+    "input": {
+      "limit": 20
+    },
+    "output": {
+      "documentId": "example-document",
+      "name": "示例画布",
+      "revision": "example-session:1",
+      "nodeCount": 0,
+      "edgeCount": 0,
+      "viewport": {
+        "x": 0,
+        "y": 0,
+        "zoom": 1
+      },
+      "offset": 0,
+      "nextOffset": null,
+      "nodes": [],
+      "edges": [],
+      "nextEdgeOffset": null
+    }
+  },
+  {
+    "capability": "create_nodes",
+    "input": {
+      "document_id": "example-document",
+      "expected_revision": "example-session:1",
+      "idempotency_key": "example-create-nodes-1",
+      "nodes": [
+        {
+          "type": "prompt",
+          "title": "示例图片",
+          "text": "用户确认的生成需求",
+          "media_type": "image",
+          "model_id": "replace-with-discovered-model-id"
+        }
+      ]
+    },
+    "output": {
+      "documentId": "example-document",
+      "appliedRevision": "example-session:2",
+      "revision": "example-session:2",
+      "savedLocally": true,
+      "nodeIds": [
+        "example-prompt"
+      ]
+    }
+  },
+  {
+    "capability": "submit_generation",
+    "input": {
+      "document_id": "example-document",
+      "expected_revision": "example-session:2",
+      "idempotency_key": "example-generate-1",
+      "node_id": "example-prompt"
+    },
+    "output": {
+      "documentId": "example-document",
+      "appliedRevision": "example-session:3",
+      "revision": "example-session:3",
+      "savedLocally": true,
+      "nodeId": "example-prompt",
+      "accepted": true,
+      "completed": false
+    }
+  },
+  {
+    "capability": "read_tasks",
+    "input": {},
+    "output": {
+      "documentId": "example-document",
+      "revision": "example-session:4",
+      "tasks": [
+        {
+          "nodeId": "example-prompt",
+          "mediaType": "image",
+          "modelId": "replace-with-discovered-model-id",
+          "imageSettings": null,
+          "videoSettings": null,
+          "status": "completed",
+          "taskId": "example-task",
+          "submissionId": null,
+          "paused": false,
+          "error": null,
+          "resultNodeIds": [
+            "example-prompt"
+          ],
+          "batchId": null,
+          "observedStatus": null,
+          "musicSettings": null,
+          "musicLyrics": null,
+          "audioMode": null,
+          "audioTaskType": null,
+          "voicePreviewText": null,
+          "voiceId": null
+        }
+      ],
+      "nextOffset": null
+    }
+  },
+  {
+    "capability": "configure_generation",
+    "input": {
+      "document_id": "example-document",
+      "expected_revision": "example-session:2",
+      "idempotency_key": "example-configure-1",
+      "node_id": "example-prompt",
+      "image_settings": {
+        "count": 2,
+        "aspect_ratio": "16:9"
+      }
+    }
+  },
+  {
+    "capability": "read_media",
+    "input": {
+      "node_id": "example-result",
+      "byte_offset": 196608,
+      "expected_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  {
+    "capability": "upload_image_chunk",
+    "input": {
+      "document_id": "example-document",
+      "expected_revision": "example-session:2",
+      "idempotency_key": "example-upload-1",
+      "upload_id": "example-image-1",
+      "mime_type": "image/png",
+      "byte_offset": 0,
+      "data_base64": "iVBORw0KGgo="
+    }
+  },
+  {
+    "capability": "import_image",
+    "input": {
+      "document_id": "example-document",
+      "expected_revision": "example-session:2",
+      "idempotency_key": "example-import-1",
+      "upload_id": "example-image-1",
+      "title": "商品参考图"
+    }
+  },
+  {
+    "capability": "resume_generation",
+    "input": {
+      "document_id": "example-document",
+      "expected_revision": "example-session:2",
+      "idempotency_key": "example-resume-1",
+      "node_id": "example-prompt"
+    }
+  },
+  {
+    "capability": "cancel_generation",
+    "input": {
+      "document_id": "example-document",
+      "expected_revision": "example-session:2",
+      "idempotency_key": "example-cancel-1",
+      "node_id": "example-prompt"
+    }
+  },
+  {
+    "capability": "create_nodes",
+    "input": {
+      "document_id": "example-document",
+      "expected_revision": "example-session:5",
+      "idempotency_key": "example-create-music-1",
+      "nodes": [
+        {
+          "type": "prompt",
+          "title": "示例音乐",
+          "text": "用户确认的音乐风格和情绪",
+          "media_type": "audio",
+          "model_id": "replace-with-discovered-music-model-id"
+        }
+      ]
+    }
+  },
+  {
+    "capability": "configure_generation",
+    "input": {
+      "document_id": "example-document",
+      "expected_revision": "example-session:6",
+      "idempotency_key": "example-configure-music-1",
+      "node_id": "example-music-prompt",
+      "music_settings": {
+        "audio_mode": "song",
+        "output_format": "mp3",
+        "lyrics": "用户确认的歌词"
+      }
+    }
+  },
+  {
+    "capability": "read_tasks",
+    "input": {},
+    "output": {
+      "documentId": "example-document",
+      "revision": "example-session:8",
+      "tasks": [
+        {
+          "nodeId": "example-music-prompt",
+          "mediaType": "audio",
+          "modelId": "replace-with-discovered-music-model-id",
+          "imageSettings": null,
+          "videoSettings": null,
+          "musicSettings": {
+            "audio_mode": "song",
+            "output_format": "mp3"
+          },
+          "musicLyrics": "用户确认的歌词",
+          "status": "running",
+          "taskId": "example-music-task",
+          "submissionId": null,
+          "paused": false,
+          "error": null,
+          "resultNodeIds": [],
+          "batchId": null,
+          "observedStatus": "running",
+          "audioMode": "music",
+          "audioTaskType": "music",
+          "voicePreviewText": null,
+          "voiceId": null
+        }
+      ],
+      "nextOffset": null
+    }
+  }
+]

@@ -1,0 +1,377 @@
+.platform-gate-content {
+  position: absolute;
+  inset: 0;
+}
+
+.platform-gate-content[inert] {
+  pointer-events: none;
+  user-select: none;
+}
+
+.platform-gate-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: none;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  border: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: max(24px, env(safe-area-inset-top))
+    max(20px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
+    max(20px, env(safe-area-inset-left));
+  background: var(--canvas);
+  color: var(--text);
+}
+
+.platform-gate-overlay[open] {
+  display: flex;
+}
+
+.platform-gate-overlay.is-returning {
+  background: #111113d9;
+  backdrop-filter: blur(5px);
+}
+
+.platform-gate-card {
+  width: min(100%, 440px);
+  flex-shrink: 0;
+  margin: auto;
+  padding: 32px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  outline: none;
+}
+
+.platform-gate-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.platform-gate-brand > svg {
+  color: var(--accent);
+}
+
+.platform-gate-brand-divider {
+  padding: 0 5px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.platform-gate-heading {
+  margin-top: 28px;
+}
+
+.platform-gate-heading h1 {
+  margin: 0 0 12px;
+  color: var(--text);
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -0.5px;
+}
+
+.platform-gate-heading p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+.platform-gate-benefits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin: 22px 0 28px;
+  padding: 0;
+  list-style: none;
+}
+
+.platform-gate-benefits li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.platform-gate-benefits svg {
+  color: var(--muted);
+}
+
+.platform-gate-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 20px;
+  padding: 12px;
+  border: 1px solid #f29c9c33;
+  border-radius: 10px;
+  background: #f29c9c09;
+  color: var(--danger);
+  font-size: 13px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.platform-gate-error svg {
+  margin-top: 3px;
+}
+
+.platform-gate-error p {
+  margin: 0;
+}
+
+.platform-gate-primary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 48px;
+  margin-top: 24px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+  transition:
+    background-color 160ms ease,
+    opacity 160ms ease;
+}
+
+.platform-gate-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.platform-gate-primary:active:not(:disabled) {
+  background: var(--accent-active);
+}
+
+.platform-gate-primary:disabled {
+  opacity: 0.7;
+}
+
+.platform-gate-secondary {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 12px;
+  padding: 10px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+}
+
+.platform-gate-secondary:hover {
+  background: var(--surface-hover);
+}
+
+.platform-gate-hint {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: center;
+}
+
+.platform-gate-details {
+  margin-top: 20px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.platform-gate-details summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  border-radius: 4px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.platform-gate-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.platform-gate-details summary:hover {
+  color: var(--text);
+}
+
+.platform-gate-details summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.platform-gate-details summary svg {
+  flex-shrink: 0;
+}
+
+.platform-gate-details[open] summary svg {
+  transform: rotate(180deg);
+}
+
+.platform-gate-details p {
+  margin: 0 0 4px;
+  overflow-wrap: anywhere;
+}
+
+.platform-gate-progress {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 48px;
+  margin-top: 24px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.platform-gate-credentials {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.platform-gate-credentials label {
+  display: grid;
+  gap: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.platform-gate-credentials input {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--canvas);
+  color: var(--text);
+  font: inherit;
+  font-weight: 400;
+}
+
+.platform-gate-credentials input::placeholder {
+  color: var(--muted);
+}
+
+.platform-gate-credentials input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.platform-gate-spinner {
+  animation: platform-gate-spin 1s linear infinite;
+}
+
+@keyframes platform-gate-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 480px) {
+  .platform-gate-card {
+    padding: 24px;
+    border-radius: 16px;
+  }
+
+  .platform-gate-heading p,
+  .platform-gate-primary {
+    font-size: 16px;
+  }
+
+  .platform-gate-heading h1 {
+    font-size: 22px;
+  }
+
+  .platform-gate-benefits {
+    gap: 10px 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .platform-gate-primary {
+    transition: none;
+  }
+
+  .platform-gate-spinner {
+    animation: none;
+  }
+}
+
+.platform-gate-dialog {
+  width: min(100%, 440px);
+  margin: auto;
+  outline: none;
+}
+
+/* The platform check only answers whether Workspace may mount. Workspace
+   renders the richer canvas bootstrap animation after admission, so the gate
+   uses a small status pill during this transient phase instead of showing a
+   second full startup card. */
+.platform-gate-dialog.is-checking {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 100%;
+}
+
+.platform-gate-loading-only {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 40px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.platform-gate-loading-only .platform-gate-spinner {
+  flex-shrink: 0;
+  color: var(--text);
+}
+
+.platform-gate-card.is-compact {
+  width: min(100%, 400px);
+  padding: 26px;
+  text-align: left;
+}
+
+.platform-gate-card.is-compact .platform-gate-heading {
+  margin-top: 22px;
+}
+
+.platform-gate-card.is-compact .platform-gate-heading h1 {
+  font-size: 21px;
+}
+
+.platform-gate-card.is-compact .platform-gate-progress {
+  min-height: 32px;
+  margin-top: 20px;
+}

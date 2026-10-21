@@ -1,0 +1,191 @@
+/* Cross-frontend tokens. Brand colors remain local to each app. */
+:root {
+  /* Primitive spacing and geometry */
+  --ui-space-1: 4px;
+  --ui-space-2: 8px;
+  --ui-space-3: 12px;
+  --ui-space-4: 16px;
+  --ui-space-5: 20px;
+  --ui-space-6: 24px;
+  --ui-control-sm: 32px;
+  --ui-control-md: 36px;
+  --ui-control-lg: 40px;
+  --ui-radius-sm: 6px;
+  --ui-radius-control: 8px;
+  --ui-radius-card: 10px;
+  --ui-radius-panel: 12px;
+  --ui-text-xs: 12px;
+  --ui-text-sm: 13px;
+  --ui-text-body: 14px;
+  --ui-text-section: 16px;
+  --ui-text-title: 24px;
+  --ui-line-body: 20px;
+  --ui-line-title: 32px;
+  --ui-line-section: 24px;
+  --ui-motion-fast: 160ms ease;
+
+  /* Semantic defaults. Product shells may override colors, not geometry. */
+  --ui-page-bg: #f8fafc;
+  --ui-surface-bg: #ffffff;
+  --ui-surface-muted-bg: #f8fafc;
+  --ui-border: #e2e8f0;
+  --ui-border-strong: #cbd5e1;
+  --ui-text: #0f172a;
+  --ui-text-muted: #64748b;
+  --ui-focus: #6366f1;
+  --ui-shadow-card: 0 8px 24px rgb(15 23 42 / 0.05);
+}
+
+.ui-app {
+  font-size: var(--ui-text-body);
+  line-height: var(--ui-line-body);
+}
+
+.ui-page {
+  min-width: 0;
+}
+
+.ui-page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--ui-space-4);
+  min-height: var(--ui-control-lg);
+  margin-bottom: var(--ui-space-5);
+}
+
+.ui-page-heading {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--ui-space-1);
+}
+
+.ui-page-title {
+  margin: 0;
+  color: inherit;
+  font-size: var(--ui-text-title);
+  font-weight: 700;
+  line-height: var(--ui-line-title);
+  letter-spacing: 0;
+}
+
+.ui-page-description {
+  margin: 0;
+  font-size: var(--ui-text-sm);
+  line-height: var(--ui-line-body);
+}
+
+.ui-page-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--ui-space-2);
+}
+
+.ui-section-heading {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--ui-space-3);
+}
+
+.ui-section-title {
+  margin: 0;
+  color: inherit;
+  font-size: var(--ui-text-section);
+  font-weight: 600;
+  line-height: var(--ui-line-section);
+  letter-spacing: 0;
+}
+
+.ui-surface {
+  min-width: 0;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-card);
+  background: var(--ui-surface-bg);
+  box-shadow: var(--ui-shadow-card);
+}
+
+.ui-panel {
+  min-width: 0;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-panel);
+  background: var(--ui-surface-bg);
+}
+
+.ui-field-label {
+  display: block;
+  margin-bottom: var(--ui-space-1);
+  color: var(--ui-text-muted);
+  font-size: var(--ui-text-sm);
+  font-weight: 500;
+  line-height: var(--ui-line-body);
+}
+
+.ui-meta {
+  color: var(--ui-text-muted);
+  font-size: var(--ui-text-sm);
+  line-height: var(--ui-line-body);
+}
+
+.ui-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-panel);
+}
+
+.ui-table-wrap table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.ui-table-wrap th {
+  padding: var(--ui-space-2) var(--ui-space-3);
+  font-size: var(--ui-text-xs);
+  font-weight: 600;
+  line-height: var(--ui-line-body);
+}
+
+.ui-table-wrap td {
+  padding: 10px var(--ui-space-3);
+  font-size: var(--ui-text-body);
+  line-height: var(--ui-line-body);
+}
+
+.ui-app :is(button, input, select, textarea):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--ui-focus) 35%, transparent);
+  outline-offset: 2px;
+}
+
+.ui-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ui-space-2);
+  min-height: calc(var(--ui-control-md) + var(--ui-space-2));
+  padding: var(--ui-space-2);
+  border-radius: var(--ui-radius-panel);
+}
+
+@media (max-width: 639px) {
+  .ui-page-header {
+    flex-direction: column;
+    gap: var(--ui-space-3);
+    margin-bottom: var(--ui-space-4);
+  }
+
+  .ui-page-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .ui-section-heading {
+    flex-direction: column;
+  }
+}

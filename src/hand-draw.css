@@ -1,0 +1,24 @@
+.handdraw-presence{display:contents}
+.handdraw-backdrop{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;padding:14px;animation:handdraw-backdrop-in 180ms ease-out both}
+.handdraw-modal{width:min(1180px,100%);height:min(760px,calc(100vh - 28px));background:#1b1b1d;color:#eee;border:1px solid #48484c;border-radius:16px;box-shadow:0 24px 70px #000b;display:flex;flex-direction:column;padding:16px;gap:10px;transform-origin:50% 50%;animation:handdraw-modal-in 180ms cubic-bezier(.2,.8,.2,1) both}
+.handdraw-presence.motion-exit .handdraw-backdrop{animation:handdraw-backdrop-out 180ms ease-in both}
+.handdraw-presence.motion-exit .handdraw-backdrop{pointer-events:none}
+.handdraw-presence.motion-exit .handdraw-modal{animation:handdraw-modal-out 180ms cubic-bezier(.4,0,1,1) both}
+@keyframes handdraw-backdrop-in{from{opacity:0}to{opacity:1}}
+@keyframes handdraw-backdrop-out{from{opacity:1}to{opacity:0}}
+@keyframes handdraw-modal-in{from{opacity:0;transform:scale(.92)}to{opacity:1;transform:scale(1)}}
+@keyframes handdraw-modal-out{from{opacity:1;transform:scale(1)}to{opacity:0;transform:scale(.92)}}
+.handdraw-modal header,.handdraw-modal footer{display:flex;align-items:center;justify-content:space-between}.handdraw-modal h2{font-size:18px;margin:0}.handdraw-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:#111113;border:1px solid #29292c;border-radius:10px;padding:8px}.handdraw-toolgroup,.handdraw-history{display:flex;gap:3px}.handdraw-toolbar button{display:inline-flex;align-items:center;gap:5px;color:#bbb;background:transparent;border:0;border-radius:6px;padding:7px 9px;font-size:12px;cursor:pointer}.handdraw-toolbar button.active,.handdraw-toolbar button:hover{color:#fff;background:#3b3b3f}.handdraw-colors{display:flex;gap:7px}.handdraw-colors button{width:18px;height:18px;padding:0;border-radius:50%;border:2px solid transparent}.handdraw-colors button.active{border-color:#fff;box-shadow:0 0 0 2px #777}.handdraw-size{font-size:11px;color:#aaa;display:flex;align-items:center;gap:6px}.handdraw-size input{width:80px}.handdraw-size span{width:20px}.handdraw-ratios{display:flex;gap:2px}.handdraw-tip{font-size:11px;color:#aaa;background:#2a2a2d;border-radius:6px;padding:7px 9px;display:flex;align-items:center;gap:6px}.handdraw-canvas-wrap{flex:1;min-height:0;background:#050505;border-radius:11px;padding:12px;display:flex;align-items:center;justify-content:center}.handdraw-canvas-wrap canvas{display:block;max-width:100%;max-height:100%;width:auto;height:auto;background:#fff;border-radius:8px;touch-action:none;box-shadow:0 2px 8px #0008}.handdraw-modal footer{font-size:11px;color:#777;padding-top:2px}.handdraw-modal footer>div{display:flex;gap:8px}.handdraw-modal .button{display:inline-flex;align-items:center;gap:5px}.handdraw-modal .button.primary{background:#f0f0f0;color:#111;border-color:#f0f0f0}@media(max-width:640px){.handdraw-modal{padding:10px}.handdraw-toolbar{gap:5px}.handdraw-colors{order:3}.handdraw-ratios{order:4}.handdraw-modal footer span{display:none}}
+.handdraw-canvas-wrap{position:relative}
+.handdraw-text-editor{position:absolute;z-index:2;width:min(230px,calc(100% - 20px));min-height:34px;max-height:150px;padding:6px 8px;border:1px solid #67676b;border-radius:6px;background:#fffffff2;color:#111;box-shadow:0 4px 16px #0004;outline:2px solid #ffffff40;box-sizing:border-box;font:inherit;line-height:1.35;resize:none;overflow:auto;will-change:height}
+.handdraw-text-editor::placeholder{color:#777}
+.handdraw-text-editor:focus{border-color:#333;outline:2px solid #ffffffaa}
+.handdraw-text-editor.is-light{background:#202024f2;color:#fff}
+.handdraw-text-editor.is-light::placeholder{color:#aaa}
+.handdraw-canvas-wrap canvas:focus-visible{outline:2px solid #4d7cff;outline-offset:4px}
+.handdraw-canvas-wrap.is-text-tool canvas{cursor:text}
+.handdraw-canvas-wrap.is-text-tool canvas:active{cursor:grabbing}
+.handdraw-ratio-confirm{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 9px;border:1px solid #6b5940;border-radius:7px;background:#302a22;color:#d8c6a4;font-size:11px}
+.handdraw-ratio-confirm div{display:flex;gap:5px;flex-shrink:0}
+.handdraw-ratio-confirm button{padding:4px 7px;border:1px solid #756346;border-radius:5px;background:transparent;color:#e8d7b5;font-size:10px;cursor:pointer}
+.handdraw-ratio-confirm button:first-child{background:#e7e1d7;color:#202022;border-color:#e7e1d7}

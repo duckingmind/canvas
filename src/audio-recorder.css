@@ -1,0 +1,50 @@
+.audio-recorder {
+  box-sizing: border-box;
+  display: grid;
+  gap: 13px;
+  width: 100%;
+  min-width: 0;
+  padding: 15px;
+  border: 1px solid #3d3d42;
+  border-radius: 12px;
+  background: linear-gradient(145deg, #2a2a2d, #242426 72%);
+  color: #e6e6e9;
+  font: 12px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.audio-recorder * { box-sizing: border-box; }
+.audio-recorder-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.audio-recorder-icon { display: grid; place-items: center; flex: 0 0 36px; width: 36px; height: 36px; border: 1px solid #45454b; border-radius: 10px; background: #333337; color: #dedee4; }
+.audio-recorder-heading { min-width: 0; }
+.audio-recorder-heading h3 { margin: 0; color: #f2f2f4; font-size: 13px; font-weight: 600; }
+.audio-recorder-heading p { margin: 2px 0 0; color: #92929a; font-size: 10px; }
+.audio-recorder-badge { flex: 0 0 auto; margin-left: auto; padding: 4px 7px; border: 1px solid #444449; border-radius: 999px; background: #303034; color: #aaaab2; font-size: 10px; line-height: 1.2; }
+.audio-recorder-badge.is-recording { border-color: #704747; background: #3c292a; color: #f0aaa5; }
+.audio-recorder-clock { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 54px; padding: 7px 10px; border: 1px solid #38383d; border-radius: 9px; background: #202023; color: #f1f1f3; font-size: 23px; font-variant-numeric: tabular-nums; letter-spacing: .04em; }
+.audio-recorder-clock.is-recording { color: #ffb2ad; }
+.audio-recorder-dot { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: #6d6d75; }
+.audio-recorder-clock.is-recording .audio-recorder-dot { background: #e56f68; box-shadow: 0 0 0 4px #e56f6820; animation: audio-recorder-pulse 1.2s ease-in-out infinite; }
+.audio-recorder-limit { align-self: baseline; margin-left: -5px; color: #73737b; font-size: 11px; letter-spacing: 0; }
+.audio-recorder-progress { height: 3px; overflow: hidden; border-radius: 99px; background: #39393e; }
+.audio-recorder-progress > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #9999a2, #e5e5eb); transition: width .15s linear; }
+.audio-recorder-clock.is-recording + .audio-recorder-progress > span { background: linear-gradient(90deg, #b94d49, #f18b83); }
+.audio-recorder-message { min-height: 30px; margin: -3px 0 0; color: #92929a; font-size: 10px; }
+.audio-recorder-message:has(+ .audio-recorder-actions) { min-height: 30px; }
+.audio-recorder-message[aria-live="polite"]:not(:empty) { overflow-wrap: anywhere; }
+.audio-recorder-preview { display: block; width: 100%; height: 36px; accent-color: #d9d9df; }
+.audio-recorder-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 7px; }
+.audio-recorder-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 34px; padding: 0 11px; border: 1px solid #4a4a50; border-radius: 8px; background: #303034; color: #d0d0d5; font: inherit; font-size: 11px; cursor: pointer; transition: background .14s, border-color .14s, color .14s, transform .14s; }
+.audio-recorder-button:hover:not(:disabled) { border-color: #686870; background: #39393e; color: #fff; }
+.audio-recorder-button:active:not(:disabled) { transform: translateY(1px); }
+.audio-recorder-button.is-primary { border-color: #e5e5e9; background: #e5e5e9; color: #1f1f21; font-weight: 600; }
+.audio-recorder-button.is-primary:hover:not(:disabled) { border-color: #fff; background: #fff; color: #111; }
+.audio-recorder-button.is-stop { border-color: #684343; background: #3b292a; color: #efb0aa; }
+.audio-recorder-button.is-stop:hover { border-color: #875654; background: #4a3031; color: #ffd1cc; }
+.audio-recorder-button:disabled { opacity: .48; cursor: not-allowed; }
+.audio-recorder-button:focus-visible { outline: 2px solid #c7c7ce; outline-offset: 2px; }
+
+@keyframes audio-recorder-pulse { 50% { opacity: .5; transform: scale(.82); } }
+@media (prefers-reduced-motion: reduce) {
+  .audio-recorder-clock.is-recording .audio-recorder-dot { animation: none; }
+  .audio-recorder-button, .audio-recorder-progress > span { transition: none; }
+}

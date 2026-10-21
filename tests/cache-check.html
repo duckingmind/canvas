@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Canvas 图片缓存验证</title>
+<style>body{font:16px system-ui;background:#202022;color:#eee;padding:40px}button{padding:12px}pre{white-space:pre-wrap}</style>
+<h1>图片缓存浏览器验证</h1>
+<button id="run">运行真实 IndexedDB 往返验证</button>
+<pre id="result" role="status">尚未运行</pre>
+<script type="module">
+import {storeInlineImages,restoreLocalImages} from '../src/image-cache.ts'
+const output=document.querySelector('#result')
+document.querySelector('#run').onclick=async()=>{
+  try {
+    const blob=await (await fetch('./fixtures/aspect-ratio.png')).blob()
+    const image=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(blob)})
+    const original={nodes:[{id:'cache-check',image},{id:'submitted-prompt',submission:{model:'image-model',prompt:'保留提交快照',images:[{id:'reference',image},{image:'https://example.com/remote.png'}]}}]}
+    const originalJSON=JSON.stringify(original)
+    const cached=await storeInlineImages(original)
+    if(JSON.stringify(original)!==originalJSON)throw new Error('原文档或提交快照被修改')
+    if(!cached.nodes[0].localImage)throw new Error('未生成缓存引用')
+    if(cached.nodes[1].submission.images[0].localImage!==cached.nodes[0].localImage)throw new Error('提交快照未复用图片缓存')
+    const platform={nodes:cached.nodes.map(({image,...node})=>({...node,...(node.submission?{submission:{...node.submission,images:node.submission.images.map(({image,...reference})=>image.startsWith('data:image/')?reference:{...reference,image})}}:{})}))}
+    const restored=await restoreLocalImages(platform)
+    if(restored.nodes[0].image!==image)throw new Error('缓存恢复内容不一致')
+    if(restored.nodes[1].submission.images[0].image!==image)throw new Error('提交快照图片恢复不一致')
+    if(restored.nodes[1].submission.images[1].image!=='https://example.com/remote.png')throw new Error('远程参考图被覆盖')
+    if(restored.nodes[1].submission.prompt!=='保留提交快照')throw new Error('提交参数丢失')
+    if(platform.nodes[1].submission.images[0].image)throw new Error('恢复过程修改平台文档')
+    const second=await storeInlineImages(original)
+    if(second.nodes[0].localImage!==cached.nodes[0].localImage)throw new Error('内容地址不稳定')
+    output.textContent='PASS：真实 IndexedDB 写入、平台文档瘦身、顶层及提交快照图片恢复、远程引用保留、内容去重、原文档不可变。'
+  }catch(error){output.textContent='FAIL：'+error.message}
+}
+</script>
