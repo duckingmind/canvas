@@ -32,8 +32,8 @@ const eventually = async (check, description, timeout = 20000) => {
 const button = name => page.getByRole("button", { name, exact: true });
 const passed = description => { checks.push(description); console.log(`PASS ${description}`); };
 const openLibrary = async () => {
-  if (!await button("资产库").isVisible()) await button("素材与图层").click();
-  await button("资产库").click();
+  if (await button("资产库").isVisible()) await button("资产库").click();
+  else await button("资产库与图层").click();
   await page.getByRole("region", { name: "Canvas 资产库" }).waitFor();
 };
 
@@ -46,7 +46,7 @@ try {
     category: "other", saved_to_library: true,
   }));
   await control({ reset: true, assets: [
-    { id: "media-character", task_id: "task-character", name: "", category: "other", saved_to_library: false },
+    { id: "media-character", task_id: "task-character", name: "", category: "other", folder: "角色库", saved_to_library: false },
     { id: "media-landscape", task_id: "task-landscape", name: "山水场景", category: "scene", tags: ["山水"], folder: "场景", saved_to_library: true },
     { id: "media-other-app", name: "其他应用资产", saved_to_library: true, source_app_id: "another-application" },
     ...pagedAssets,
@@ -71,12 +71,11 @@ try {
   const collapse = button("收起画布列表").first();
   if (await collapse.isVisible()) await collapse.click();
   await page.locator('[data-node-id="character-node"]').click();
-  await button("节点操作").click();
-  await page.getByRole("menu", { name: "节点操作菜单", exact: true }).getByRole("menuitem", { name: "保存为资产", exact: true }).click();
+  await button("保存为资产：原始角色图").click();
   const dialog = page.getByRole("dialog", { name: "保存资产", exact: true });
   await dialog.waitFor();
   await dialog.getByLabel(/资产名称/).fill("角色三视图");
-  await dialog.getByLabel("保存位置", { exact: true }).fill("角色库");
+  assert.equal(await dialog.getByLabel("保存位置", { exact: true }).count(), 0, "asset dialogs do not expose folder configuration");
   await dialog.getByRole("group", { name: "资产分类" }).getByRole("button", { name: "角色", exact: true }).click();
   const tagInput = dialog.getByLabel(/^自定义标签/);
   await tagInput.fill(" 古装 ");
@@ -92,6 +91,9 @@ try {
   await dialog.getByRole("button", { name: "保存资产", exact: true }).click();
   await dialog.waitFor({ state: "hidden" });
   await eventually(async () => (await state()).assets["media-character"].saved_to_library, "platform membership saved");
+  await page.getByRole("status").filter({ hasText: "已保存“角色三视图”到资产库" }).getByRole("button", { name: "打开资产库", exact: true }).click();
+  await page.getByRole("region", { name: "Canvas 资产库" }).waitFor();
+  passed("saving an asset offers a direct path into the reusable library");
   let snapshot = await state();
   assert.equal(snapshot.assets["media-character"].name, "角色三视图");
   assert.equal(snapshot.assets["media-character"].folder, "角色库");
@@ -103,7 +105,7 @@ try {
   assert.deepEqual(Object.keys(patches[0].metadata).sort(), ["category", "expected_revision", "folder", "name", "saved_to_library", "tags"]);
   assert.equal(patches[0].metadata.expected_revision, 0);
   assert.equal(snapshot.storage["canvas:asset:v1:media-character"], undefined, "platform metadata is not duplicated into KV");
-  passed("save platform asset with folder/category/user tags and read-only system provenance at revision zero");
+  passed("save platform asset metadata while preserving its existing folder and read-only system provenance");
 
   await openLibrary();
   const library = page.getByRole("region", { name: "Canvas 资产库" });
@@ -134,7 +136,7 @@ try {
   await library.getByRole("heading", { name: "角色三视图", exact: true }).waitFor();
   await button("编辑 角色三视图 的信息").click();
   const editing = page.getByRole("dialog", { name: "编辑资产", exact: true });
-  assert.equal(await editing.getByLabel("保存位置", { exact: true }).inputValue(), "角色库");
+  assert.equal(await editing.getByLabel("保存位置", { exact: true }).count(), 0, "editing does not expose folder configuration");
   assert.equal(await editing.getByRole("button", { name: "移除标签 Hero", exact: true }).count(), 1);
   await button("关闭资产弹窗").click();
   const beforeNodes = await page.locator(".node[data-node-id]").count();

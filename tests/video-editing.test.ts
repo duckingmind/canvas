@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { gradeFilter, initialVideoEditRange, MAX_VIDEO_EDIT_DURATION_SECONDS, raceWithAbort, recorderMimeType, supportedVideoOutputFormats, videoCanvasSize, videoEditRange, videoExportBitrate, videoOutputExtension, videoTransformDimensions, watermarkPlacement } from "../src/video-editing.ts";
+import { gradeFilter, initialVideoEditRange, MAX_VIDEO_EDIT_DURATION_SECONDS, raceWithAbort, recorderMimeType, supportedVideoOutputFormats, videoCanvasSize, videoEditOperationParams, videoEditOutputDuration, videoEditRange, videoExportBitrate, videoOutputExtension, videoTransformDimensions, watermarkPlacement } from "../src/video-editing.ts";
 
 test("video edit ranges clamp to the source and reject unusable durations", () => {
   assert.deepEqual(videoEditRange(10, -2, 12), { start: 0, end: 10 });
@@ -33,6 +33,17 @@ test("video transforms expose stable dimensions for quarter turns", () => {
   assert.deepEqual(videoTransformDimensions(1920, 1080, 0), { width: 1920, height: 1080 });
   assert.deepEqual(videoTransformDimensions(1920, 1080, 90), { width: 1080, height: 1920 });
   assert.deepEqual(videoTransformDimensions(1920, 1080, 270), { width: 1080, height: 1920 });
+});
+
+test("processed video results retain edit parameters and derive speed-adjusted duration", () => {
+  const options = { operation: "speed" as const, startTime: 1, endTime: 7, playbackRate: 1.5 as const, flipHorizontal: false };
+  assert.deepEqual(videoEditOperationParams("source-video", options, "video/webm", 1024), {
+    sourceNodeId: "source-video", startTime: 1, endTime: 7, mimeType: "video/webm", size: 1024,
+    playbackRate: 1.5, flipHorizontal: false,
+  });
+  assert.equal(videoEditOutputDuration(options), 4);
+  assert.equal(videoEditOutputDuration({ operation: "trim", startTime: 1, endTime: 4 }), 3);
+  assert.equal(videoEditOutputDuration({ operation: "trim", startTime: 1, endTime: 1.1 }), 0.25);
 });
 
 test("watermark placement respects all corners and keeps text inside the output frame", () => {
@@ -68,7 +79,7 @@ test("recorder mime selection prefers supported browser codecs", () => {
 
 test("download extensions match recorder output MIME types", () => {
   assert.equal(videoOutputExtension("audio/ogg;codecs=opus"), "ogg");
-  assert.equal(videoOutputExtension("audio/mp4"), "m4a");
+  assert.equal(videoOutputExtension("audio/mp4;codecs=mp4a.40.2"), "m4a");
   assert.equal(videoOutputExtension("video/mp4"), "mp4");
   assert.equal(videoOutputExtension("video/webm;codecs=vp9,opus"), "webm");
 });

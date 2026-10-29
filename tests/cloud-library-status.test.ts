@@ -69,6 +69,17 @@ test("classifies synchronized, newer and conflicting versions", () => {
   );
 });
 
+test("camera and timestamp-only updates stay synchronized in the cloud list", () => {
+  const local = document("2026-09-17T01:00:00.000Z", "same");
+  const remote = {
+    ...structuredClone(local),
+    updatedAt: "2026-09-17T01:01:00.000Z",
+    viewport: { x: 260, y: -120, zoom: 1.4 },
+  };
+
+  assert.equal(state(local, remote), "synced");
+});
+
 test("a newer cloud tombstone is visible without deleting the local copy", () => {
   assert.equal(
     state(

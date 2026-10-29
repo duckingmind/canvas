@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  arrangeGroupMembers,
   arrangeNodes,
+  arrangeSmartNodes,
+  arrangeGridNodes,
+  layoutUnitCount,
   clampZoom,
   displayGridStep,
   connectorPath,
@@ -402,6 +406,207 @@ test("cycles, duplicate edges, self edges and missing targets cannot break arran
   assert.deepEqual(arrangeNodes(arranged, edges), arranged);
 });
 
+test("all canvas edges participate in workflow depth calculation", () => {
+  const nodes = [node("source"), node("value"), node("next")];
+  const arranged = arrangeNodes(nodes, [
+    { from: "source", to: "value" },
+    { from: "value", to: "next" },
+    { from: "source", to: "next" },
+  ]);
+  const byId = new Map(arranged.map((item) => [item.id, item]));
+  assert.equal(byId.get("source")!.x + byId.get("source")!.width + 120, byId.get("value")!.x);
+  assert.ok(byId.get("next")!.x > byId.get("value")!.x);
+});
+
+test("independent workflow components are packed as separate islands", () => {
+  const nodes = [
+    { ...node("a"), x: 0, y: 0 },
+    { ...node("b"), x: 300, y: 0 },
+    { ...node("c"), x: 0, y: 900 },
+    { ...node("d"), x: 300, y: 900 },
+  ];
+  const arranged = arrangeNodes(nodes, [
+    { from: "a", to: "b" },
+    { from: "c", to: "d" },
+  ]);
+  const byId = new Map(arranged.map((item) => [item.id, item]));
+  const first = getBounds([byId.get("a")!, byId.get("b")!])!;
+  const second = getBounds([byId.get("c")!, byId.get("d")!])!;
+  assert.ok(
+    second.x >= first.x + first.width + 112,
+    "disconnected workflows should have a visible island gap",
+  );
+  assert.equal(byId.get("a")!.y, byId.get("c")!.y);
+  assert.deepEqual(
+    arranged.map(({ id }) => id),
+    nodes.map(({ id }) => id),
+    "arrangement preserves the document node order",
+  );
+});
+
+test("shared inputs and references remain one connected layout island", () => {
+  const nodes = [
+    { ...node("shared"), x: 0, y: 0 },
+    { ...node("left"), x: 300, y: 0 },
+    { ...node("right"), x: 300, y: 300 },
+    { ...node("other"), x: 0, y: 900 },
+    { ...node("other-result"), x: 300, y: 900 },
+  ];
+  const arranged = arrangeNodes(nodes, [
+    { from: "shared", to: "left" },
+    { from: "shared", to: "right" },
+    { from: "other", to: "other-result" },
+    { from: "left", to: "other" },
+  ]);
+  const byId = new Map(arranged.map((item) => [item.id, item]));
+  assert.equal(byId.get("left")!.x, byId.get("right")!.x);
+  const sharedIsland = getBounds([byId.get("shared")!, byId.get("left")!, byId.get("right")!])!;
+  const otherIsland = getBounds([byId.get("other")!, byId.get("other-result")!])!;
+  assert.ok(otherIsland.x < sharedIsland.x + sharedIsland.width + 320);
+});
+
+test("weak connector between two dense workflow modules is separated into islands", () => {
+  const first = Array.from({ length: 6 }, (_, index) => ({
+    ...node(`first-${index}`, 100, 80),
+    x: index * 130,
+    y: 0,
+  }));
+  const second = Array.from({ length: 6 }, (_, index) => ({
+    ...node(`second-${index}`, 100, 80),
+    x: index * 130,
+    y: 1200,
+  }));
+  const connector = { ...node("connector", 100, 80), x: 0, y: 1200 };
+  const leaf = { ...node("connector-leaf", 100, 80), x: 130, y: 1200 };
+  const nodes = [...first, ...second, connector, leaf];
+  const edges = [
+    ...first.flatMap((source, sourceIndex) => first.slice(sourceIndex + 1).map((target) => ({ from: source.id, to: target.id }))),
+    ...second.flatMap((source, sourceIndex) => second.slice(sourceIndex + 1).map((target) => ({ from: source.id, to: target.id }))),
+    // The connector touches the second module more often. A small leaf must
+    // remain with that module instead of becoming its own island.
+    { from: first[0].id, to: connector.id },
+    { from: connector.id, to: second[0].id },
+    { from: connector.id, to: second[1].id },
+    { from: connector.id, to: second[2].id },
+    { from: connector.id, to: leaf.id },
+  ];
+  const arranged = arrangeNodes(nodes, edges);
+  const byId = new Map(arranged.map((item) => [item.id, item]));
+  const firstBounds = getBounds(first.map((item) => byId.get(item.id)!))!;
+  const secondBounds = getBounds([...second, connector, leaf].map((item) => byId.get(item.id)!))!;
+  assert.ok(
+    secondBounds.x >= firstBounds.x + firstBounds.width + 112,
+    "a sparse articulation should not collapse two internally dense modules into one island",
+  );
+  assert.equal(arranged.length, nodes.length);
+  assert.deepEqual(arranged.map(({ id }) => id), nodes.map(({ id }) => id));
+});
+
+test("large fan-out layers wrap into columns without reversing workflow direction", () => {
+  const source = node("source");
+  const targets = Array.from({ length: 12 }, (_, index) => node(`target-${index}`));
+  const nodes = [source, ...targets];
+  const edges = targets.map((target) => ({ from: source.id, to: target.id }));
+  const arranged = arrangeNodes(nodes, edges);
+  const byId = new Map(arranged.map((item) => [item.id, item]));
+  const targetNodes = targets.map((target) => byId.get(target.id)!);
+  const bounds = getBounds(arranged)!;
+
+  assert.ok(new Set(targetNodes.map((target) => target.x)).size > 1,
+    "a large same-depth layer should wrap into more than one horizontal lane");
+  assert.ok(targetNodes.every((target) => target.x > byId.get(source.id)!.x),
+    "wrapping a layer must keep dependency edges flowing to the right");
+  assert.ok(bounds.height <= 1800,
+    "fan-out layouts should avoid an unnecessarily long vertical stack");
+});
+
+test("smart arrangement chooses dependency flow for workflows and a compact grid otherwise", () => {
+  const workflow = [
+    { ...node("source"), x: 0, y: 0 },
+    { ...node("result"), x: 900, y: 700 },
+    { ...node("independent"), x: 0, y: 1400 },
+  ];
+  const flowed = arrangeSmartNodes(workflow, [{ from: "source", to: "result" }]);
+  const flowById = new Map(flowed.map((item) => [item.id, item]));
+  assert.ok(flowById.get("result")!.x > flowById.get("source")!.x);
+
+  const cards = ["a", "b", "c", "d"].map((id, index) => ({
+    ...node(id),
+    x: index * 420,
+    y: index * 170,
+  }));
+  const gridded = arrangeSmartNodes(cards, []);
+  const gridById = new Map(gridded.map((item) => [item.id, item]));
+  assert.equal(gridById.get("a")!.y, gridById.get("b")!.y);
+  assert.ok(gridById.get("c")!.y > gridById.get("a")!.y);
+  assert.deepEqual(arrangeSmartNodes(gridded, []), gridded);
+});
+
+test("smart arrangement gathers disconnected units into a compact grid beside workflows", () => {
+  const workflow = [
+    { ...node("source", 100, 80), x: 0, y: 0 },
+    { ...node("result", 100, 80), x: 500, y: 0 },
+  ];
+  const loose = Array.from({ length: 6 }, (_, index) => ({
+    ...node(`loose-${index}`, 100, 80),
+    x: (index % 2) * 900,
+    y: 500 + Math.floor(index / 2) * 500,
+  }));
+  const arranged = arrangeSmartNodes([...workflow, ...loose], [
+    { from: "source", to: "result" },
+  ]);
+  const byId = new Map(arranged.map((item) => [item.id, item]));
+  const workflowBounds = getBounds([byId.get("source")!, byId.get("result")!])!;
+  const looseBounds = getBounds(loose.map((item) => byId.get(item.id)!))!;
+
+  assert.ok(byId.get("result")!.x > byId.get("source")!.x,
+    "connected workflow keeps its directional layout");
+  assert.ok(looseBounds.x >= workflowBounds.x + workflowBounds.width + 112,
+    "loose units should form a separate nearby area instead of individual distant islands");
+  assert.ok(looseBounds.width <= 2 * 100 + 32,
+    "six loose units should wrap into a compact two-column grid");
+  assert.ok(looseBounds.height <= 3 * 80 + 2 * 32,
+    "six loose units should fit in three compact rows");
+});
+
+test("a single link forces workflow flow layout", () => {
+  const nodes = [
+    { ...node("a"), x: 0, y: 0 },
+    { ...node("b"), x: 800, y: 400 },
+  ];
+  const arranged = arrangeSmartNodes(nodes, [{ from: "a", to: "b" }]);
+  assert.ok(arranged[1].x > arranged[0].x);
+});
+
+test("references merge grouped units into one island", () => {
+  const nodes = [
+    { ...node("group-a", 100, 80), x: 0, y: 0, groupId: "g" },
+    { ...node("group-b", 100, 80), x: 130, y: 20, groupId: "g" },
+    { ...node("value", 120, 90), x: 400, y: 0 },
+  ];
+  const arranged = arrangeNodes(nodes, [
+    { from: "group-a", to: "value" },
+  ]);
+  assert.ok(arranged[2].x > arranged[0].x);
+});
+
+test("barycenter sweeps still run inside each workflow island", () => {
+  const nodes = [
+    { ...node("a", 100, 80), x: 0, y: 0 },
+    { ...node("b", 100, 80), x: 0, y: 400 },
+    { ...node("c", 100, 80), x: 300, y: 0 },
+    { ...node("d", 100, 80), x: 300, y: 400 },
+  ];
+  const arranged = arrangeNodes(nodes, [
+    { from: "a", to: "d" },
+    { from: "b", to: "c" },
+  ]);
+  const byId = new Map(arranged.map((item) => [item.id, item]));
+  assert.equal(byId.get("a")!.y, byId.get("d")!.y);
+  assert.equal(byId.get("b")!.y, byId.get("c")!.y);
+  assert.ok(byId.get("c")!.x >= byId.get("a")!.x + 100 + 112);
+});
+
 test("large chains arrange without recursive stack overflow", () => {
   const nodes = Array.from({ length: 12000 }, (_, index) =>
     node(String(index).padStart(5, "0"), 100, 100),
@@ -412,4 +617,83 @@ test("large chains arrange without recursive stack overflow", () => {
   const arranged = arrangeNodes(nodes, edges);
   assert.equal(arranged.length, nodes.length);
   assert.ok(arranged[11999].x > arranged[11998].x + arranged[11998].width);
+});
+
+test("arrangement treats a group as one unit and preserves member offsets", () => {
+  const nodes = [
+    { ...node("group-a", 100, 80), x: 0, y: 0, groupId: "g" },
+    { ...node("group-b", 120, 90), x: 260, y: 40, groupId: "g" },
+    { ...node("outside", 100, 80), x: 30, y: 400 },
+  ];
+  const before = nodes.map(({ x, y }) => ({ x, y }));
+  const arranged = arrangeNodes(nodes, [{ from: "group-b", to: "outside" }]);
+  const groupOffset = { x: arranged[0].x - before[0].x, y: arranged[0].y - before[0].y };
+  assert.deepEqual(
+    { x: arranged[1].x - before[1].x, y: arranged[1].y - before[1].y },
+    groupOffset,
+  );
+  assert.equal(layoutUnitCount(nodes), 2);
+  assert.ok(arranged[2].x > arranged[1].x + arranged[1].width);
+});
+
+test("grid arrangement keeps grouped cards together and sizes rows by group bounds", () => {
+  const nodes = [
+    { ...node("a", 100, 80), x: 0, y: 0, groupId: "g" },
+    { ...node("b", 120, 90), x: 260, y: 40, groupId: "g" },
+    { ...node("c", 80, 60), x: 900, y: 0 },
+  ];
+  const arranged = arrangeGridNodes(nodes, 1);
+  assert.equal(arranged[0].y, arranged[1].y - 40);
+  assert.equal(arranged[0].x + 260, arranged[1].x);
+  assert.ok(arranged[2].x >= arranged[1].x + arranged[1].width + 32);
+});
+
+test("explicit group-content arrangement changes positions without changing membership or lineage", () => {
+  const nodes = [
+    { ...node("a", 100, 80), x: 0, y: 0, groupId: "g", resultOf: "creator" },
+    { ...node("b", 120, 90), x: 900, y: 500, groupId: "g", resultOf: "creator" },
+  ];
+  const arranged = arrangeGroupMembers(nodes, []);
+  assert.notDeepEqual(
+    arranged.map(({ x, y }) => ({ x, y })),
+    nodes.map(({ x, y }) => ({ x, y })),
+  );
+  assert.deepEqual(
+    arranged.map(({ groupId, resultOf }) => ({ groupId, resultOf })),
+    nodes.map(({ groupId, resultOf }) => ({ groupId, resultOf })),
+  );
+  assert.deepEqual(arrangeGroupMembers(arranged, []), arranged);
+});
+
+test("hidden completed creator metadata does not inflate the visible group unit", () => {
+  const nodes = [
+    { ...node("creator", 160, 100), x: -900, y: -900, type: "prompt", groupId: "g" },
+    { ...node("result", 200, 140), x: 0, y: 0, type: "image", resultOf: "creator", groupId: "g" },
+    { ...node("outside", 100, 80), x: 600, y: 0, type: "note" },
+  ];
+  const arranged = arrangeNodes(nodes, [{ from: "result", to: "outside" }]);
+  assert.equal(arranged[1].x, 100);
+  assert.equal(arranged[1].y, 100);
+  assert.equal(arranged[0].x, -800);
+  assert.equal(arranged[0].y, -800);
+});
+
+test("implicit result and continuation lineage remains one layout unit", () => {
+  const nodes = [
+    { ...node("creator", 140, 90), x: 0, y: 0, type: "prompt" },
+    { ...node("result", 180, 120), x: 300, y: 20, type: "image", resultOf: "creator" },
+    { ...node("continuation", 160, 100), x: 620, y: 40, type: "prompt", continuationOf: "result" },
+    { ...node("outside", 120, 80), x: 900, y: 0 },
+  ];
+  const before = nodes.map(({ id, x, y }) => ({ id, x, y }));
+  const arranged = arrangeNodes(nodes, [
+    { from: "continuation", to: "outside" },
+  ]);
+  const byId = new Map(arranged.map((item) => [item.id, item]));
+  const original = new Map(before.map((item) => [item.id, item]));
+  const creator = byId.get("creator")!, result = byId.get("result")!, continuation = byId.get("continuation")!;
+  assert.equal(layoutUnitCount(nodes), 2);
+  assert.equal(result.x - creator.x, original.get("result")!.x - original.get("creator")!.x);
+  assert.equal(continuation.x - result.x, original.get("continuation")!.x - original.get("result")!.x);
+  assert.ok(byId.get("outside")!.x > continuation.x);
 });

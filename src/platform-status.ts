@@ -122,6 +122,17 @@ export function platformFailure(error: unknown): PlatformFailure {
       kind: "service",
       message: "Canvas 会话不存在或已失效，请返回主应用重新打开应用。",
     };
+  if (code === "APP_DEVELOPMENT_ACCESS_DENIED" || code === "APP_DEVELOPMENT_APP_UNAVAILABLE")
+    return {
+      kind: "developer",
+      switchDeveloperAccount: true,
+      message: "当前账号无法访问此本地开发预览。请核对应用标识并使用创建者账户；普通用户请从已发布应用入口打开。",
+    };
+  if (code === "APP_DEVELOPMENT_VERSION_NOT_FOUND")
+    return {
+      kind: "developer",
+      message: "本地应用版本未登记。请让 manifest.version 与平台登记版本一致后重试。",
+    };
   if (code === "APP_LOGIN_UNAVAILABLE")
     return {
       kind: "login",
@@ -180,12 +191,6 @@ export function platformFailure(error: unknown): PlatformFailure {
     return { kind: "login", message: loginMessages[code] };
   if (code?.startsWith("APP_LOGIN_"))
     return { kind: "login", message: "平台登录未完成，请重新连接账户。" };
-
-  if (code === "MEDIA_STORAGE_QUOTA_EXCEEDED")
-    return {
-      kind: "service",
-      message: "可用媒体空间不足。请管理云端素材，或升级会员与存储包后继续。",
-    };
 
   const rawMessage = typeof body.message === "string" ? body.message : "";
   const diagnosticText = entries

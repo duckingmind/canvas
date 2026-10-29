@@ -2,6 +2,7 @@
 
 export type MediaReference = {
   image?: string;
+  /** Legacy field accepted for reading old snapshots, never normalized or submitted. */
   localImage?: string;
   video?: string;
   /** Scoped browser-local video bytes. Never a remote delivery URL. */
@@ -67,11 +68,9 @@ function normalizeReference(value: unknown): MediaReference | undefined {
   const localAudio = string(item.localAudio);
   const videoContentUrl = string(item.videoContentUrl) || string(item.video_content_url);
   const assetId = string(item.assetId) || string(item.asset_id);
-  const localImage = string(item.localImage);
   const mediaType = item.mediaType === "image" || item.mediaType === "video" || item.mediaType === "audio" ? item.mediaType : undefined;
-  return image || localImage || video || localVideo || audio || localAudio || videoContentUrl || assetId ? {
+  return image || video || localVideo || audio || localAudio || videoContentUrl || assetId ? {
     ...(image ? { image } : {}),
-    ...(localImage ? { localImage } : {}),
     ...(video ? { video } : {}),
     ...(localVideo ? { localVideo } : {}),
     ...(audio ? { audio } : {}),
@@ -82,7 +81,7 @@ function normalizeReference(value: unknown): MediaReference | undefined {
   } : undefined;
 }
 
-/** Accept both the original string[] and the current {image, localImage}[] form. */
+/** Accept both the original string[] and the current structured form. */
 export function normalizeMediaReferences(value: unknown): MediaReference[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.map(normalizeReference).filter((item): item is MediaReference => Boolean(item));
@@ -100,7 +99,7 @@ export function normalizeVideoSubmission(value: unknown): VideoSubmission | unde
       ? input.references.filter((item): item is { type: "image_url" | "audio_url" | "video_url"; url?: string; assetId?: string; mediaType?: "image" | "video" | "audio"; localImage?: string; localVideo?: string; localAudio?: string } => {
         const value = record(item);
         return (value.type === "image_url" || value.type === "audio_url" || value.type === "video_url") &&
-          (typeof value.url === "string" && Boolean(value.url) || typeof value.assetId === "string" && Boolean(value.assetId) || typeof value.localImage === "string" && Boolean(value.localImage) || typeof value.localVideo === "string" && Boolean(value.localVideo) || typeof value.localAudio === "string" && Boolean(value.localAudio));
+          (typeof value.url === "string" && Boolean(value.url) || typeof value.assetId === "string" && Boolean(value.assetId) || typeof value.localVideo === "string" && Boolean(value.localVideo) || typeof value.localAudio === "string" && Boolean(value.localAudio));
       })
     : undefined;
   return {

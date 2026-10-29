@@ -9,7 +9,7 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const artifacts = fileURLToPath(new URL("./artifacts/", import.meta.url));
 const base = "http://127.0.0.1:5289", api = "http://127.0.0.1:5290";
 const fixture = spawn(process.execPath, ["tests/platform-fixture.mjs", "--port=5289", "--api-port=5290"], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
-let output = "", browser, context, page, canvasId, requests = [], checks = [];
+let output = "", browser, context, page, canvasId, requests = [], objectRequests = [], checks = [];
 const errors = [], browserDiagnostics = [], forbiddenRequests = [];
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const ready = new Promise((resolve, reject) => {
@@ -40,7 +40,7 @@ const cover = { id: "fixture-music-cover", name: "测试 Cover", type: "audio", 
 const voice = { id: "minimax-voice-design", name: "测试音色", type: "audio", is_default: true, supported_operations: ["generation"], supported_input_modes: ["text"], supported_parameters: { prompt: {}, preview_text: {} } };
 
 async function makeCase(name, patch = {}, recover = false) {
-  await context?.close(); requests = [];
+  await context?.close(); requests = []; objectRequests = [];
   canvasId = "audio-workflow-" + name;
   const now = new Date().toISOString();
   const node = { id: "audio-node", type: "prompt", mediaType: "audio", audioMode: "music", title: "测试音频", text: "轻快明亮的中文夏日歌曲", x: 300, y: 120, width: 360, height: 180, color: "#888", status: "idle", ...patch };
@@ -65,11 +65,15 @@ async function makeCase(name, patch = {}, recover = false) {
     if (/^\/v1\/(?:music|voice-design)\/(?:generations|tasks\/|by-idempotency-key\/)/.test(path)) {
       requests.push({ path, method: request.method(), key: request.headers()["idempotency-key"], ...(request.postData() ? { body: request.postDataJSON() } : {}) });
       const isVoice = path.includes("voice-design"), taskId = isVoice ? "fixture-voice-task" : "fixture-music-task";
-      if (path.endsWith("/content")) return route.fulfill({ status: 200, contentType: "audio/wav", body: wav });
       if (path.includes("by-idempotency-key") && !recover) return json({ error: { code: isVoice ? "voice_design_task_not_found" : "music_task_not_found", message: "not found" } }, 404);
-      return json(isVoice ? { id: taskId, task_status: "succeeded", voice_id: "voice-fixture-result", content_url: `/v1/voice-design/tasks/${taskId}/content`, trial_audio: { available: true } } : { id: taskId, status: "completed", content_url: `/v1/music/tasks/${taskId}/content` });
+      const signedUrl = `https://objects.example/${isVoice ? "voice-preview" : "music-result"}.wav?signature=temporary`;
+      return json(isVoice ? { id: taskId, task_status: "succeeded", voice_id: "voice-fixture-result", content_url: signedUrl, trial_audio: { available: true, url: signedUrl } } : { id: taskId, status: "completed", content_url: signedUrl, data: [{ url: signedUrl, format: "wav" }] });
     }
     return route.continue();
+  });
+  await context.route("https://objects.example/**", async route => {
+    objectRequests.push(route.request().url());
+    return route.fulfill({ status: 200, contentType: "audio/wav", headers: { "Access-Control-Allow-Origin": "*" }, body: wav });
   });
   page = await context.newPage(); page.on("pageerror", error => { errors.push(error.message); browserDiagnostics.push(error.stack || error.message); });
   page.on("requestfailed", request => browserDiagnostics.push(`${request.method()} ${request.url()}: ${request.failure()?.errorText}`));
@@ -148,13 +152,14 @@ try {
   assert.equal(requests.filter(request => request.path === "/v1/music/generations").length, 0);
   const voicePost = requests.find(request => request.path === "/v1/voice-design/generations");
   assert.equal(voicePost.body.preview_text, "你好，欢迎来到音乐创作。"); assert.ok(voicePost.key);
-  await eventually(async () => requests.some(request => request.path.endsWith("/voice-design/tasks/fixture-voice-task/content")), "voice preview authenticated content");
+  await eventually(async () => objectRequests.some(url => url.includes("/voice-preview.wav?")), "voice preview direct object-storage download");
+  assert.equal(requests.some(request => request.path.endsWith("/content")), false, "audio bytes must not pass through Gateway content routes");
   await page.locator('[data-node-id="audio-node"]').click();
   const download = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载音频", exact: true }).first().click();
   assert.match((await download).suggestedFilename(), /\.wav$/);
   await page.screenshot({ path: artifacts + "audio-workflow-voice.png" });
-  passed("voice design yields voice_id, authenticated playback, and a downloadable audio result");
+  passed("voice design yields voice_id, direct object-storage playback, and a downloadable audio result");
   }
   if (!selectedCase || selectedCase === "retired-tts") {
     const legacyText = "历史语音草稿，保留原有文字。";

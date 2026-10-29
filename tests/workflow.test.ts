@@ -31,7 +31,7 @@ test("text reference eligibility excludes generated image prompts and empty node
   assert.equal(isWorkflowTextReference({
     ...node("local-generated", "prompt", "原始提示词"),
     localImage: "proxy-canvas:image:sha256:generated",
-  }), false);
+  }), true);
 });
 
 test("prompt composition includes upstream dependencies once in order and excludes downstream and unrelated content", () => {
@@ -59,6 +59,21 @@ test("prompt composition includes upstream dependencies once in order and exclud
     ["brief", "style", "detail"],
   );
   assert.deepEqual({ nodes, edges }, before);
+});
+
+test("one persisted edge relation feeds prompt composition", () => {
+  const result = composePrompt(
+    [
+      { ...node("image", "image"), title: "Image", image: "https://cdn.example/image.png" },
+      { ...node("target", "prompt", "Create"), title: "Target" },
+    ],
+    [
+      { from: "image", to: "target" },
+    ],
+    "target",
+  );
+  assert.deepEqual(result.imageReferences.map((reference) => reference.nodeId), ["image"]);
+  assert.equal(result.prompt, "Create");
 });
 
 test("cycles, self edges and missing nodes cannot repeat the selected prompt or its sources", () => {
@@ -108,7 +123,6 @@ test("image dependencies including unloaded images remain visible and image meta
       title: "image",
       image: "https://example.test/image.png",
     },
-    { nodeId: "missing", title: "missing", localImage: "local-id" },
   ]);
   assert.deepEqual(composePrompt([], [], "unknown"), {
     prompt: "",
@@ -197,7 +211,7 @@ test("inline prompt references resolve to canvas media without putting media URL
     },
   ], [edge("hero", "target")], "target");
   assert.equal(result.prompt, "保持构图 @主角，加入雪夜@雪夜");
-  assert.deepEqual(result.imageReferences.map(reference => reference.nodeId), ["hero", "scene"]);
+  assert.deepEqual(result.imageReferences.map(reference => reference.nodeId), ["hero"]);
   assert.equal(result.prompt.includes("https://cdn.example/hero.png"), false);
 });
 
@@ -215,12 +229,12 @@ test("video dependencies preserve audio references alongside video and image inp
   assert.deepEqual(result.imageReferences, [{ nodeId: "image", title: "image", image: "https://cdn.example/image.png" }]);
 });
 
-test("creator uploads compose as embedded image references without graph nodes", () => {
+test("creator uploads compose as embedded COS image references without graph nodes", () => {
   const result = composePrompt(
     [
       {
         ...node("target", "prompt", "edit this image"),
-        embeddedReferences: [{ id: "upload-1", title: "reference.png", image: "data:image/png;base64,inline" }],
+        embeddedReferences: [{ id: "upload-1", title: "reference.png", image: "https://cos.example/reference.png" }],
       },
     ],
     [],
@@ -231,11 +245,11 @@ test("creator uploads compose as embedded image references without graph nodes",
     nodeId: "upload-1",
     title: "reference.png",
     embedded: true,
-    image: "data:image/png;base64,inline",
+    image: "https://cos.example/reference.png",
   }]);
 });
 
-test("local embedded references remain usable and share the same identity rules", () => {
+test("local embedded references are excluded until uploaded to COS", () => {
   const result = composePrompt(
     [{
       ...node("target", "prompt", "edit this"),
@@ -244,12 +258,7 @@ test("local embedded references remain usable and share the same identity rules"
     [],
     "target",
   );
-  assert.deepEqual(result.imageReferences, [{
-    nodeId: "local-upload",
-    title: "local.png",
-    embedded: true,
-    localImage: "proxy-canvas:image:sha256:local",
-  }]);
+  assert.deepEqual(result.imageReferences, []);
 });
 
 test("embedded and canvas references share one image identity in the composed request", () => {
@@ -257,9 +266,9 @@ test("embedded and canvas references share one image identity in the composed re
     [
       {
         ...node("target", "prompt", "keep the composition"),
-        embeddedReferences: [{ id: "upload-1", title: "uploaded.png", image: "data:image/png;base64:same" }],
+        embeddedReferences: [{ id: "upload-1", title: "uploaded.png", image: "https://cos.example/same.png" }],
       },
-      { ...node("canvas-image", "image"), image: "data:image/png;base64:same" },
+      { ...node("canvas-image", "image"), image: "https://cos.example/same.png" },
     ],
     [edge("canvas-image", "target")],
     "target",
@@ -270,8 +279,8 @@ test("embedded and canvas references share one image identity in the composed re
 
 test("the same image URL connected through multiple nodes is exposed once", () => {
   const nodes = [
-    { ...node("first", "image"), image: "data:image/png;base64,same" },
-    { ...node("second", "image"), image: "data:image/png;base64,same" },
+    { ...node("first", "image"), image: "https://cos.example/same.png" },
+    { ...node("second", "image"), image: "https://cos.example/same.png" },
     node("target", "prompt", "make a video"),
   ];
   const result = composePrompt(nodes, [edge("first", "target"), edge("second", "target")], "target");

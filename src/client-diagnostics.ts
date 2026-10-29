@@ -15,6 +15,7 @@ export type CanvasDiagnosticFields = {
   component?: string;
   operation?: string;
   phase?: string;
+  trigger?: "waiting" | "stalled";
   result?: string;
   error_name?: string;
   error_code?: string;
@@ -29,6 +30,8 @@ export type CanvasDiagnosticFields = {
   cors_mode?: "anonymous" | "none";
   attempt?: number;
   duration_ms?: number;
+  buffered_ahead_ms?: number;
+  current_time_ms?: number;
 };
 
 export type CanvasDiagnosticEvent = {
@@ -84,12 +87,13 @@ function safeFields(input: Record<string, unknown>): CanvasDiagnosticFields {
     const value = compactString(input[key]);
     if (value) result[key] = value;
   }
+  if (input.trigger === "waiting" || input.trigger === "stalled") result.trigger = input.trigger;
   const requestID = compactString(input.request_id, 128);
   if (requestID) result.request_id = requestID;
   const origin = safeOrigin(input.source_origin);
   if (origin) result.source_origin = origin;
   if (input.cors_mode === "anonymous" || input.cors_mode === "none") result.cors_mode = input.cors_mode;
-  for (const key of ["http_status", "media_error_code", "network_state", "ready_state", "attempt", "duration_ms"] as const) {
+  for (const key of ["http_status", "media_error_code", "network_state", "ready_state", "attempt", "duration_ms", "buffered_ahead_ms", "current_time_ms"] as const) {
     const value = input[key];
     if (typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 && value <= 1_000_000_000) {
       result[key] = value;

@@ -116,12 +116,14 @@ function CanvasNameDialog({
   operationError,
   onClose,
   onSubmit,
+  onNotice,
 }: {
   dialog: NameDialog;
   busy: boolean;
   operationError: string;
   onClose: () => void;
   onSubmit: (name: string) => void;
+  onNotice?: (text: string) => void;
 }) {
   const [name, setName] = React.useState(
     dialog.kind === "rename" ? dialog.item.name : "",
@@ -233,6 +235,7 @@ function CanvasNameDialog({
             const value = name.trim();
             if (!value) {
               setError("请填写画布名称");
+              onNotice?.("请填写画布名称");
               input.current?.focus();
               return;
             }
@@ -244,11 +247,9 @@ function CanvasNameDialog({
               onSubmit(value);
             } catch (failure) {
               setPending(false);
-              setError(
-                failure instanceof Error
-                  ? failure.message
-                  : "操作未完成，请重试",
-              );
+              const message = failure instanceof Error ? failure.message : "操作未完成，请重试";
+              setError(message);
+              onNotice?.(message);
             }
           }}
         >
@@ -271,15 +272,10 @@ function CanvasNameDialog({
               setError("");
             }}
           />
-          <p
-            id={helpId}
-            className={error ? "library-form-error" : "library-form-help"}
-            role={error ? "alert" : undefined}
-          >
-            {error ||
-              (dialog.kind === "create"
-                ? "从一张空白画布开始，随时添加文字、图片和提示词。"
-                : "一个好找的名字，方便下次继续创作。")}
+          <p id={helpId} className="library-form-help">
+            {dialog.kind === "create"
+              ? "从一张空白画布开始，随时添加文字、图片和提示词。"
+              : "一个好找的名字，方便下次继续创作。"}
           </p>
           <div className="library-dialog-actions">
             <button
@@ -944,6 +940,7 @@ export default function CanvasLibrary(props: CanvasLibraryProps) {
             dialog={dialog}
             busy={busy}
             operationError={error}
+            onNotice={onNotice}
             onClose={() => setDialog(null)}
             onSubmit={(name) => {
               if (dialog.kind === "create") onCreate(name);

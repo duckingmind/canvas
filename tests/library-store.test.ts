@@ -21,6 +21,11 @@ const {
   renameCanvas,
   copyCanvasDocument,
   migrateLegacy,
+  listPendingCloudSync,
+  getPendingCloudSync,
+  queuePendingCloudSync,
+  pausePendingCloudSync,
+  removePendingCloudSync,
 } = await import("../src/library-store.ts");
 resolveHook.deregister();
 const { writeDraft, readDraft } = await import("../src/draft-store.ts");
@@ -293,6 +298,72 @@ test("call-time snapshots and queued reads see the last save only after transact
   assert.equal((await listCanvases())[0].name, "newest");
 });
 
+test("pending cloud revisions commit with local documents and stale acknowledgements cannot clear newer work", async () => {
+  const database = installDatabase();
+  const first = document("outbox", { updatedAt: "2026-10-01T00:00:00.000Z" });
+  await saveCanvas(first, { queueCloudSync: true });
+  assert.deepEqual(await getCanvas(first.id), first);
+  const firstPending = (await listPendingCloudSync())[0];
+  assert.equal(firstPending.id, first.id);
+  assert.equal(firstPending.updatedAt, first.updatedAt);
+
+  const second = { ...first, name: "最新版本", updatedAt: "2026-10-02T00:00:00.000Z" };
+  await saveCanvas(second, { queueCloudSync: true });
+  const secondPending = (await listPendingCloudSync())[0];
+  assert.equal(secondPending.updatedAt, second.updatedAt);
+  assert.notEqual(secondPending.revision, firstPending.revision);
+  assert.equal(await removePendingCloudSync(second.id, firstPending.revision), false);
+  assert.equal(await removePendingCloudSync(second.id, secondPending.revision), true);
+  assert.deepEqual(await listPendingCloudSync(), []);
+
+  const queued = { ...second, name: "离线修改", updatedAt: "2026-10-03T00:00:00.000Z" };
+  await saveCanvas(queued, { queueCloudSync: true });
+  const queuedRevision = (await getPendingCloudSync(queued.id))!.revision;
+  await saveCanvas({ ...queued, name: "仅保存在本机" });
+  assert.equal(await removePendingCloudSync(queued.id, queuedRevision), true);
+  assert.deepEqual(await listPendingCloudSync(), []);
+  assert.deepEqual(database.inspect("documents", "outbox"), await getCanvas("outbox"));
+});
+
+test("content identity distinguishes edits made within the same timestamp", async () => {
+  installDatabase();
+  const timestamp = "2026-10-20T12:00:00.000Z";
+  const first = document("same-time", { updatedAt: timestamp, name: "第一版" });
+  await saveCanvas(first, { queueCloudSync: true });
+  const firstPending = (await getPendingCloudSync(first.id))!;
+
+  const second = { ...first, name: "第二版" };
+  await saveCanvas(second);
+  const secondRevision = await queuePendingCloudSync(second);
+  const secondPending = (await getPendingCloudSync(second.id))!;
+  assert.equal(secondPending.updatedAt, timestamp);
+  assert.notEqual(secondRevision, firstPending.revision);
+  assert.notEqual(secondPending.contentHash, firstPending.contentHash);
+  assert.equal(await removePendingCloudSync(second.id, firstPending.revision), false);
+  assert.equal(await removePendingCloudSync(second.id, secondPending.revision), true);
+});
+
+test("local-only choice pauses automatic delivery until an explicit sync resumes it", async () => {
+  installDatabase();
+  const first = document("paused", { updatedAt: "2026-10-20T12:00:00.000Z" });
+  await saveCanvas(first);
+  assert.equal(await pausePendingCloudSync(first), true);
+  const paused = await getPendingCloudSync(first.id);
+  assert.equal(paused?.paused, true);
+  assert.equal(await queuePendingCloudSync(first, { reactivatePaused: false }), null);
+  assert.equal((await getPendingCloudSync(first.id))?.revision, paused?.revision);
+
+  const newer = { ...first, name: "本机继续编辑", updatedAt: "2026-10-20T12:01:00.000Z" };
+  await saveCanvas(newer);
+  assert.equal(await queuePendingCloudSync(newer, { reactivatePaused: false }), null);
+  const resumedRevision = await queuePendingCloudSync(newer);
+  assert.ok(resumedRevision);
+  const resumed = await getPendingCloudSync(first.id);
+  assert.equal(resumed?.paused, false);
+  assert.equal(resumed?.updatedAt, newer.updatedAt);
+  assert.notEqual(resumed?.revision, paused?.revision);
+});
+
 test("a metadata failure rolls back the document and does not poison later operations", async () => {
   const database = installDatabase();
   const original = document("A");
@@ -384,7 +455,7 @@ test("cloud import captures its snapshot and commits document and summary atomic
   assert.equal((await listCanvases())[0].name, retrySnapshot.name);
 });
 
-test("small inline image covers are included while oversized and unsafe covers are omitted", async () => {
+test("inline image covers are omitted while unsafe covers are omitted", async () => {
   installDatabase();
   await saveCanvas(
     document("small", {
@@ -405,10 +476,7 @@ test("small inline image covers are included while oversized and unsafe covers a
     }),
   );
   const summaries = await listCanvases();
-  assert.equal(
-    summaries.find((value) => value.id === "small")?.cover,
-    "data:image/png;base64,YQ==",
-  );
+  assert.equal(summaries.find((value) => value.id === "small")?.cover, undefined);
   assert.equal(
     summaries.find((value) => value.id === "invalid")?.cover,
     undefined,

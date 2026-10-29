@@ -1,6 +1,6 @@
 import type { ImageSettings } from "./image-models.ts";
 import type { VideoSettings } from "./video-models.ts";
-import { imageGenerationParameters, videoGenerationParameters } from "./media-request-parameters.ts";
+import { imageEstimateParameters, videoGenerationParameters } from "./media-request-parameters.ts";
 
 export type MediaEstimateRequest = {
   model: string;
@@ -18,7 +18,7 @@ type EstimateInput = { model: string; referenceCount: number } & (
 export function mediaEstimateRequest(input: EstimateInput): MediaEstimateRequest {
   const parameters = input.kind === "video"
     ? videoGenerationParameters(input.settings)
-    : imageGenerationParameters({
+    : imageEstimateParameters({
         count: input.settings.count,
         size: input.settings.size,
         resolutionTier: input.settings.resolution,
@@ -128,5 +128,5 @@ export function estimatedCostLabel(estimate: CostEstimate): string {
     minimumFractionDigits: 2, maximumFractionDigits: 6,
   });
   const belowMinimum = estimate.amount > 0 && estimate.amount < minimum;
-  return `预估 ${belowMinimum ? "<" : ""}${formatter.format(belowMinimum ? minimum : estimate.amount)}`;
+  return `参考 ${belowMinimum ? "<" : ""}${formatter.format(belowMinimum ? minimum : estimate.amount)}`;
 }

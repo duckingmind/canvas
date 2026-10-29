@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createImageNode } from "./canvas-ui.mjs";
 
 const { chromium } = await import(process.env.CANVAS_PLAYWRIGHT_MODULE || "playwright");
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -48,15 +49,17 @@ const eventually = async (check, label) => {
   }
   throw new Error(`Timed out: ${label}`);
 };
-const settle = (page) => page.locator('.library-results[aria-busy="false"]').waitFor();
+const settle = (page) => page.locator('.library-results[aria-busy="false"]:visible').waitFor();
 const management = async (page) => {
   await page.getByLabel("无限创作画布").waitFor();
-  if (await button(page, "管理画布").isVisible()) await button(page, "管理画布").click();
+  const libraryButton = button(page, "我的画布");
+  if (await libraryButton.isVisible()) await libraryButton.click();
+  else if (await button(page, "管理画布").isVisible()) await button(page, "管理画布").click();
   await page.getByLabel("搜索画布名称").waitFor();
   await settle(page);
 };
 const current = async (page, name) => {
-  await page.waitForFunction((value) => document.querySelector(".project-name")?.value === value, name);
+  await page.getByLabel(`当前画布：${name}`, { exact: true }).waitFor();
   await page.getByLabel("无限创作画布").waitFor();
 };
 const create = async (page, name) => {
@@ -68,8 +71,15 @@ const create = async (page, name) => {
   await button(page, "创建画布").click();
   await page.getByRole("dialog").waitFor({ state: "hidden" });
   await current(page, name);
+  if (!(await page.getByLabel("搜索画布名称").isVisible())) await management(page);
   await settle(page);
-  await button(page, `打开画布：${name}`).waitFor();
+  const opened = button(page, `打开画布：${name}`);
+  try {
+    await opened.waitFor({ timeout: 2000 });
+  } catch {
+    await management(page);
+    await opened.waitFor();
+  }
   return page.url();
 };
 const open = async (page, name) => {
@@ -133,7 +143,7 @@ try {
   let discoveryStarted;
   const discovered = new Promise((resolve) => { discoveryStarted = resolve; });
   await page.route(canonicalList, async (route) => { discoveryStarted(); await discoveryGate; await route.continue(); });
-  await button(page, "管理画布").click();
+  await button(page, "我的画布").click();
   await discovered;
   await page.getByText("正在检查云端画布…", { exact: true }).waitFor();
   assert.equal(await page.locator(".library-card").count(), 1, "cloud discovery keeps existing local rows visible");
@@ -149,7 +159,6 @@ try {
   assert.equal(await page.locator(".library-card").count(), 2, "opening the sidebar hydrates the pre-existing cloud canvas");
   assert.equal(await button(page, `打开画布：${localCanvas.name}`).count(), 1, "local startup canvas remains available after cloud discovery");
   assert.equal(await page.getByRole("tab", { name: /协作/ }).count(), 0, "unavailable collaboration cannot select an artificial empty list");
-  await page.getByText("即将支持", { exact: true }).waitFor();
   assert.equal(await page.locator('.library-card-open[aria-current="page"]').count(), 1, "active canvas is identified in the list");
   await page.reload();
   await management(page);
@@ -157,12 +166,12 @@ try {
   assert.equal(await page.locator(".library-card").count(), 2, "reload does not create another blank canvas");
 
   const aURL = await create(page, "列表闭环 A");
-  await button(page, "创建图片").click();
+  await createImageNode(page);
   await page.getByLabel("创作画面描述").fill("A 的即时输入，切换时应保存");
   const bURL = await create(page, "列表闭环 B");
   assert.notEqual(aURL, bURL);
   assert.equal(await page.locator(".library-card").count(), 4);
-  await button(page, "创建图片").click();
+  await createImageNode(page);
   await page.getByLabel("创作画面描述").fill("B 的独立内容");
   await open(page, "列表闭环 A");
   await page.waitForFunction(() => document.querySelector(".world")?.innerText.includes("A 的即时输入"));

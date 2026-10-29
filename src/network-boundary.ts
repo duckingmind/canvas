@@ -13,7 +13,11 @@
 // exact `admin` label would let a canonical-looking `/v1` URL bypass this
 // browser-side boundary.
 const ADMIN_HOST_PATTERN = /(?:^|[.-])(?:admin|admin-api|admin-go|codex-admin-api|portal|www)(?:[.-]|$)/i;
-const ADMIN_PATH_PATTERN = /(?:^|\/)api\/(?:app-runtime|portal|market|admin)(?:\/|$)|(?:^|\/)bridge(?:\/|$)/i;
+// These paths belong to the platform control plane or retired browser
+// transports.  They must be rejected even when they are same-origin: a
+// relative fetch such as `/auth/status` would otherwise bypass the SDK's
+// Gateway route allow-list.
+const CONTROL_PLANE_PATH_PATTERN = /(?:^|\/)(?:auth|__platform)(?:\/|$)|(?:^|\/)api\/(?:app-runtime|portal|market|admin)(?:\/|$)|(?:^|\/)bridge(?:\/|$)/i;
 const SIGNATURE_PARAMETER_PATTERN = /^(?:q-signature|q-sign-time|x-cos-security-token|x-amz-signature|x-amz-credential|x-amz-date|x-goog-signature|signature|signkey)$/i;
 
 export const CANVAS_NETWORK_BOUNDARY_ERROR = "CANVAS_NETWORK_BOUNDARY";
@@ -72,7 +76,7 @@ function hasMediaSignature(url: URL): boolean {
 }
 
 function isBlockedAdminURL(url: URL): boolean {
-  return ADMIN_HOST_PATTERN.test(url.hostname) || ADMIN_PATH_PATTERN.test(url.pathname);
+  return ADMIN_HOST_PATTERN.test(url.hostname) || CONTROL_PLANE_PATH_PATTERN.test(url.pathname);
 }
 
 function isPrivateNetworkHost(hostname: string): boolean {

@@ -18,8 +18,10 @@ import {
 } from "lucide-react";
 import { platformFailure } from "./platform-status";
 import { diagnosticErrorFields, migratePreAuthCanvasDiagnostics, recordCanvasDiagnostic } from "./client-diagnostics.ts";
+import { useTransientNotice } from "./useTransientNotice";
 import { resetDocumentStorage, resumeDocumentStorage } from "./document-storage";
 import StartupScreen from "./StartupScreen";
+import CanvasLoadingIndicator from "./CanvasLoadingIndicator";
 import { prepareLocalStorageScope, setLocalStorageScope } from "./local-storage-scope.ts";
 import "./platform-gate.css";
 
@@ -77,6 +79,7 @@ export default function PlatformGate({
 }) {
   const [phase, setPhase] = useState<GatePhase>("checking");
   const [message, setMessage] = useState("");
+  const { notice: gateNotice, show: showGateNotice } = useTransientNotice(7000);
   const [retryFeedback, setRetryFeedback] = useState("");
   const [rechecking, setRechecking] = useState(false);
   const [hostLoginRequired, setHostLoginRequired] = useState(false);
@@ -101,7 +104,6 @@ export default function PlatformGate({
   // that require user action.
   const checking = phase === "checking";
   const hostedLogin = client.auth.loginMode === "host" || hostLoginRequired;
-  const redirectLogin = client.auth.recoveryMode === "redirect";
   const desktopPasswordLogin = isStandaloneDesktopRuntime() && !hostedLogin;
   // A returning workspace must replace the expired authorization. Initial
   // login and account-scope recovery can reuse the normal flow only when the
@@ -115,14 +117,14 @@ export default function PlatformGate({
     const status = phase === "checking"
       ? { state: "loading" as const, reason: "正在检查平台连接与登录状态", retryable: true, nextAction: { type: "wait" as const } }
       : phase === "required" || phase === "connecting"
-        ? { state: "auth_required" as const, reason: redirectLogin ? "请返回平台恢复应用会话" : hostedLogin ? "请在平台完成登录后重新检查登录状态" : "请在 Canvas 登录窗口完成登录", retryable: hostedLogin, nextAction: { type: "user_login" as const } }
+        ? { state: "auth_required" as const, reason: hostedLogin ? "请在平台完成登录后重新检查登录状态" : "请在 Canvas 登录窗口完成登录", retryable: hostedLogin, nextAction: { type: "user_login" as const } }
         : phase === "account"
           ? { state: "error" as const, reason: hostedLogin ? "暂时无法确认账户信息，请返回平台确认登录状态后重试。" : "暂时无法确认账户信息，请重新登录；如果仍无法进入，请联系平台管理员。", retryable: true, nextAction: { type: "user_login" as const } }
           : phase === "permission"
             ? { state: "error" as const, reason: "Canvas 当前无法使用所需功能，请重新打开应用并检查版本配置。", retryable: true, nextAction: { type: "retry" as const } }
           : { state: "error" as const, reason: phase === "developer" ? "应用开发绑定未完成" : "平台连接暂时不可用", retryable: phase !== "developer", nextAction: { type: "retry" as const } };
     return agent.setStatus(status, { scope: "canvas.platform", priority: 100 });
-  }, [hostedLogin, redirectLogin, phase]);
+  }, [hostedLogin, phase]);
 
   const admit = useCallback(async (scope: string | undefined, attempt: number) => {
     if (!scope) throw Object.assign(new Error("平台未返回有效的账户标识"), {
@@ -146,6 +148,7 @@ export default function PlatformGate({
     const failure = platformFailure(error);
     if (failure.loginMode === "host") setHostLoginRequired(true);
     setMessage(loginMessage(failure.message));
+    showGateNotice(loginMessage(failure.message));
     setSwitchDeveloperAccount(Boolean(failure.switchDeveloperAccount));
     setPhase(
       failure.kind === "login"
@@ -159,7 +162,7 @@ export default function PlatformGate({
             : "unavailable",
     );
     return failure;
-  }, []);
+  }, [showGateNotice]);
 
   const check = useCallback(async (retry = false) => {
     const attempt = ++request.current;
@@ -198,7 +201,7 @@ export default function PlatformGate({
   const login = useCallback(
     async (forceLogin = false) => {
       if (phaseRef.current === "connecting") return;
-      if (hostedLogin && !redirectLogin) {
+      if (hostedLogin) {
         await check(true);
         return;
       }
@@ -220,14 +223,11 @@ export default function PlatformGate({
             ? { email: email.trim(), password, ...(forceLogin ? { forceLogin: true } : {}) }
             : forceLogin ? { forceLogin: true } : undefined,
         );
-        // Hosted server apps recover through the Portal launcher. Do not
-        // reuse this client's terminated session while navigation is pending.
-        if (redirectLogin) return;
-        const status = await client.auth.status();
+        const session = await client.platform.createSession();
         if (!active.current || attempt !== request.current) return;
-        if (status.authenticated) {
+        if (session.account_scope) {
           setPassword("");
-          await admit(status.accountScope, attempt);
+          await admit(session.account_scope, attempt);
         }
         else {
           setPhase("required");
@@ -243,7 +243,7 @@ export default function PlatformGate({
         }
       }
     },
-    [admit, check, client, desktopPasswordLogin, email, hostedLogin, redirectLogin, password, showFailure],
+    [admit, check, client, desktopPasswordLogin, email, hostedLogin, password, showFailure],
   );
 
   const requireLogin = useCallback((reason?: string) => {
@@ -384,8 +384,6 @@ export default function PlatformGate({
           ? "应用功能暂不可用"
         : phase === "unavailable"
           ? "暂时无法连接平台"
-          : redirectLogin
-            ? "恢复登录，继续创作"
           : hostedLogin
             ? "请先在平台登录"
             : admitted
@@ -417,24 +415,14 @@ export default function PlatformGate({
             tabIndex={-1}
           >
             {checking ? (
-              <div
-                className="platform-gate-loading-only"
-                role="status"
-                aria-live="polite"
-                aria-busy="true"
-              >
-                <LoaderCircle
-                  className="platform-gate-spinner"
-                  size={18}
-                  aria-hidden="true"
-                />
-                <span>{rechecking ? "正在重新检查平台连接…" : "正在连接平台…"}</span>
-              </div>
+              <CanvasLoadingIndicator
+                message={rechecking ? "正在重新检查平台连接…" : "正在连接平台…"}
+              />
             ) : (
             <StartupScreen
               title={title}
               description={phase === "developer"
-                  ? "本地应用的开发登记未完成，暂时无法创建运行会话。"
+                  ? message || "本地预览只检查应用开发权限；普通用户应从已发布应用入口打开。"
                 : phase === "account"
                     ? hostedLogin
                       ? `${admitted ? "当前画布已保留。" : "为保护你的画布数据，暂时无法进入。"}请返回平台确认登录状态后重试。`
@@ -445,18 +433,12 @@ export default function PlatformGate({
                       ? "请重新打开应用后重试。如果仍无法使用，请联系应用开发者检查版本配置与应用权限。"
                     : phase === "unavailable"
                       ? "连接恢复后，即可继续进入画布。"
-                      : redirectLogin
-                        ? `${admitted ? "当前画布已暂停同步。" : "应用会话需要恢复。"}返回平台验证登录后，将回到当前页面。`
                       : hostedLogin
                         ? `${admitted ? "当前画布已保留。" : "当前环境由平台管理登录。"}请在平台完成登录后重试。`
                         : admitted
                           ? "当前画布已保留，完成登录后会继续同步画布与模型。"
                           : "一次完成登录、模型加载和云端画布同步，进入后即可开始创作。"}
               showBenefits={(phase === "required" || phase === "connecting") && !admitted && !hostedLogin}
-              message={phase === "account" ? undefined : message}
-              technicalDetails={phase === "account"
-                ? `${message} 错误代码：APP_ACCOUNT_SCOPE_UNAVAILABLE`
-                : undefined}
               status={phase === "connecting"
                   ? "等待登录完成…"
                   : retryFeedback || undefined}
@@ -502,13 +484,6 @@ export default function PlatformGate({
                     onClick: () => void check(true),
                     icon: <RefreshCw size={17} aria-hidden="true" />,
                   }
-                : redirectLogin
-                  ? {
-                      label: phase === "connecting" ? "正在返回平台…" : "返回平台恢复登录",
-                      onClick: () => void login(),
-                      disabled: phase === "connecting",
-                      icon: phase === "connecting" ? <LoaderCircle className="platform-gate-spinner" size={18} aria-hidden="true" /> : <RefreshCw size={17} aria-hidden="true" />,
-                    }
                 : hostedLogin
                   ? {
                       label: "重新检查登录状态",
@@ -540,8 +515,6 @@ export default function PlatformGate({
                 ? "请在打开的登录窗口中完成授权，完成后将自动继续加载。"
                 : phase === "permission"
                   ? "应用可直接打开，无需安装或另行确认权限。"
-                : redirectLogin && (phase === "account" || phase === "required")
-                  ? "平台仍处于登录状态时会自动恢复，无需再次输入密码。"
                 : hostedLogin && (phase === "account" || phase === "required")
                   ? "如果仍无法进入，请在平台重新打开应用，或联系平台管理员。"
                   : phase === "account"
@@ -552,6 +525,10 @@ export default function PlatformGate({
             />
             )}
           </div>
+          {gateNotice && <div className="platform-gate-toast" role="alert">
+            <span>{gateNotice.text}</span>
+            <button type="button" aria-label="关闭提示" onClick={() => showGateNotice("")}>×</button>
+          </div>}
         </dialog>
       )}
     </PlatformAccessContext.Provider>

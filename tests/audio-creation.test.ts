@@ -59,11 +59,15 @@ test('voice recovery preserves every character in the original valid Unicode pre
   assert.equal(normalizeVoiceDesignSubmission({ ...submission, previewText: previewText + '🎵' })?.previewText, previewText);
 });
 
-test('cloud snapshots keep small local audio identities and strip unsolicited base64 from frozen submissions', () => {
-  const document: Document = { id: 'doc', name: 'audio', createdAt: '2026-10-14', updatedAt: '2026-10-14', viewport: { x: 0, y: 0, zoom: 1 }, edges: [], nodes: [{ ...node, taskId: 'accepted-task', localAudio, musicReference: { localAudio, title: 'ref', duration: 10, size: 40 }, musicSubmission: { key: 'submit-1', model: 'music', prompt: 'test', referenceLocalAudio: localAudio, audio_base64: 'private' } as any }] };
+test('cloud snapshots keep stable audio identities and strip local cache keys and unsolicited base64', () => {
+  const document: Document = { id: 'doc', name: 'audio', createdAt: '2026-10-14', updatedAt: '2026-10-14', viewport: { x: 0, y: 0, zoom: 1 }, edges: [], nodes: [{ ...node, taskId: 'accepted-task', localAudio, musicReference: { localAudio, assetId: 'reference-asset', title: 'ref', duration: 10, size: 40 }, musicSubmission: { key: 'submit-1', model: 'music', prompt: 'test', referenceLocalAudio: localAudio, referenceAssetId: 'reference-asset', audio_base64: 'private' } as any }] };
   const saved = storageDocument(document);
-  assert.equal(saved.nodes[0].localAudio, localAudio);
-  assert.equal(saved.nodes[0].musicReference?.localAudio, localAudio);
+  assert.equal(saved.nodes[0].localAudio, undefined);
+  assert.equal(saved.nodes[0].musicReference?.localAudio, undefined);
+  assert.equal(saved.nodes[0].musicReference?.assetId, 'reference-asset');
+  assert.equal(saved.nodes[0].musicSubmission?.referenceLocalAudio, undefined);
+  assert.equal(saved.nodes[0].musicSubmission?.referenceAssetId, 'reference-asset');
+  assert.equal(JSON.stringify(saved).includes('proxy-canvas:'), false);
   assert.equal(JSON.stringify(saved).includes('private'), false);
   assert.equal((document.nodes[0].musicSubmission as any).audio_base64, 'private');
 });

@@ -2,7 +2,6 @@ import type { ReactNode } from "react";
 import {
   ArrowRight,
   ChevronDown,
-  CircleAlert,
   Cloud,
   History,
   Layers2,
@@ -78,12 +77,6 @@ export default function StartupScreen({
             <span>云端画布</span>
           </li>
         </ul>
-      )}
-      {message && (
-        <div className="platform-gate-error" role="alert">
-          <CircleAlert size={17} aria-hidden="true" />
-          <p>{message}</p>
-        </div>
       )}
       {status && (
         <div className="platform-gate-progress" role="status">

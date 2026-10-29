@@ -20,6 +20,9 @@ export type ImageSettings = {
 /** How a prompt node acquired its model. Legacy documents omit this field. */
 export type ModelSelectionSource = "user" | "default";
 
+/** Short-lived state for a browser-to-platform media upload. */
+export type CanvasUploadState = "preparing" | "uploading" | "completing" | "failed";
+
 export type VideoSettings = {
   duration?: number;
   size?: string;
@@ -143,6 +146,8 @@ export type CanvasNode = {
   image?: string;
   /** Small server-signed image preview used by cards; never the canonical media bytes. */
   imageThumbnail?: string;
+  /** Source aspect ratio retained when a generated image has no measurable preview yet. */
+  imageAspectRatio?: string;
   video?: string;
   /** Scoped browser-local bytes for derived video files. */
   localVideo?: string;
@@ -162,6 +167,10 @@ export type CanvasNode = {
   taskId?: string;
   /** Stable media asset identity used by the reusable asset library. */
   assetId?: string;
+  /** Browser upload marker; cleared after the platform asset is confirmed. */
+  uploadState?: CanvasUploadState;
+  uploadProgress?: number;
+  uploadError?: string;
   error?: string;
   taskPrompt?: string;
   taskDiagnostic?: {
@@ -175,6 +184,8 @@ export type CanvasNode = {
     supplierConfirmation?: { state?: string; status?: string; source?: string; reason?: string };
   };
   generationBatchId?: string;
+  /** Prevent load-time generated-lineage repair from undoing an explicit user group or ungroup action. */
+  groupMembershipOverride?: boolean;
   inputSignature?: string;
   modelId?: string;
   /** Preserve explicit choices while allowing idle legacy defaults to refresh. */
@@ -226,6 +237,7 @@ export type GroupFrame = {
   height: number;
 };
 
+/** Every persisted canvas connection has one workflow/reference meaning. */
 export type Edge = { id: string; from: string; to: string };
 
 export type Document = {
@@ -248,6 +260,7 @@ export type Model = {
   model_type?: string;
   supported_operations?: string[];
   available?: boolean;
+  supply_status?: string;
   max_input_images?: number;
   max_reference_images?: number;
   supported_input_modes?: string[];
@@ -286,6 +299,7 @@ export type StoredAsset = {
   url_expires_at?: string;
   content_type?: string;
   status?: string;
+  /** Asset retention deadline; distinct from the signed URL deadline. */
   expires_at?: string;
   created_at: string;
   /** Optional for reading older media API responses; asset-library writes require the new metadata contract. */

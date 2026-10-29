@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   frameForGroupNodes,
+  inheritGeneratedGroupIds,
   rebuildGroupState,
   regroupNodes,
   selectionForGroupMember,
@@ -41,6 +42,38 @@ test("regrouping clears the invisible singleton left in an old group", () => {
     ],
   );
   assert.deepEqual(result.groups.map((group) => group.id), ["new"]);
+});
+
+test("manual regrouping of a generated result survives group repair", () => {
+  const repaired = inheritGeneratedGroupIds([
+    { ...node("creator", 0, 0, "old-group"), type: "prompt" },
+    { ...node("selected-result", 140, 0, "new-group"), resultOf: "creator" },
+    { ...node("remaining-result", 280, 0, "old-group"), resultOf: "creator" },
+  ]);
+  assert.equal(repaired.find((item) => item.id === "selected-result")?.groupId, "new-group");
+  assert.equal(repaired.find((item) => item.id === "remaining-result")?.groupId, "old-group");
+});
+
+test("an explicit ungroup survives repair even while its creator remains grouped", () => {
+  const repaired = inheritGeneratedGroupIds([
+    { ...node("creator", 0, 0, "creator-group"), type: "prompt" },
+    {
+      ...node("result", 140, 0),
+      resultOf: "creator",
+      groupMembershipOverride: true,
+    },
+  ]);
+  assert.equal(repaired.find((item) => item.id === "result")?.groupId, undefined);
+});
+
+test("legacy generated batch groups still inherit their creator group", () => {
+  const repaired = inheritGeneratedGroupIds([
+    { ...node("creator", 0, 0, "creator-group"), type: "prompt" },
+    { ...node("result-a", 140, 0, "image-batch-123"), resultOf: "creator" },
+    { ...node("result-b", 280, 0), resultOf: "creator" },
+  ]);
+  assert.equal(repaired.find((item) => item.id === "result-a")?.groupId, "creator-group");
+  assert.equal(repaired.find((item) => item.id === "result-b")?.groupId, "creator-group");
 });
 
 test("removing one member shrinks the frame and dissolves a remaining singleton", () => {
@@ -92,13 +125,13 @@ test("dragging a group moves hidden metadata with visible cards", () => {
   ]);
 });
 
-test("plain clicks select a group while shift-click keeps member-level toggles", () => {
+test("plain clicks keep a grouped member individually addressable; shift-click toggles members", () => {
   const visible = [
     node("a", 0, 0, "group"),
     node("b", 140, 0, "group"),
     node("outside", 300, 0),
   ];
-  assert.deepEqual(selectionForGroupMember(visible, "a", [], false), ["a", "b"]);
+  assert.deepEqual(selectionForGroupMember(visible, "a", [], false), ["a"]);
   assert.deepEqual(selectionForGroupMember(visible, "a", ["outside"], true), ["outside", "a"]);
   assert.deepEqual(selectionForGroupMember(visible, "b", ["outside", "a", "b"], true), ["outside", "a"]);
   assert.deepEqual(selectionForGroupMember(visible, "outside", ["a"], false), ["outside"]);

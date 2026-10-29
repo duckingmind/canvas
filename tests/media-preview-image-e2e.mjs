@@ -117,7 +117,8 @@ try {
       while (!predicate()) { if (Date.now() > deadline) throw new Error(message); await new Promise(resolve => setTimeout(resolve, 20)); }
     };
     const host = document.createElement("div");
-    Object.assign(host.style, { position: "fixed", inset: "40px", width: "640px", height: "500px", zIndex: "999999", background: "#111" });
+    host.className = "modal image-modal";
+    Object.assign(host.style, { position: "fixed", left: "40px", top: "40px", width: "640px", height: "500px", zIndex: "999999", display: "flex", flexDirection: "column", background: "#111" });
     document.body.append(host);
     let root = createRoot(host);
     let calls = 0, finishOriginal;
@@ -342,6 +343,7 @@ try {
     ];
     let selected = galleryItems[0];
     const originalRequests = [];
+    let locatedId = "";
     const renderGallery = () => {
       const current = selected;
       root.render(React.createElement(MediaPreview, {
@@ -351,7 +353,7 @@ try {
         sources: [{ id: "gallery-source", type: "prompt" }],
         error: "",
         onSelect(item) { selected = item; renderGallery(); },
-        onLocate() {},
+        onLocate(id) { locatedId = id; },
         resolveImageSource: source => source,
         resolveImageThumbnail: source => source,
         onImageOriginalRequest() { originalRequests.push(current.id); return galleryOriginal(current.id); },
@@ -367,9 +369,32 @@ try {
     if (getComputedStyle(thumbnailRow).display !== "grid" || thumbnailRow.children.length !== 3) throw new Error("thumbnail rail should reserve space for both navigation arrows");
     if (host.querySelector(".media-preview-navigation")) throw new Error("result navigation should sit with the thumbnail gallery, not over the media");
     if (!host.querySelector(".media-preview-thumbnails-row [aria-label=\"上一个结果\"]") || !host.querySelector(".media-preview-thumbnails-row [aria-label=\"下一个结果\"]")) throw new Error("gallery arrows should flank the thumbnail rail");
+    const locateButton = host.querySelector(".media-preview-zoom-controls .media-preview-locate");
+    if (!locateButton || host.querySelector(".media-preview-gallery-head .media-preview-locate")) throw new Error("locate action should share the stage toolbar instead of sitting in a separate gallery row");
+    const toolbarDivider = host.querySelector(".media-preview-zoom-controls .media-preview-toolbar-divider");
+    const dividerRect = toolbarDivider?.getBoundingClientRect();
+    if (!toolbarDivider || Math.abs(dividerRect.width - 1) > 0.1 || Math.abs(dividerRect.height - 18) > 0.1) throw new Error("toolbar separator should render as a narrow divider rather than a gray block");
+    const toolbarRect = host.querySelector(".media-preview-zoom-controls").getBoundingClientRect();
+    const stageRectForToolbar = host.querySelector(".media-preview-stage").getBoundingClientRect();
+    if (Math.abs((toolbarRect.left + toolbarRect.right) / 2 - (stageRectForToolbar.left + stageRectForToolbar.right) / 2) > 1) throw new Error("combined media tools should be centered in the stage");
+    if (locateButton.getBoundingClientRect().width < 70 || getComputedStyle(locateButton).whiteSpace !== "nowrap" || !locateButton.textContent.includes("定位到节点")) throw new Error("locate action should remain readable inside the shared toolbar");
+    locateButton.click();
+    if (locatedId !== "gallery-source") throw new Error("locate action remains interactive inside the shared toolbar");
+    host.style.width = "320px";
+    await flush();
+    const narrowToolbarRect = host.querySelector(".media-preview-zoom-controls").getBoundingClientRect();
+    const narrowStageRect = host.querySelector(".media-preview-stage").getBoundingClientRect();
+    if (narrowToolbarRect.left < narrowStageRect.left || narrowToolbarRect.right > narrowStageRect.right || Math.abs((narrowToolbarRect.left + narrowToolbarRect.right) / 2 - (narrowStageRect.left + narrowStageRect.right) / 2) > 1) throw new Error("combined tools should fit centered within a narrow stage");
+    host.style.width = "640px";
+    await flush();
     const stagePrevious = host.querySelector('[aria-label="上一个结果（主图）"]');
     const stageNext = host.querySelector('[aria-label="下一个结果（主图）"]');
     if (!stagePrevious || !stageNext || !stagePrevious.disabled || stageNext.disabled) throw new Error("stage arrows should be visible with the previous arrow disabled at the first result");
+    if (Number(getComputedStyle(stagePrevious).opacity) < 0.2 || getComputedStyle(stagePrevious).pointerEvents !== "none") throw new Error("unavailable stage navigation should remain visible but not interactive");
+    const stageRect = host.querySelector(".media-preview-stage").getBoundingClientRect();
+    const arrowRects = [stagePrevious, stageNext].map(button => ({ position: getComputedStyle(button).position, rect: button.getBoundingClientRect() }));
+    const stageCenterY = (stageRect.top + stageRect.bottom) / 2;
+    if (arrowRects.some(({ position, rect }, arrowIndex) => position !== "absolute" || rect.top < stageRect.top || rect.bottom > stageRect.bottom || Math.abs((rect.top + rect.bottom) / 2 - stageCenterY) > 1 || (arrowIndex === 0 ? rect.left < stageRect.left : rect.right > stageRect.right))) throw new Error(`stage navigation arrows should stay centered inside the media stage instead of following the gallery content: ${JSON.stringify({ stage: { top: stageRect.top, bottom: stageRect.bottom, left: stageRect.left, right: stageRect.right }, arrows: arrowRects.map(({ position, rect }) => ({ position, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right })) })}`);
     await until(() => host.querySelector(".media-preview-image-detail")?.classList.contains("is-ready"), "opening the gallery automatically loads the selected original");
     if (originalRequests.length !== 1 || originalRequests[0] !== "gallery-a") throw new Error("opening the gallery must resolve only the current original");
     host.querySelector('[aria-label="查看第 2 个结果"]').click();
@@ -406,6 +431,21 @@ try {
     if (host.querySelector(".media-preview-thumbnails img")?.src !== host.querySelector(".media-preview-image")?.src) throw new Error("single gallery should reuse its decoded detail image when no separate thumbnail exists");
     if (!host.querySelector('[aria-label="上一个结果（主图）"]')?.disabled || !host.querySelector('[aria-label="下一个结果（主图）"]')?.disabled) throw new Error("single-item stage arrows should remain visible but disabled");
     root.unmount(); root = createRoot(host);
+    const portraitVideo = { id: "portrait-video", type: "video", mediaType: "video", title: "竖版视频", videoAspectRatio: "9:16", videoPoster: `data:image/png;base64,${btoa("portrait-fixture")}` };
+    root.render(React.createElement(MediaPreview, {
+      node: portraitVideo, items: [portraitVideo], index: 0, sources: [{ id: "portrait-source", type: "prompt" }], error: "", onSelect() {}, onLocate() {},
+    }));
+    await until(() => Boolean(host.querySelector(".media-preview-video-wrap")), "poster-only video preview renders its ambient stage");
+    const stage = host.querySelector(".media-preview-video-wrap");
+    const bounds = stage.getBoundingClientRect();
+    const parent = stage.parentElement.getBoundingClientRect();
+    const portraitLayout = { width: bounds.width, height: bounds.height, parentWidth: parent.width, parentHeight: parent.height };
+    if (Math.abs(portraitLayout.width / portraitLayout.height - 9 / 16) > 0.03) throw new Error("portrait videos should keep their 9:16 stage ratio");
+    if (portraitLayout.width >= portraitLayout.parentWidth * 0.8 || portraitLayout.height > portraitLayout.parentHeight) throw new Error("portrait videos should fit the stage without a wide black player shell");
+    if (getComputedStyle(host.querySelector(".media-preview-video-backdrop")).filter === "none") throw new Error("video posters should provide a blurred ambient backdrop");
+    if (!host.querySelector(".media-preview-gallery-head")?.textContent.includes("1 / 1")) throw new Error("the gallery should keep a visible result count");
+    if (!host.querySelector(".media-preview-zoom-controls .media-preview-locate") || host.querySelector(".media-preview-zoom-controls [aria-label=\"放大图片\"]")) throw new Error("video previews should retain the source action without image-only zoom controls");
+    root.unmount(); root = createRoot(host);
     const raceItems = [
       { ...galleryItems[0], id: "race-a", image: galleryThumb("race-a") },
       { ...galleryItems[1], id: "race-b", image: galleryThumb("race-b") },
@@ -437,7 +477,7 @@ try {
     if (!host.querySelector(".media-preview-info")?.textContent.includes("1200 × 600px")) throw new Error("a stale response must not clear the current original dimensions");
     if (raceRequests.join(",") !== "race-a,race-b") throw new Error("rapid navigation must issue exactly one original request for each selected image");
     root.unmount(); host.remove();
-    return { calls, retryCalls, canonicalCalls, directCalls, renewalCalls, lateErrorCalls, rotatingCalls, thumbnailOnlyCalls, sameSourceCalls, originalLayerRetained: true, thumbnailRetainedAfterFailure: true, originalDimensions: "1200 × 600px", lateThumbnailDimensionsIgnored: true, galleryOriginalRequests: originalRequests, raceRequests, staleOriginalIgnored: true };
+    return { calls, retryCalls, canonicalCalls, directCalls, renewalCalls, lateErrorCalls, rotatingCalls, thumbnailOnlyCalls, sameSourceCalls, originalLayerRetained: true, thumbnailRetainedAfterFailure: true, originalDimensions: "1200 × 600px", lateThumbnailDimensionsIgnored: true, galleryOriginalRequests: originalRequests, raceRequests, staleOriginalIgnored: true, stageArrowsPositionedWithinMediaStage: true };
   }, { ...reactSources, thumbUrl, originalUrl });
 
   assert.equal(result.calls, 1);

@@ -1,6 +1,7 @@
 import { platformFailure } from "./platform-status.ts";
 import { fetchCanvasResource } from "./network-boundary.ts";
 import { imageGenerationParameters } from "./media-request-parameters.ts";
+import { hasStableMediaIdentity } from "./media-identity.ts";
 
 export type ImageRequest = (
   path: string,
@@ -19,9 +20,9 @@ export type ImageGenerationInput = {
   resolutionTier?: string;
   qualityMode?: string;
   aspectRatio?: string;
-  /** Encoded artifact format, separate from responseFormat (URL/base64). */
+  /** Encoded artifact format; image delivery is always a URL. */
   outputFormat?: string;
-  /** Freeze with the submission; absence preserves legacy request bodies. */
+  /** Legacy input is accepted for document compatibility but never selects Base64. */
   responseFormat?: "url" | "b64_json";
 };
 export type ImageGenerationResult = { image: string; images?: string[]; thumbnails?: Array<string | undefined>; taskId?: string; assetIds?: string[] };
@@ -36,7 +37,7 @@ export type ImageGenerationOptions = {
   /** Injectable image reader for testing; never used while resuming a task. */
   loadReference?: (url: string) => Promise<Blob>;
   /** Look up a frozen submission before replaying its creation request. */
-  recovery?: { inputReferencesAvailable: boolean };
+  recovery?: { inputReferencesAvailable: boolean; allowResubmit?: boolean };
 };
 
 /** A pending task can be resumed with taskId; it must not be submitted again. */
@@ -142,8 +143,10 @@ const imageResultsFrom = (value: unknown): ImageResultEntry[] => {
   const data = record(value).data;
   if (!Array.isArray(data)) return [];
   return data.flatMap((entry) => {
-    const item = record(entry), url = string(item.url), base64 = string(item.b64_json);
-    const image = /^https?:\/\//i.test(url) ? url : base64 ? `data:image/png;base64,${base64}` : "";
+    const item = record(entry), url = string(item.url).trim();
+    // Inline provider bytes are intentionally not a recovery path. The
+    // Gateway must materialize the result in COS and return its delivery URL.
+    const image = /^https?:\/\//i.test(url) ? url : "";
     if (!image) return [];
     const thumbnail = string(item.thumbnail_url) || string(item.thumbnailUrl);
     return [{ image, ...( /^https?:\/\//i.test(thumbnail) ? { thumbnail } : {}) }];
@@ -228,10 +231,21 @@ function readResult(
     const assetIds = Array.isArray(data)
       ? data.flatMap((entry) => {
           const item = record(entry);
-          const image = /^https?:\/\//i.test(string(item.url)) || Boolean(string(item.b64_json));
+          const image = /^https?:\/\//i.test(string(item.url).trim());
           return image ? [string(item.asset_id)] : [];
         })
       : [];
+    if (!results.every((item, index) => hasStableMediaIdentity({
+      url: item.image,
+      taskId,
+      assetId: assetIds[index],
+    }))) {
+      throw new ImageGenerationError("图片生成完成但没有可恢复的素材身份", {
+        taskId,
+        code: "IMAGE_RESULT_IDENTITY_MISSING",
+        terminalTask: true,
+      });
+    }
     const thumbnails = results.map((item) => item.thumbnail);
     return {
       image,
@@ -252,8 +266,9 @@ function readResult(
 }
 
 async function readReference(url: string): Promise<Blob> {
-  if (!/^(https?:\/\/|data:image\/|blob:)/i.test(url))
-    throw new Error("图片地址无效");
+  // Edit references must be fetched from the platform/COS delivery. Data and
+  // Blob URLs are browser-local intermediates and are never a recovery path.
+  if (!/^(?:https?:\/\/|\/)/i.test(url)) throw new Error("图片地址无效");
   const response = await fetchCanvasResource(url, { credentials: "omit" });
   if (!response.ok) throw new Error(`图片读取失败（${response.status}）`);
   return response.blob();
@@ -429,6 +444,11 @@ export async function generateImage(
       throw new ImageGenerationError("原提交的参考图片缺失，请恢复原图片后重试。", {
         code: "IMAGE_SUBMISSION_INPUT_MISSING",
         pending: true,
+      });
+    } else if (options.recovery.allowResubmit === false) {
+      throw new ImageGenerationError("原图片提交暂未查到，已停止自动重提，请稍后重试。", {
+        pending: true,
+        code: "IMAGE_SUBMISSION_NOT_FOUND",
       });
     }
   }

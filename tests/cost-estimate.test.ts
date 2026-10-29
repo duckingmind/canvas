@@ -28,6 +28,7 @@ test("image estimation matches both generation JSON and edit multipart pricing p
       assert.equal(input_image_count, referenceCount);
       for (const [key, value] of Object.entries(parameters)) assert.equal(String(body[key]), String(value));
       assert.equal(body.size, undefined, "obsolete explicit size must not override tier + ratio");
+      assert.equal(body.response_format, "url", "generation still requests URL delivery");
       return { data: [{ url: "https://cdn.example/image.webp" }] };
     }, {
       model: model.id, prompt: "提交用提示词", count: settings.count, size: settings.size,
@@ -105,10 +106,10 @@ test("SDK failures keep their code instead of becoming an indistinguishable empt
 });
 
 test("currency formatting retains small costs, genuine zero and the returned currency", () => {
-  assert.equal(estimatedCostLabel({ status: "ready", amount: 0.00001, currency: "USD" }), "预估 US$0.00001");
-  assert.equal(estimatedCostLabel({ status: "ready", amount: 0.0000001, currency: "USD" }), "预估 <US$0.000001");
-  assert.equal(estimatedCostLabel({ status: "ready", amount: 0, currency: "USD" }), "预估 US$0.00");
-  assert.equal(estimatedCostLabel({ status: "ready", amount: 1.2, currency: "CNY" }), "预估 ¥1.20");
+  assert.equal(estimatedCostLabel({ status: "ready", amount: 0.00001, currency: "USD" }), "参考 US$0.00001");
+  assert.equal(estimatedCostLabel({ status: "ready", amount: 0.0000001, currency: "USD" }), "参考 <US$0.000001");
+  assert.equal(estimatedCostLabel({ status: "ready", amount: 0, currency: "USD" }), "参考 US$0.00");
+  assert.equal(estimatedCostLabel({ status: "ready", amount: 1.2, currency: "CNY" }), "参考 ¥1.20");
   assert.equal(estimatedCostLabel({ status: "loading" }), "估算中…");
   assert.equal(estimatedCostLabel({ status: "unavailable" }), "暂无法估价");
 });

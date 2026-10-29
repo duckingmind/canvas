@@ -2,10 +2,12 @@ import { captureLocalStorageScope } from "./local-storage-scope.ts";
 import React from "react";
 import { registerCanvasCapabilities } from "./agent-registration";
 import type { CanvasAgentContext } from "./agent-capabilities";
-import { Layers2, PanelLeftOpen, Plus } from "lucide-react";
+import type { AgentHandler, AgentInvocationContext } from "@ducking-mind/proxy-app-sdk";
+import manifest from "../manifest.json";
+import { getAgentCapabilities } from "./agent-tools.mjs";
+import { LoaderCircle, PanelLeftOpen, Plus } from "lucide-react";
 import App, {
   documentRevisionSignature,
-  documentSignature,
   normalize,
   syncCloudDocument,
 } from "./App";
@@ -19,17 +21,23 @@ import {
   importCloudCanvas,
   listCanvases,
   migrateLegacy,
+  listPendingCloudSync,
+  getPendingCloudSync,
+  queuePendingCloudSync,
+  removePendingCloudSync,
   renameCanvas,
   saveCanvas,
   setCanvasDeleted,
   type CanvasSummary,
 } from "./library-store";
 import { listCanvasDocuments, readCanvasDocument } from "./document-storage";
-import { restoreLocalImages } from "./image-cache";
+import { loadCanvasPreferences } from "./canvas-preferences";
 import { isSessionOnlyStorage, markSessionSynced } from "./draft-store";
 import { platformFailure } from "./platform-status";
 import { usePlatformAccess } from "./PlatformGate";
+import CanvasLoadingIndicator from "./CanvasLoadingIndicator";
 import { useTransientNotice } from "./useTransientNotice";
+import { canvasContentSignature, resolveCloudDocumentVersion } from "./cloud-version";
 import {
   classifyCloudAcknowledgement,
   classifyCloudDocument,
@@ -59,6 +67,18 @@ const blankDocument = (name = "未命名画布") => {
 
 const CANVAS_LOADING_FADE_MS = 360;
 const CANVAS_LOADING_SETTLE_MS = CANVAS_LOADING_FADE_MS + 60;
+const CANVAS_SWITCH_FEEDBACK_DELAY_MS = 180;
+const CANVAS_SWITCH_FADE_MS = 220;
+type CanvasSwitchIndicator = {
+  id: string;
+  name: string;
+  message: string;
+  phase: "pending" | "visible" | "dismissing";
+};
+const WORKSPACE_CAPABILITIES = new Set(["list_documents", "open_document", "create_document"]);
+const EDITOR_CAPABILITY_NAMES = getAgentCapabilities()
+  .map(({ name }) => name)
+  .filter((name) => name !== "read_metadata" && !WORKSPACE_CAPABILITIES.has(name));
 
 export default function Workspace() {
   const checkAccount = React.useRef(captureLocalStorageScope()).current;
@@ -74,8 +94,17 @@ export default function Workspace() {
   const lastPlatformRevision = React.useRef(platformRevision);
   const [items, setItems] = React.useState<CanvasSummary[]>([]);
   const [active, setActive] = React.useState<Document | null>(null);
+  const [workspaceReady, setWorkspaceReady] = React.useState(false);
   const activeRef = React.useRef(active);
   activeRef.current = active;
+  const [switchIndicator, setSwitchIndicator] = React.useState<CanvasSwitchIndicator | null>(null);
+  const switchIndicatorRef = React.useRef<CanvasSwitchIndicator | null>(null);
+  const [switchReadyId, setSwitchReadyId] = React.useState<string | null>(null);
+  const switchTargetRef = React.useRef<string | null>(null);
+  const switchFeedbackTimer = React.useRef<number | null>(null);
+  const switchDismissTimer = React.useRef<number | null>(null);
+  const switchReadyTimer = React.useRef<number | null>(null);
+  const [reduceMotion, setReduceMotion] = React.useState(() => loadCanvasPreferences().reduceMotion);
   const [loading, setLoading] = React.useState(true);
   const [loadingDismissed, setLoadingDismissed] = React.useState(false);
   const loadingDismissTimer = React.useRef<number | null>(null);
@@ -95,6 +124,10 @@ export default function Workspace() {
   const panel = React.useRef<HTMLDivElement>(null);
   const editorElement = React.useRef<HTMLDivElement>(null);
   const editor = React.useRef<CanvasEditorHandle | null>(null);
+  const editorAgentHandlers = React.useRef<Record<string, AgentHandler>>({});
+  const registerEditorAgent = React.useCallback((handlers: Record<string, AgentHandler> | null) => {
+    editorAgentHandlers.current = handlers || {};
+  }, []);
   const operation = React.useRef(false);
   const pendingHistory = React.useRef<{ id: string | null } | null>(null);
   const cloudListAttempted = React.useRef(false);
@@ -102,6 +135,7 @@ export default function Workspace() {
   const cloudListRequestRevision = React.useRef(platformRevision);
   const requestedDocument = React.useRef(routeId());
   const cloudReady = React.useRef(false);
+  const pendingSyncRun = React.useRef<Promise<void> | null>(null);
   const live = React.useRef(true);
   const registerEditor = React.useCallback(
     (handler: CanvasEditorHandle | null) => {
@@ -148,7 +182,7 @@ export default function Workspace() {
           local,
           normalize(document),
           previous[document.id],
-          documentSignature,
+          canvasContentSignature,
           documentRevisionSignature,
         ),
       }));
@@ -163,6 +197,73 @@ export default function Workspace() {
         routeUrl(id),
       );
   };
+  const setCanvasSwitchIndicator = (next: CanvasSwitchIndicator | null) => {
+    switchIndicatorRef.current = next;
+    setSwitchIndicator(next);
+  };
+  const clearCanvasSwitchTimers = () => {
+    if (switchFeedbackTimer.current !== null) {
+      window.clearTimeout(switchFeedbackTimer.current);
+      switchFeedbackTimer.current = null;
+    }
+    if (switchDismissTimer.current !== null) {
+      window.clearTimeout(switchDismissTimer.current);
+      switchDismissTimer.current = null;
+    }
+    if (switchReadyTimer.current !== null) {
+      window.clearTimeout(switchReadyTimer.current);
+      switchReadyTimer.current = null;
+    }
+  };
+  const beginCanvasSwitch = (id: string, name: string, message: string) => {
+    clearCanvasSwitchTimers();
+    setReduceMotion(loadCanvasPreferences().reduceMotion);
+    switchTargetRef.current = id;
+    setSwitchReadyId(null);
+    setCanvasSwitchIndicator({ id, name, message, phase: "pending" });
+    switchFeedbackTimer.current = window.setTimeout(() => {
+      switchFeedbackTimer.current = null;
+      const current = switchIndicatorRef.current;
+      if (live.current && current?.id === id && current.phase === "pending")
+        setCanvasSwitchIndicator({ ...current, phase: "visible" });
+    }, CANVAS_SWITCH_FEEDBACK_DELAY_MS);
+  };
+  const updateCanvasSwitchMessage = (id: string, message: string) => {
+    const current = switchIndicatorRef.current;
+    if (current?.id !== id) return;
+    setCanvasSwitchIndicator({ ...current, message });
+  };
+  const cancelCanvasSwitch = () => {
+    clearCanvasSwitchTimers();
+    switchTargetRef.current = null;
+    setCanvasSwitchIndicator(null);
+    setSwitchReadyId(null);
+  };
+  const onEditorReady = React.useCallback((id: string) => {
+    if (switchTargetRef.current !== id) return;
+    switchTargetRef.current = null;
+    const stillWaitingToShow = switchFeedbackTimer.current !== null;
+    if (switchFeedbackTimer.current !== null) {
+      window.clearTimeout(switchFeedbackTimer.current);
+      switchFeedbackTimer.current = null;
+    }
+    const current = switchIndicatorRef.current;
+    const shouldAnimate = !stillWaitingToShow && current?.id === id && current.phase === "visible" && !reduceMotion;
+    setSwitchReadyId(shouldAnimate ? id : null);
+    if (!shouldAnimate) {
+      setCanvasSwitchIndicator(null);
+    } else {
+      setCanvasSwitchIndicator({ ...current, phase: "dismissing" });
+      switchDismissTimer.current = window.setTimeout(() => {
+        switchDismissTimer.current = null;
+        if (switchIndicatorRef.current?.id === id) setCanvasSwitchIndicator(null);
+      }, CANVAS_SWITCH_FADE_MS);
+      switchReadyTimer.current = window.setTimeout(() => {
+        switchReadyTimer.current = null;
+        setSwitchReadyId((currentId) => currentId === id ? null : currentId);
+      }, CANVAS_SWITCH_FADE_MS);
+    }
+  }, [reduceMotion]);
   const activate = (value: Document | null, replace = false) => {
     requestedDocument.current = null;
     activeRef.current = value;
@@ -209,7 +310,7 @@ export default function Workspace() {
         try {
           const remote = await readCanvasDocument(client.storage, id);
           if (remote) {
-            await importCloudCanvas(await restoreLocalImages(normalize(remote)));
+            await importCloudCanvas(normalize(remote));
             checkAccount();
             value = await getCanvas<Document>(id);
           }
@@ -225,7 +326,7 @@ export default function Workspace() {
       );
     if (value.deletedAt)
       throw new Error("这张画布已移入回收站，请先恢复后再打开。");
-    return restoreLocalImages(normalize(value));
+    return normalize(value);
   };
   const prepareSwitch = async (signal?: AbortSignal) => {
     signal?.throwIfAborted();
@@ -244,12 +345,17 @@ export default function Workspace() {
       return;
     }
     requestedDocument.current = id;
+    const targetName = items.find((item) => item.id === id)?.name || "目标画布";
+    beginCanvasSwitch(id, targetName, "正在打开画布…");
     try {
       const value = await readDocument(id);
+      updateCanvasSwitchMessage(id, "正在保存当前画布…");
       await prepareSwitch(signal);
+      updateCanvasSwitchMessage(id, "正在显示新画布…");
       activate(value, fromHistory);
       await reloadList();
     } catch (cause) {
+      cancelCanvasSwitch();
       if (fromHistory) setRoute(previous?.id || null, true);
       throw cause;
     }
@@ -257,20 +363,33 @@ export default function Workspace() {
   const create = async (name = "未命名画布", signal?: AbortSignal) => {
     checkAccount();
     const value = blankDocument(name);
-    await prepareSwitch(signal);
-    checkAccount();
-    await saveCanvas(value);
-    markLocalSave(value);
-    activate(value);
-    await reloadList();
-    if (isSessionOnlyStorage()) await mirrorManagement(value.id, null);
+    beginCanvasSwitch(value.id, value.name, "正在创建画布…");
+    try {
+      updateCanvasSwitchMessage(value.id, "正在保存当前画布…");
+      await prepareSwitch(signal);
+      checkAccount();
+      await saveCanvas(value);
+      markLocalSave(value);
+      updateCanvasSwitchMessage(value.id, "正在显示新画布…");
+      activate(value);
+      await reloadList();
+      if (isSessionOnlyStorage()) await mirrorManagement(value.id, null);
+    } catch (cause) {
+      cancelCanvasSwitch();
+      throw cause;
+    }
   };
   const workspaceAgentRef = React.useRef<Record<string, (input: any, context: CanvasAgentContext) => Promise<unknown>>>({});
   const runAgent = async (input: { expected_active_document_id: string }, context: CanvasAgentContext, action: () => Promise<void>) => {
     context.signal.throwIfAborted();
-    const fail = (message: string) => { throw Object.assign(new Error(message), { code: "CANVAS_WORKSPACE_CONFLICT", executionStarted: false }); };
-    if (!platformReadyRef.current || !live.current || loading || operation.current) fail("画布工作区尚未就绪或正在切换");
-    if (input.expected_active_document_id !== (activeRef.current?.id || "")) fail("当前画布已变化，请重新读取 list_documents");
+    const fail = (code: string, message: string, retryable: boolean, nextAction: { type: "wait" | "user_login" }) => {
+      throw Object.assign(new Error(message), { code, executionStarted: false, retryable, nextAction });
+    };
+    if (!platformReadyRef.current || !live.current) fail("APP_LOGIN_REQUIRED", "请先登录后再操作画布", false, { type: "user_login" });
+    if (loading || operation.current) fail("AGENT_APP_NOT_READY", "画布工作区正在加载或切换，请稍后重试", true, { type: "wait" });
+    if (input.expected_active_document_id !== (activeRef.current?.id || "")) {
+      throw Object.assign(new Error("当前画布已变化，请重新读取 list_documents"), { code: "CANVAS_WORKSPACE_CONFLICT", executionStarted: false });
+    }
     operation.current = true; setBusy(true);
     try {
       await action();
@@ -281,7 +400,8 @@ export default function Workspace() {
   workspaceAgentRef.current = {
     list_documents: async (input: { offset?: number; limit?: number }, context) => {
       context.signal.throwIfAborted();
-      if (!platformReadyRef.current || !live.current) throw new Error("请先登录");
+      if (!platformReadyRef.current || !live.current) throw Object.assign(new Error("请先登录后再读取画布"), { code: "APP_LOGIN_REQUIRED", executionStarted: false, retryable: false, nextAction: { type: "user_login" } });
+      if (loading || operation.current) throw Object.assign(new Error("画布目录正在加载或切换，请稍后重试"), { code: "AGENT_APP_NOT_READY", executionStarted: false, retryable: true, nextAction: { type: "wait" } });
       const offset = input.offset ?? 0, limit = input.limit ?? 50;
       const documents = (await listCanvases()).filter(item => !item.deletedAt);
       return { activeDocumentId: activeRef.current?.id || "", documents: documents.slice(offset, offset + limit).map(({ id, name, updatedAt, nodeCount, pendingTasks }) => ({ id, name, updatedAt, nodeCount, pendingTasks })), nextOffset: offset + limit < documents.length ? offset + limit : null };
@@ -293,9 +413,33 @@ export default function Workspace() {
     }),
   };
   React.useEffect(() => {
-    if (!platformReady || loading) return;
-    return registerCanvasCapabilities(Object.fromEntries(["list_documents", "open_document", "create_document"].map(name => [name, (input: unknown, context: CanvasAgentContext) => workspaceAgentRef.current[name](input, context)])));
-  }, [platformReady, loading]);
+    const workspaceHandlers = Object.fromEntries(
+      ["read_metadata", "list_documents", "open_document", "create_document"].map((name) => [
+        name,
+        name === "read_metadata"
+          ? async () => ({ appId: manifest.id, version: manifest.version, name: manifest.name })
+          : (input: unknown, context: AgentInvocationContext) => workspaceAgentRef.current[name](input, context),
+      ]),
+    );
+    const editorHandlers = Object.fromEntries(
+      EDITOR_CAPABILITY_NAMES.map((name) => [
+        name,
+        async (input: unknown, context: AgentInvocationContext) => {
+          const handler = editorAgentHandlers.current[name];
+          if (!handler) {
+            throw Object.assign(new Error("请先打开或新建画布"), {
+              code: "CANVAS_NO_DOCUMENT",
+              executionStarted: false,
+              retryable: true,
+              nextAction: { type: "open_document", capability: "proxy_canvas_create_document" },
+            });
+          }
+          return handler(input, context);
+        },
+      ]),
+    );
+    return registerCanvasCapabilities({ ...workspaceHandlers, ...editorHandlers });
+  }, []);
   React.useEffect(() => {
     if (!platformReady) return;
     const context = active?.id ? { activeDocumentId: active.id } : {};
@@ -314,13 +458,21 @@ export default function Workspace() {
       updatedAt: at,
       deletedAt: undefined,
     });
-    await prepareSwitch();
-    checkAccount();
-    await saveCanvas(value);
-    markLocalSave(value);
-    activate(value);
-    await reloadList();
-    if (isSessionOnlyStorage()) await mirrorManagement(value.id, null);
+    beginCanvasSwitch(value.id, value.name, "正在导入画布…");
+    try {
+      updateCanvasSwitchMessage(value.id, "正在保存当前画布…");
+      await prepareSwitch();
+      checkAccount();
+      await saveCanvas(value);
+      markLocalSave(value);
+      updateCanvasSwitchMessage(value.id, "正在显示新画布…");
+      activate(value);
+      await reloadList();
+      if (isSessionOnlyStorage()) await mirrorManagement(value.id, null);
+    } catch (cause) {
+      cancelCanvasSwitch();
+      throw cause;
+    }
   };
   const importFile = () => {
     const input = document.createElement("input");
@@ -342,7 +494,7 @@ export default function Workspace() {
           throw new Error("文件不是有效画布，需要包含节点和连接。");
         if (value.schema && value.schema !== "proxy.canvas/v3")
           throw new Error("暂不支持此画布格式，请使用本应用导出的 JSON。");
-        await importDocument(await restoreLocalImages(normalize(value)));
+        await importDocument(normalize(value));
       });
     input.click();
   };
@@ -359,8 +511,13 @@ export default function Workspace() {
     const request = (async () => {
       try {
         checkAccount();
-        // `createSession()` already validates the session and account scope.
-        const session = await client.platform.createSession();
+        // PlatformGate validates the session before the workspace mounts.
+        // Reuse that admitted session for the initial cloud listing instead
+        // of rotating it again and revoking the bearer used by startup calls.
+        const admittedSession = client.session();
+        const session = admittedSession?.access_token && admittedSession.account_scope
+          ? admittedSession
+          : await client.platform.createSession();
         checkAccount();
         if (!current()) return false;
         if (!session.account_scope) {
@@ -384,12 +541,12 @@ export default function Workspace() {
             nextStatuses[raw.id] = classifyCloudDocument(
               normalize(existing),
               normalize(raw),
-              documentSignature,
+              canvasContentSignature,
               documentRevisionSignature,
             );
             continue;
           }
-          const value = await restoreLocalImages(normalize(raw));
+          const value = normalize(raw);
           checkAccount();
           if (!current()) return false;
           const imported = await importCloudCanvas(value);
@@ -399,7 +556,7 @@ export default function Workspace() {
             nextStatuses[value.id] = classifyCloudDocument(
               value,
               value,
-              documentSignature,
+              canvasContentSignature,
               documentRevisionSignature,
             );
           }
@@ -413,7 +570,7 @@ export default function Workspace() {
           nextStatuses[item.id] = classifyCloudDocument(
             local ? normalize(local) : null,
             null,
-            documentSignature,
+            canvasContentSignature,
             documentRevisionSignature,
           );
         }
@@ -445,6 +602,92 @@ export default function Workspace() {
     cloudListRequest.current = request;
     return request;
   };
+  const resumePendingCloudSync = React.useCallback((): Promise<void> => {
+    if (pendingSyncRun.current) return pendingSyncRun.current;
+    if (!platformReadyRef.current || !navigator.onLine || !live.current || !workspaceReady)
+      return Promise.resolve();
+    const revision = platformRevisionRef.current;
+    const current = () =>
+      live.current &&
+      platformReadyRef.current &&
+      revision === platformRevisionRef.current;
+    const request = (async () => {
+      try {
+        const records = await listPendingCloudSync();
+        checkAccount();
+        for (const record of records) {
+          if (!current()) return;
+          if (record.paused) continue;
+          if (activeRef.current?.id === record.id) continue;
+          try {
+            let persisted = await getCanvas<Document>(record.id);
+            checkAccount();
+            if (!persisted) continue;
+            await queuePendingCloudSync(persisted, { reactivatePaused: false });
+            checkAccount();
+            const local = normalize(persisted);
+            const pending = await getPendingCloudSync(record.id);
+            checkAccount();
+            if (!pending || pending.paused) continue;
+            if (activeRef.current?.id === record.id) continue;
+            const remoteValue = await readCanvasDocument(client.storage, record.id);
+            checkAccount();
+            if (!current()) return;
+            if (activeRef.current?.id === record.id) continue;
+            const remote = remoteValue
+              ? normalize({ ...(remoteValue as object), id: record.id })
+              : null;
+            if (remote) {
+              const resolution = resolveCloudDocumentVersion(
+                local,
+                remote,
+                canvasContentSignature,
+                documentRevisionSignature,
+              );
+              if (resolution === "same") {
+                await removePendingCloudSync(record.id, pending.revision);
+                continue;
+              }
+              // A background outbox has no retained common ancestor. Timestamp
+              // ordering alone cannot prove that the local document contains
+              // the newer cloud edits, so never replace a divergent document
+              // wholesale. Opening the canvas exposes its recovery/merge flow.
+              continue;
+            }
+            const delivered = await syncCloudDocument(persisted);
+            checkAccount();
+            if (delivered) onCloudSynced(delivered);
+          } catch (cause) {
+            checkAccount();
+            const failure = platformFailure(cause);
+            if (failure.kind === "login") {
+              requireLogin(failure.message);
+              return;
+            }
+          }
+        }
+      } catch (cause) {
+        if (!current()) return;
+        const failure = platformFailure(cause);
+        if (failure.kind === "login") requireLogin(failure.message);
+      }
+    })().finally(() => {
+      if (pendingSyncRun.current === request) pendingSyncRun.current = null;
+    });
+    pendingSyncRun.current = request;
+    return request;
+  }, [checkAccount, onCloudSynced, requireLogin, workspaceReady]);
+  React.useEffect(() => {
+    if (platformReady && workspaceReady) void resumePendingCloudSync();
+  }, [platformReady, platformRevision, resumePendingCloudSync, workspaceReady, active?.id]);
+  React.useEffect(() => {
+    const resume = () => {
+      if (navigator.onLine && platformReadyRef.current && workspaceReady)
+        void resumePendingCloudSync();
+    };
+    window.addEventListener("online", resume);
+    return () => window.removeEventListener("online", resume);
+  }, [resumePendingCloudSync, workspaceReady]);
   React.useEffect(() => {
     if (!sidebarOpen) {
       cloudListAttempted.current = false;
@@ -463,13 +706,12 @@ export default function Workspace() {
     }
     try {
       const value = await getCanvas<Document>(id);
-      if (value)
-        await syncCloudDocument(
+      const synced = value ? await syncCloudDocument(
           value,
           Promise.resolve(),
           previous || undefined,
-        );
-      if (value) onCloudSynced(value);
+        ) : false;
+      if (synced) onCloudSynced(synced);
     } catch (cause) {
       if (live.current) {
         const failure = platformFailure(cause);
@@ -657,6 +899,7 @@ export default function Workspace() {
         }
         if (!live.current) setLoading(false);
         drainHistory();
+        if (live.current) setWorkspaceReady(true);
       }
       // Do not enumerate every cloud canvas during a normal local-storage
       // bootstrap. The active document is hydrated by App; full discovery is
@@ -709,6 +952,10 @@ export default function Workspace() {
       if (secondFrame) window.cancelAnimationFrame(secondFrame);
     };
   }, [active, loading, platformReady]);
+  React.useEffect(() => () => {
+    clearCanvasSwitchTimers();
+    switchTargetRef.current = null;
+  }, []);
   React.useEffect(() => {
     if (!platformReady) {
       cloudReady.current = false;
@@ -815,7 +1062,7 @@ export default function Workspace() {
   const showLoadingVeil = platformReady && loading;
 
   return (
-    <div className={`canvas-workbench ${sidebarOpen ? "sidebar-open" : ""}`}>
+    <div className={`canvas-workbench${sidebarOpen ? " sidebar-open" : ""}${reduceMotion ? " canvas-reduce-motion" : ""}`}>
       {notice && <div className="workspace-toast" role="status"><span>{notice.text}</span>
         {notice.action && <button type="button" className="toast-action" onClick={() => { setNotice(""); notice.action?.run(); }}>{notice.action.label}</button>}
         <button type="button" aria-label="关闭提示" onClick={() => setNotice("")}>×</button></div>}
@@ -870,41 +1117,39 @@ export default function Workspace() {
       </div>
       <div className="canvas-workbench-editor" ref={editorElement}>
         {active && (
-          <div className={`canvas-editor-enter${loadingDismissed ? " is-revealing" : ""}`}>
+          <div className={`canvas-editor-enter${loadingDismissed ? " is-revealing" : ""}${switchReadyId === active.id ? " is-switching" : ""}`}>
             <App
               key={active.id}
               initialDocument={active}
               registerEditor={registerEditor}
+              registerAgentHandlers={registerEditorAgent}
               libraryOpen={sidebarOpen}
+              isSwitchingCanvas={Boolean(switchIndicator)}
               onToggleLibrary={() => setSidebarOpen((open) => !open)}
               onCanvasInteraction={() => {
                 if (sidebarOpen) setSidebarOpen(false);
               }}
+              onReady={onEditorReady}
               onSaved={onSaved}
               onCloudSynced={onCloudSynced}
             />
           </div>
         )}
+        {switchIndicator && switchIndicator.phase !== "pending" && (
+          <div
+            className={`canvas-switch-indicator is-${switchIndicator.phase}`}
+            role="status"
+            aria-live="polite"
+            aria-label={`${switchIndicator.message}${switchIndicator.name ? `：${switchIndicator.name}` : ""}`}
+          >
+            <LoaderCircle size={15} aria-hidden="true" />
+            <span>{switchIndicator.message}</span>
+            <strong>{switchIndicator.name}</strong>
+          </div>
+        )}
         {showLoadingVeil && (
           <div className={`canvas-workbench-empty is-loading${loadingDismissed ? " is-dismissing" : ""}`}>
-            <div
-              className="canvas-loading-indicator"
-              role="status"
-              aria-label="正在加载画布"
-            >
-              <div className="canvas-loading-brand" aria-hidden="true">
-                <span className="canvas-loading-mark">
-                  <span className="canvas-loading-orbit canvas-loading-orbit-a" />
-                  <span className="canvas-loading-orbit canvas-loading-orbit-b" />
-                  <Layers2 size={23} />
-                </span>
-                <span className="canvas-loading-copy">
-                  <strong>Canvas</strong>
-                  <span>正在准备你的画布</span>
-                </span>
-              </div>
-              <span className="canvas-loading-track" aria-hidden="true"><span /></span>
-            </div>
+            <CanvasLoadingIndicator />
           </div>
         )}
         {!active && !showLoadingVeil && (

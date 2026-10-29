@@ -22,7 +22,6 @@ export type CanvasPreferences = {
   showEdges: boolean;
   showNodeStatus: boolean;
   nodeDensity: "comfortable" | "compact";
-  autoLayout: "flow" | "grid";
   backgroundPreset: "midnight" | "graphite" | "warm";
   accent: "mono" | "cyan" | "violet";
   connectionColor: "muted" | "accent" | "node";
@@ -53,7 +52,6 @@ export const DEFAULT_CANVAS_PREFERENCES: CanvasPreferences = {
   showEdges: true,
   showNodeStatus: true,
   nodeDensity: "comfortable",
-  autoLayout: "flow",
   backgroundPreset: "midnight",
   accent: "mono",
   connectionColor: "muted",
@@ -102,7 +100,6 @@ export function normalizeCanvasPreferences(value: unknown): CanvasPreferences {
     showEdges: bool("showEdges"),
     showNodeStatus: bool("showNodeStatus"),
     nodeDensity: oneOf(raw.nodeDensity, ["comfortable", "compact"], "comfortable"),
-    autoLayout: oneOf(raw.autoLayout, ["flow", "grid"], "flow"),
     backgroundPreset: oneOf(raw.backgroundPreset, ["midnight", "graphite", "warm"], "midnight"),
     accent: oneOf(raw.accent, ["mono", "cyan", "violet"], "mono"),
     connectionColor: oneOf(raw.connectionColor, ["muted", "accent", "node"], "muted"),

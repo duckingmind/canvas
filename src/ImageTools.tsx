@@ -1,22 +1,27 @@
 import React from "react";
 import { createPortal } from "react-dom";
-import { Crop, Expand, FlipHorizontal, Grid2X2, Layers3, Rotate3d, Shrink, SlidersHorizontal, SunMedium, Type, WandSparkles, X } from "lucide-react";
+import { CircleUserRound, Crop, Expand, Grid2X2, Layers3, Rotate3d, SlidersHorizontal, SunMedium, Type, WandSparkles, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import MediaToolMenu, { dismissMediaToolMenus } from "./MediaToolMenu";
+import ImageAnnotator from "./ImageAnnotator";
+import ImageCropEditor from "./ImageCropEditor";
+import ImageLayerSplitter from "./ImageLayerSplitter";
+import CharacterTurnaroundEditor, { type CharacterTurnaroundRequest } from "./CharacterTurnaroundEditor";
+import type { NoticeAction } from "./useTransientNotice";
 import "./image-tools.css";
 
 export type ImageToolId =
-  | "crop"
-  | "compress"
-  | "mirror"
+  | "basic-edit"
   | "grid"
   | "adjust"
   | "annotate"
+  | "layer-split"
   | "remove-background"
   | "relight"
   | "depth"
   | "outpaint"
-  | "angle";
+  | "angle"
+  | "character-turnaround";
 
 export type ImageToolOutput = {
   dataUrl: string;
@@ -31,10 +36,12 @@ type ImageToolsProps = {
   source: string;
   title: string;
   onApply: (outputs: ImageToolOutput[]) => void;
+  /** Create a prompt node that uses the current image as the character reference. */
+  onCreatePrompt?: (request: CharacterTurnaroundRequest) => void;
   /** Resolve a cached, editable source before the canvas operation starts. */
   resolveSource?: () => Promise<string | undefined>;
   /** Surface transient operation failures through the workbench toast. */
-  onNotice?: (text: string) => void;
+  onNotice?: (text: string, action?: NoticeAction) => void;
 };
 
 type ToolDefinition = {
@@ -47,22 +54,29 @@ type ToolDefinition = {
 };
 
 const TOOLS: ToolDefinition[] = [
-  { id: "crop", label: "裁剪", detail: "按边距裁剪图片", icon: Crop, group: "basic", available: true },
-  { id: "compress", label: "压缩", detail: "调整格式与质量", icon: Shrink, group: "basic", available: true },
-  { id: "mirror", label: "镜像", detail: "水平或垂直翻转", icon: FlipHorizontal, group: "basic", available: true },
+  { id: "basic-edit", label: "图片基础编辑", detail: "裁剪、翻转并设置输出格式与质量", icon: Crop, group: "basic", available: true },
   { id: "grid", label: "宫格裁剪", detail: "切分为多张图片", icon: Grid2X2, group: "basic", available: true },
   { id: "adjust", label: "图片调整", detail: "亮度、对比度与饱和度", icon: SlidersHorizontal, group: "basic", available: true },
-  { id: "annotate", label: "标记修图", detail: "添加文字标记", icon: Type, group: "basic", available: true },
+  { id: "annotate", label: "标记修图", detail: "画笔、箭头、形状、文字与马赛克", icon: Type, group: "basic", available: true },
+  { id: "layer-split", label: "图层拆分", detail: "框选区域并拆分为独立图层", icon: Layers3, group: "smart", available: true },
   { id: "remove-background", label: "智能抠图", detail: "需要平台分割模型", icon: WandSparkles, group: "smart", available: false },
   { id: "relight", label: "智能打光", detail: "需要平台重光照模型", icon: SunMedium, group: "smart", available: false },
   { id: "depth", label: "转深度图", detail: "需要平台深度模型", icon: Layers3, group: "smart", available: false },
   { id: "outpaint", label: "扩图", detail: "需要平台扩图模型", icon: Expand, group: "smart", available: false },
   { id: "angle", label: "角度", detail: "需要平台视角模型", icon: Rotate3d, group: "smart", available: false },
+  { id: "character-turnaround", label: "角色三视图", detail: "基于当前角色图生成正、侧、背三视图", icon: CircleUserRound, group: "smart", available: true },
 ];
 
 type ImageSize = { width: number; height: number };
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const normalizeCropPair = (first: number, second: number): [number, number] => {
+  const a = clamp(first, 0, 94);
+  const b = clamp(second, 0, 94);
+  if (a + b <= 94) return [a, b];
+  const scale = 94 / (a + b || 1);
+  return [a * scale, b * scale];
+};
 
 function loadImage(source: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -79,6 +93,18 @@ function loadImage(source: string): Promise<HTMLImageElement> {
 
 function canvasDataUrl(canvas: HTMLCanvasElement, format = "image/png", quality?: number) {
   return canvas.toDataURL(format, quality);
+}
+
+function dataUrlSize(dataUrl: string): number {
+  const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor(base64.length * 3 / 4) - padding);
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 function drawBase(image: HTMLImageElement, width = image.naturalWidth, height = image.naturalHeight) {
@@ -122,6 +148,49 @@ async function renderOperation(source: string, operation: ImageToolId, params: R
     throw new Error("该操作需要平台图片模型，当前暂未接入模型接口。");
   }
 
+  if (operation === "basic-edit") {
+    const [left, right] = normalizeCropPair(Number(params.left) || 0, Number(params.right) || 0);
+    const [top, bottom] = normalizeCropPair(Number(params.top) || 0, Number(params.bottom) || 0);
+    const scale = clamp(Number(params.scale) || 1, 0.25, 1);
+    const x = Math.floor(originalWidth * left / 100);
+    const y = Math.floor(originalHeight * top / 100);
+    const width = Math.max(1, Math.floor(originalWidth * (1 - (left + right) / 100)));
+    const height = Math.max(1, Math.floor(originalHeight * (1 - (top + bottom) / 100)));
+    const outputWidth = Math.max(1, Math.round(width * scale));
+    const outputHeight = Math.max(1, Math.round(height * scale));
+    const horizontal = params.horizontal === true;
+    const vertical = params.vertical === true;
+    const requestedFormat = String(params.format || "image/png");
+    const format = requestedFormat === "image/jpeg" || requestedFormat === "image/webp" ? requestedFormat : "image/png";
+    const quality = clamp(Number(params.quality) || 90, 10, 100);
+    const { canvas, context } = drawBase(image, outputWidth, outputHeight);
+    context.clearRect(0, 0, outputWidth, outputHeight);
+    if (format === "image/jpeg") {
+      context.fillStyle = "#fff";
+      context.fillRect(0, 0, outputWidth, outputHeight);
+    }
+    context.save();
+    context.translate(horizontal ? outputWidth : 0, vertical ? outputHeight : 0);
+    context.scale(horizontal ? -1 : 1, vertical ? -1 : 1);
+    context.drawImage(image, x, y, width, height, 0, 0, outputWidth, outputHeight);
+    context.restore();
+    const dataUrl = canvasDataUrl(canvas, format, format === "image/png" ? undefined : quality / 100);
+    const actualFormat = dataUrl.slice(0, dataUrl.indexOf(";"));
+    const operations = [
+      left || right || top || bottom || scale !== 1 ? "裁剪" : "",
+      horizontal || vertical ? "翻转" : "",
+      actualFormat !== "data:image/png" ? "压缩" : "",
+    ].filter(Boolean);
+    return [{
+      dataUrl,
+      width: outputWidth,
+      height: outputHeight,
+      operationId: operation,
+      params: { left, right, top, bottom, scale, horizontal, vertical, quality: actualFormat === "data:image/png" ? 100 : quality, format: actualFormat.replace("data:", ""), operations: operations.join(",") },
+      titleSuffix: operations.length ? `基础编辑 · ${operations.join("、")}` : "基础编辑",
+    }];
+  }
+
   if (operation === "grid") {
     const rows = clamp(Number(params.rows) || 2, 1, 6);
     const columns = clamp(Number(params.columns) || 2, 1, 6);
@@ -142,34 +211,6 @@ async function renderOperation(source: string, operation: ImageToolId, params: R
       }
     }
     return outputs;
-  }
-
-  if (operation === "crop") {
-    const left = clamp(Number(params.left) || 0, 0, 45);
-    const right = clamp(Number(params.right) || 0, 0, 45);
-    const top = clamp(Number(params.top) || 0, 0, 45);
-    const bottom = clamp(Number(params.bottom) || 0, 0, 45);
-    const x = Math.floor(originalWidth * left / 100);
-    const y = Math.floor(originalHeight * top / 100);
-    const width = Math.max(1, Math.floor(originalWidth * (1 - (left + right) / 100)));
-    const height = Math.max(1, Math.floor(originalHeight * (1 - (top + bottom) / 100)));
-    const { canvas, context } = drawBase(image, width, height);
-    context.clearRect(0, 0, width, height);
-    context.drawImage(image, x, y, width, height, 0, 0, width, height);
-    return [{ dataUrl: canvasDataUrl(canvas), width, height, operationId: operation, params: { left, right, top, bottom }, titleSuffix: "裁剪" }];
-  }
-
-  if (operation === "mirror") {
-    const horizontal = params.horizontal !== false;
-    const vertical = params.vertical === true;
-    const { canvas, context } = drawBase(image);
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.save();
-    context.translate(horizontal ? canvas.width : 0, vertical ? canvas.height : 0);
-    context.scale(horizontal ? -1 : 1, vertical ? -1 : 1);
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
-    context.restore();
-    return [{ dataUrl: canvasDataUrl(canvas), width: canvas.width, height: canvas.height, operationId: operation, params: { horizontal, vertical }, titleSuffix: horizontal && vertical ? "翻转" : horizontal ? "水平镜像" : "垂直镜像" }];
   }
 
   const { canvas } = drawBase(image);
@@ -198,29 +239,23 @@ async function renderOperation(source: string, operation: ImageToolId, params: R
     context.fillText(text, padding * 2, canvas.height - size / 2 - padding);
     return [{ dataUrl: canvasDataUrl(canvas), width: canvas.width, height: canvas.height, operationId: operation, params: { text, color }, titleSuffix: "标记" }];
   }
-  if (operation === "compress") {
-    const quality = clamp(Number(params.quality) || 80, 10, 100) / 100;
-    const format = params.format === "image/webp" ? "image/webp" : "image/jpeg";
-    return [{ dataUrl: canvasDataUrl(canvas, format, quality), width: canvas.width, height: canvas.height, operationId: operation, params: { quality: Math.round(quality * 100), format }, titleSuffix: "压缩" }];
-  }
   throw new Error("暂不支持该图片操作。");
 }
 
 function initialParams(operation: ImageToolId): Record<string, string | number | boolean> {
-  if (operation === "crop") return { left: 5, right: 5, top: 5, bottom: 5 };
-  if (operation === "compress") return { quality: 80, format: "image/jpeg" };
-  if (operation === "mirror") return { horizontal: true, vertical: false };
+  if (operation === "basic-edit") return { left: 0, right: 0, top: 0, bottom: 0, ratio: "free", lockRatio: false, scale: 1, horizontal: false, vertical: false, quality: 90, format: "image/png" };
   if (operation === "grid") return { rows: 2, columns: 2 };
   if (operation === "adjust") return { brightness: 0, contrast: 0, saturation: 0, exposure: 0 };
   return { text: "标记", color: "#ffdb5c" };
 }
 
-export default function ImageTools({ source, title, onApply, resolveSource, onNotice }: ImageToolsProps) {
+export default function ImageTools({ source, title, onApply, onCreatePrompt, resolveSource, onNotice }: ImageToolsProps) {
   const [operation, setOperation] = React.useState<ImageToolId | null>(null);
   const [params, setParams] = React.useState<Record<string, string | number | boolean>>({});
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [previewSource, setPreviewSource] = React.useState<string | null>(null);
+  const [previewOutputs, setPreviewOutputs] = React.useState<ImageToolOutput[] | null>(null);
   const [sourceState, setSourceState] = React.useState<"idle" | "loading" | "ready" | "error">("idle");
   const trigger = React.useRef<HTMLButtonElement>(null);
   const dialog = React.useRef<HTMLDivElement>(null);
@@ -230,10 +265,7 @@ export default function ImageTools({ source, title, onApply, resolveSource, onNo
   const resolver = React.useRef(resolveSource);
   resolver.current = resolveSource;
   const titleId = React.useId();
-  const tabsId = React.useId();
   const active = TOOLS.find((tool) => tool.id === operation);
-  const basicTabs: ImageToolId[] = ["crop", "compress", "mirror"];
-  const isBasicTab = operation !== null && basicTabs.includes(operation);
   const dialogOpen = operation !== null;
 
   React.useEffect(() => {
@@ -267,18 +299,30 @@ export default function ImageTools({ source, title, onApply, resolveSource, onNo
 
   const openOperation = React.useCallback((next: ImageToolId) => {
     const selectedTool = TOOLS.find((tool) => tool.id === next);
-    if (!selectedTool?.available || busy) return;
+    if (!selectedTool?.available || busy || next === "character-turnaround" && !onCreatePrompt) return;
     dismissMediaToolMenus();
     setParams(initialParams(next));
     setError(null);
+    setPreviewOutputs(null);
     setOperation(next);
-  }, [busy]);
+  }, [busy, onCreatePrompt]);
 
   React.useLayoutEffect(() => {
     if (!dialogOpen) return;
     loadEditableSource();
     return () => { requestId.current += 1; };
   }, [dialogOpen, loadEditableSource]);
+
+  const lastSourceErrorNotice = React.useRef("");
+  React.useEffect(() => {
+    if (sourceState !== "error" || !error) {
+      lastSourceErrorNotice.current = "";
+      return;
+    }
+    if (lastSourceErrorNotice.current === error) return;
+    lastSourceErrorNotice.current = error;
+    onNotice?.(error, { label: "重试加载", run: loadEditableSource });
+  }, [error, loadEditableSource, onNotice, sourceState]);
 
   const closeOperation = React.useCallback(() => {
     if (busy) return;
@@ -288,17 +332,20 @@ export default function ImageTools({ source, title, onApply, resolveSource, onNo
     setError(null);
     setSourceState("idle");
     setPreviewSource(null);
+    setPreviewOutputs(null);
   }, [busy]);
-
-  const switchBasicTab = (next: ImageToolId) => {
-    if (busy || !basicTabs.includes(next)) return;
-    setParams(initialParams(next));
-    setError(null);
-    setOperation(next);
-  };
 
   const apply = async () => {
     if (!operation || busy) return;
+    if (previewOutputs) {
+      onApply(previewOutputs);
+      restoreTriggerFocus.current = true;
+      setOperation(null);
+      setPreviewSource(null);
+      setPreviewOutputs(null);
+      setSourceState("idle");
+      return;
+    }
     if (sourceState === "error") return;
     if (sourceState === "loading") return;
     const editableSource = previewSource || source;
@@ -308,12 +355,8 @@ export default function ImageTools({ source, title, onApply, resolveSource, onNo
     try {
       const outputs = await renderOperation(editableSource, operation, params);
       if (!mounted.current || runId !== requestId.current) return;
-      onApply(outputs);
-      restoreTriggerFocus.current = true;
+      setPreviewOutputs(outputs);
       setBusy(false);
-      setOperation(null);
-      setPreviewSource(null);
-      setSourceState("idle");
     } catch (cause) {
       if (!mounted.current || runId !== requestId.current) return;
       const message = cause instanceof Error ? cause.message : "图片处理失败，请重试。";
@@ -324,7 +367,33 @@ export default function ImageTools({ source, title, onApply, resolveSource, onNo
     }
   };
 
-  const setParam = (key: string, value: string | number | boolean) => setParams((current) => ({ ...current, [key]: value }));
+  const applyAnnotation = (output: ImageToolOutput) => {
+    onApply([output]);
+    restoreTriggerFocus.current = true;
+    setOperation(null);
+    setPreviewSource(null);
+    setPreviewOutputs(null);
+    setSourceState("idle");
+  };
+
+  const applyCharacterTurnaround = (request: CharacterTurnaroundRequest) => {
+    if (!onCreatePrompt || busy) return;
+    onCreatePrompt(request);
+    restoreTriggerFocus.current = true;
+    setOperation(null);
+    setPreviewSource(null);
+    setPreviewOutputs(null);
+    setSourceState("idle");
+  };
+
+  const setParam = (key: string, value: string | number | boolean) => {
+    setPreviewOutputs(null);
+    setParams((current) => ({ ...current, [key]: value }));
+  };
+  const setParamsPatch = (patch: Record<string, string | number | boolean>) => {
+    setPreviewOutputs(null);
+    if (Object.keys(patch).length) setParams((current) => ({ ...current, ...patch }));
+  };
 
   React.useLayoutEffect(() => {
     // Restore only after the dialog is removed and its trigger is enabled.
@@ -342,7 +411,7 @@ export default function ImageTools({ source, title, onApply, resolveSource, onNo
       target?.focus({ preventScroll: true });
     });
     return () => cancelAnimationFrame(frame);
-  }, [dialogOpen]);
+  }, [dialogOpen, sourceState]);
 
   React.useLayoutEffect(() => {
     if (dialogOpen && busy) dialog.current?.focus({ preventScroll: true });
@@ -381,43 +450,65 @@ export default function ImageTools({ source, title, onApply, resolveSource, onNo
   }, [operation, busy, closeOperation]);
 
   const modal = operation && typeof document !== "undefined" ? createPortal(
-    <div className="image-tool-modal-backdrop" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget && !busy) closeOperation(); }}>
-      <div ref={dialog} className="image-tool-modal" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-busy={busy || sourceState === "loading"} tabIndex={-1} onPointerDown={(event) => event.stopPropagation()}>
+    <div className={`image-tool-modal-backdrop${operation === "annotate" ? " image-annotator-backdrop" : operation === "basic-edit" ? " image-crop-backdrop" : operation === "layer-split" ? " image-layer-split-backdrop" : operation === "character-turnaround" ? " character-turnaround-backdrop" : ""}`} role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget && !busy) closeOperation(); }}>
+      <div ref={dialog} className={`image-tool-modal${operation === "annotate" ? " image-annotator-modal" : operation === "basic-edit" ? " image-crop-modal" : operation === "layer-split" ? " image-layer-split-modal" : operation === "character-turnaround" ? " character-turnaround-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-busy={busy || sourceState === "loading"} tabIndex={-1} onPointerDown={(event) => event.stopPropagation()}>
+        {operation === "basic-edit" ? sourceState === "loading" ? <>
+          <div className="image-tool-modal-head"><div><strong id={titleId}>图片基础编辑</strong><small>{title}</small></div><button type="button" aria-label="关闭图片工具" disabled={busy} onClick={closeOperation}><X size={16} aria-hidden="true" /></button></div>
+          <div className="image-annotator-loading" role="status">正在读取图片…</div>
+        </> : sourceState === "error" ? <>
+          <div className="image-tool-modal-head"><div><strong id={titleId}>图片基础编辑</strong><small>{title}</small></div><button type="button" aria-label="关闭图片工具" disabled={busy} onClick={closeOperation}><X size={16} aria-hidden="true" /></button></div>
+          <div className="image-annotator-error-state"><p className="image-tool-error" role="alert">{error || "图片加载失败，请重试。"}</p><button type="button" className="generate-button" onClick={loadEditableSource}>重试加载</button></div>
+        </> : <ImageCropEditor source={previewSource || source} title={title} titleId={titleId} params={params} previewOutput={previewOutputs?.[0]} busy={busy} error={error} onChange={setParamsPatch} onReset={() => { setParams(initialParams("basic-edit")); setPreviewOutputs(null); setError(null); }} onCancel={closeOperation} onGenerate={apply} /> : operation === "character-turnaround" ? sourceState === "loading" ? <>
+          <div className="image-tool-modal-head"><div><strong id={titleId}>角色三视图</strong><small>{title}</small></div><button type="button" aria-label="关闭角色三视图" disabled={busy} onClick={closeOperation}><X size={16} aria-hidden="true" /></button></div>
+          <div className="image-annotator-loading" role="status">正在读取图片…</div>
+        </> : sourceState === "error" ? <>
+          <div className="image-tool-modal-head"><div><strong id={titleId}>角色三视图</strong><small>{title}</small></div><button type="button" aria-label="关闭角色三视图" disabled={busy} onClick={closeOperation}><X size={16} aria-hidden="true" /></button></div>
+          <div className="image-annotator-error-state"><p className="image-tool-error" role="alert">{error || "图片加载失败，请重试。"}</p><button type="button" className="generate-button" onClick={loadEditableSource}>重试加载</button></div>
+        </> : <CharacterTurnaroundEditor source={previewSource || source} title={title} titleId={titleId} busy={busy} onCancel={closeOperation} onGenerate={applyCharacterTurnaround} /> : operation === "layer-split" ? sourceState === "loading" ? <>
+          <div className="image-tool-modal-head"><div><strong id={titleId}>图层拆分</strong><small>{title}</small></div><button type="button" aria-label="关闭图层拆分" disabled={busy} onClick={closeOperation}><X size={16} aria-hidden="true" /></button></div>
+          <div className="image-annotator-loading" role="status">正在读取图片…</div>
+        </> : sourceState === "error" ? <>
+          <div className="image-tool-modal-head"><div><strong id={titleId}>图层拆分</strong><small>{title}</small></div><button type="button" aria-label="关闭图层拆分" disabled={busy} onClick={closeOperation}><X size={16} aria-hidden="true" /></button></div>
+          <div className="image-annotator-error-state"><p className="image-tool-error" role="alert">{error || "图片加载失败，请重试。"}</p><button type="button" className="generate-button" onClick={loadEditableSource}>重试加载</button></div>
+        </> : <ImageLayerSplitter source={previewSource || source} title={title} titleId={titleId} onApply={outputs => { onApply(outputs); restoreTriggerFocus.current = true; setOperation(null); setPreviewSource(null); setPreviewOutputs(null); setSourceState("idle"); }} onCancel={closeOperation} onBusyChange={setBusy} /> : operation === "annotate" ? sourceState === "loading" ? <>
+          <div className="image-tool-modal-head"><div><strong id={titleId}>标记编辑</strong><small>{title}</small></div><button type="button" aria-label="关闭标记编辑" disabled={busy} onClick={closeOperation}><X size={16} aria-hidden="true" /></button></div>
+          <div className="image-annotator-loading" role="status">正在读取图片…</div>
+        </> : sourceState === "error" ? <>
+          <div className="image-tool-modal-head"><div><strong id={titleId}>标记编辑</strong><small>{title}</small></div><button type="button" aria-label="关闭标记编辑" disabled={busy} onClick={closeOperation}><X size={16} aria-hidden="true" /></button></div>
+          <div className="image-annotator-error-state"><p className="image-tool-error" role="alert">{error || "图片加载失败，请重试。"}</p><button type="button" className="generate-button" onClick={loadEditableSource}>重试加载</button></div>
+        </> : <ImageAnnotator source={previewSource || source} title={title} titleId={titleId} onApply={applyAnnotation} onCancel={closeOperation} /> : <>
         <div className="image-tool-modal-head"><div><strong id={titleId}>{active?.label || "图片工具"}</strong><small>{title}</small></div><button type="button" aria-label="关闭图片工具" disabled={busy} onClick={closeOperation}><X size={16} aria-hidden="true" /></button></div>
-        {isBasicTab && <div className="image-tool-tabs" role="tablist" aria-label="基础图片工具" onKeyDown={(event) => {
-          if (busy || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-          event.preventDefault();
-          const current = basicTabs.indexOf(operation);
-          const index = event.key === "Home" ? 0 : event.key === "End" ? basicTabs.length - 1 : (current + (event.key === "ArrowLeft" ? -1 : 1) + basicTabs.length) % basicTabs.length;
-          const next = basicTabs[index];
-          switchBasicTab(next);
-          document.getElementById(`${tabsId}-${next}`)?.focus({ preventScroll: true });
-        }}>{basicTabs.map((tab) => <button key={tab} id={`${tabsId}-${tab}`} type="button" role="tab" aria-selected={operation === tab} aria-controls={`${tabsId}-panel`} tabIndex={operation === tab ? 0 : -1} className={operation === tab ? "is-active" : ""} disabled={busy} onClick={() => switchBasicTab(tab)}>{TOOLS.find((tool) => tool.id === tab)?.label}</button>)}</div>}
         <div className="image-tool-workspace">
-          <div className="image-tool-preview">{sourceState === "loading" ? <div className="video-tool-note" role="status" aria-live="polite">正在加载原图…</div> : sourceState === "error" ? <div className="image-tool-error" role="alert">{error || "原图加载失败，请重试。"}</div> : <img className="image-tool-source" src={previewSource || source} alt={title} />}</div>
-          <div id={isBasicTab ? `${tabsId}-panel` : undefined} className="image-tool-settings image-tool-form" role={isBasicTab ? "tabpanel" : undefined} aria-labelledby={isBasicTab ? `${tabsId}-${operation}` : undefined}>
-            {operation === "crop" && <div className="image-tool-grid four"><label>左<input data-primary-input type="number" min="0" max="45" value={Number(params.left)} disabled={busy} onChange={(event) => setParam("left", Number(event.target.value))} /></label><label>右<input type="number" min="0" max="45" value={Number(params.right)} disabled={busy} onChange={(event) => setParam("right", Number(event.target.value))} /></label><label>上<input type="number" min="0" max="45" value={Number(params.top)} disabled={busy} onChange={(event) => setParam("top", Number(event.target.value))} /></label><label>下<input type="number" min="0" max="45" value={Number(params.bottom)} disabled={busy} onChange={(event) => setParam("bottom", Number(event.target.value))} /></label></div>}
-            {operation === "compress" && <><label>质量 <input data-primary-input type="range" min="10" max="100" value={Number(params.quality)} disabled={busy} onChange={(event) => setParam("quality", Number(event.target.value))} /><output>{Number(params.quality)}%</output></label><label>格式<select value={String(params.format)} disabled={busy} onChange={(event) => setParam("format", event.target.value)}><option value="image/jpeg">JPEG</option><option value="image/webp">WEBP</option></select></label></>}
-            {operation === "mirror" && <div className="image-tool-choice"><label><input data-primary-input type="checkbox" checked={Boolean(params.horizontal)} disabled={busy} onChange={(event) => setParam("horizontal", event.target.checked)} />水平镜像</label><label><input type="checkbox" checked={Boolean(params.vertical)} disabled={busy} onChange={(event) => setParam("vertical", event.target.checked)} />垂直翻转</label></div>}
+          <div className="image-tool-preview">{sourceState === "loading" ? <div className="video-tool-note" role="status" aria-live="polite">正在加载原图…</div> : sourceState === "error" ? <div className="video-tool-note" role="alert">{error || "预览暂不可用"}</div> : <><img className="image-tool-source" src={previewOutputs?.[0]?.dataUrl || previewSource || source} alt={previewOutputs ? `${title}处理预览` : title} />{previewOutputs && <div className="image-tool-preview-output-info" role="status"><strong>处理预览{previewOutputs.length > 1 ? ` · ${previewOutputs.length} 张` : ""}</strong><span>{previewOutputs[0].width} × {previewOutputs[0].height} · 输出 {formatBytes(previewOutputs.reduce((total, output) => total + dataUrlSize(output.dataUrl), 0))}</span><small>原图不会被覆盖；确认后会创建新的画布节点。</small></div>}</>}</div>
+          <div className="image-tool-settings image-tool-form">
             {operation === "grid" && <div className="image-tool-grid two"><label>行数<input data-primary-input type="number" min="1" max="6" value={Number(params.rows)} disabled={busy} onChange={(event) => setParam("rows", Number(event.target.value))} /></label><label>列数<input type="number" min="1" max="6" value={Number(params.columns)} disabled={busy} onChange={(event) => setParam("columns", Number(event.target.value))} /></label></div>}
             {operation === "adjust" && <>{["brightness", "contrast", "saturation", "exposure"].map((key) => <label key={key}>{key === "brightness" ? "亮度" : key === "contrast" ? "对比度" : key === "saturation" ? "饱和度" : "曝光"}<input data-primary-input={key === "brightness" ? true : undefined} type="range" min="-100" max="100" value={Number(params[key])} disabled={busy} onChange={(event) => setParam(key, Number(event.target.value))} /><output>{Number(params[key])}</output></label>)}</>}
-            {operation === "annotate" && <><label>标记文字<textarea data-primary-input value={String(params.text)} maxLength={200} disabled={busy} onChange={(event) => setParam("text", event.target.value)} /></label><label>颜色<input type="color" value={String(params.color)} disabled={busy} onChange={(event) => setParam("color", event.target.value)} /></label></>}
           </div>
         </div>
-        <div className="image-tool-actions"><button type="button" className="image-tool-reset" onClick={() => { if (!operation || busy) return; setParams(initialParams(operation)); setError(null); }} disabled={busy}>重置</button><button type="button" className="button" onClick={closeOperation} disabled={busy}>取消</button><button type="button" className="generate-button" onClick={() => sourceState === "error" ? loadEditableSource() : void apply()} disabled={busy || sourceState === "loading"}>{busy ? "处理中…" : sourceState === "error" ? "重试加载" : error ? "重试处理" : "生成派生图片"}</button></div>
+        <div className="image-tool-actions"><button type="button" className="image-tool-reset" onClick={() => { if (!operation || busy) return; setParams(initialParams(operation)); setPreviewOutputs(null); setError(null); }} disabled={busy}>重置</button><button type="button" className="button" onClick={closeOperation} disabled={busy}>取消</button><button type="button" className="generate-button" onClick={() => sourceState === "error" ? loadEditableSource() : void apply()} disabled={busy || sourceState === "loading"}>{busy ? "处理中…" : sourceState === "error" ? "重试加载" : error ? "重试处理" : previewOutputs ? `添加${previewOutputs.length > 1 ? ` ${previewOutputs.length} 张` : ""}到画布` : "生成预览"}</button></div>
+        </>}
       </div>
     </div>, document.body,
   ) : null;
 
-  const menuGroups = [{
-    label: "图片编辑",
-    items: [
-      { id: "basic", label: "裁剪 / 压缩 / 镜像", detail: "裁剪、压缩或翻转图片", icon: Crop, onSelect: () => openOperation("crop") },
-      { id: "annotate", label: "标记修图", detail: "添加文字标记", icon: Type, onSelect: () => openOperation("annotate") },
-      { id: "grid", label: "宫格裁剪", detail: "切分为多张图片", icon: Grid2X2, onSelect: () => openOperation("grid") },
-      { id: "adjust", label: "图片调整", detail: "亮度、对比度与饱和度", icon: SlidersHorizontal, onSelect: () => openOperation("adjust") },
-    ],
-  }];
+  const menuGroups = [
+    {
+      label: "图片编辑",
+      items: [
+        { id: "basic-edit", label: "图片基础编辑", detail: "裁剪、翻转并设置输出格式与质量", icon: Crop, onSelect: () => openOperation("basic-edit") },
+        { id: "annotate", label: "标记修图", detail: "画笔、箭头、形状、文字与马赛克", icon: Type, onSelect: () => openOperation("annotate") },
+        { id: "layer-split", label: "图层拆分", detail: "框选区域并拆分为独立图层", icon: Layers3, onSelect: () => openOperation("layer-split") },
+        { id: "grid", label: "宫格裁剪", detail: "切分为多张图片", icon: Grid2X2, onSelect: () => openOperation("grid") },
+        { id: "adjust", label: "图片调整", detail: "亮度、对比度与饱和度", icon: SlidersHorizontal, onSelect: () => openOperation("adjust") },
+      ],
+    },
+    ...(onCreatePrompt ? [{
+      label: "角色设定",
+      items: [
+        { id: "character-turnaround", label: "角色三视图", detail: "基于当前角色图生成正、侧、背三视图", icon: CircleUserRound, onSelect: () => openOperation("character-turnaround") },
+      ],
+    }] : []),
+  ];
   return <div className="image-tools" onPointerDown={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
     <MediaToolMenu label="图片工具" triggerLabel="工具" groups={menuGroups} disabled={busy} triggerRef={trigger} />
     {modal}

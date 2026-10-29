@@ -67,6 +67,10 @@ test("lookup authorization, outages, and missing routes never become task failur
   for (const failure of [
     { status: 401, code: "APP_SESSION_EXPIRED" },
     { status: 503, code: "APP_GATEWAY_UNAVAILABLE" },
+    // The Gateway may temporarily lack/lose the submission lookup capability.
+    // This is still an unresolved original request, never permission to POST
+    // the billable video creation again.
+    { status: 503, code: "media_submission_lookup_unavailable" },
     { status: 404, code: "route_not_found" },
     { status: 503, code: "video_task_not_found" },
     { code: "LOCAL_DEV_RELAY_ERROR" },
@@ -171,18 +175,23 @@ test("the safe video projection preserves queued phase, raw state and supplier e
 
 test("video success waits for platform asset collection before returning a content URL", async () => {
   const states: string[] = [];
+  const signedURL = "https://objects.example/video.mp4?signature=temporary";
   let reads = 0;
   const result = await generateVideo(async (path, init) => {
     assert.equal(path, "/videos/v-assets");
     assert.notEqual(init?.method, "POST");
     reads += 1;
-    return { id: "v-assets", status: "completed", task_status: "succeeded", phase: reads === 1 ? "collecting" : "completed", asset_status: reads === 1 ? "pending" : "ready" };
+    return reads === 1
+      ? { id: "v-assets", status: "completed", task_status: "succeeded", phase: "collecting", asset_status: "pending" }
+      : { id: "v-assets", status: "completed", task_status: "succeeded", phase: "completed", asset_status: "ready", content_url: signedURL, asset_id: "asset-v-assets", content_url_expires_at: "2026-10-25T02:00:00Z", assets: [{ id: "asset-v-assets", type: "video", url: signedURL, url_expires_at: "2026-10-25T02:00:00Z" }] };
   }, { model: "", prompt: "", taskId: "v-assets" }, undefined, {
     intervalMs: 0, delay: async () => {}, onStatus: snapshot => { states.push(snapshot.assetStatus!); },
   });
   assert.equal(reads, 2);
   assert.deepEqual(states, ["pending", "ready"]);
-  assert.equal(result.contentUrl, "/videos/v-assets/content");
+  assert.equal(result.contentUrl, signedURL);
+  assert.equal(result.assetId, "asset-v-assets");
+  assert.equal(result.contentUrlExpiresAt, "2026-10-25T02:00:00Z");
 });
 
 test("failed legacy rows with unresolved lookup evidence keep reading the same task until closure", async () => {
@@ -253,13 +262,14 @@ test("a rejected create preserves task and request references without polling or
 
 test("video payload uses gateway input_references and returns a URL without downloading bytes", async () => {
   const calls: Array<[string, unknown]> = [];
+  const signedURL = "https://objects.example/video.mp4?signature=temporary";
   const request: VideoRequest = async (path, init) => {
     calls.push([path, init]);
     if (path === "/videos") return { id: "vid-1", status: "queued" };
-    return { id: "vid-1", status: "completed" };
+    return { id: "vid-1", status: "completed", content_url: signedURL };
   };
 const result = await generateVideo(request, { model: "video-model", prompt: "a cat", images: ["https://cdn/a.png"], duration: 5 });
-  assert.deepEqual(result, { taskId: "vid-1", contentUrl: "/videos/vid-1/content" });
+  assert.deepEqual(result, { taskId: "vid-1", contentUrl: signedURL });
   const body = JSON.parse(String((calls[0][1] as { body: BodyInit }).body));
   assert.deepEqual(body.input_references, [{ type: "image_url", image_url: { url: "https://cdn/a.png" } }]);
   assert.equal(calls.some(([path]) => path.endsWith("/content")), false);
@@ -355,11 +365,12 @@ test("async task callback is awaited before polling", async () => {
 });
 
 test("successful upstream aliases are treated as completed", async () => {
+  const signedURL = "https://objects.example/video.mp4?signature=temporary";
   for (const status of ["succeeded", "success"]) {
     const result = await generateVideo(async path => path === "/videos"
       ? { id: `v-${status}`, status: "queued" }
-      : { id: `v-${status}`, status }, { model: "m", prompt: "p" });
-    assert.deepEqual(result, { taskId: `v-${status}`, contentUrl: `/videos/v-${status}/content` });
+      : { id: `v-${status}`, status, content_url: signedURL }, { model: "m", prompt: "p" });
+    assert.deepEqual(result, { taskId: `v-${status}`, contentUrl: signedURL });
   }
 });
 
@@ -653,10 +664,12 @@ test("the editor observes an unknown result through terminal failure without res
 
 test("resuming an ambiguous video task observes success using only its original task id", async () => {
   const states: string[] = [], delays: number[] = [];
+  const signedURL = "https://objects.example/video.mp4?signature=temporary";
   const sequence = ["unknown", "in_progress", "completed"];
   const result = await generateVideo(async (path) => {
     assert.equal(path, "/videos/v-resume");
-    return { id: "v-resume", status: sequence.shift() };
+    const status = sequence.shift();
+    return { id: "v-resume", status, ...(status === "completed" ? { content_url: signedURL } : {}) };
   }, { model: "", prompt: "", taskId: "v-resume" }, undefined, {
     observeUnknown: true,
     delay: async (ms) => { delays.push(ms); },
@@ -664,7 +677,7 @@ test("resuming an ambiguous video task observes success using only its original 
   });
   assert.deepEqual(states, ["unknown", "in_progress", "completed"]);
   assert.deepEqual(delays, [15000, 2000]);
-  assert.deepEqual(result, { taskId: "v-resume", contentUrl: "/videos/v-resume/content" });
+  assert.deepEqual(result, { taskId: "v-resume", contentUrl: signedURL });
 });
 
 test("an unknown create response waits before observation and cancellation prevents the next read", async () => {
@@ -784,16 +797,27 @@ test("authorization failures while replaying a video submission preserve its ori
   }
 });
 
-test("read and cancel helpers use independent content and DELETE routes", async () => {
+test("read and cancel helpers use task metadata, direct object storage, and DELETE routes", async () => {
   const calls: Array<[string, unknown]> = [];
+  const fetches: Array<[string, RequestInit | undefined]> = [];
+  const signedURL = "https://objects.example/video.mp4?signature=temporary";
   const blob = new Blob(["mp4"], { type: "video/mp4" });
-  const request: VideoRequest = async (path, init) => { calls.push([path, init]); return path.endsWith("content") ? blob : { status: "cancelled" }; };
-  assert.equal(await readVideoContent(request, "v3"), blob);
+  const request: VideoRequest = async (path, init) => {
+    calls.push([path, init]);
+    return init?.method === "DELETE" ? { status: "cancelled" } : { id: "v3", status: "completed", content_url: signedURL };
+  };
+  const downloaded = await readVideoContent(request, "v3", { fetchResource: async (url, init) => { fetches.push([url, init]); return new Response(blob); } });
+  assert.equal(downloaded.size, blob.size);
+  assert.equal(downloaded.type, blob.type);
   const cancelled = await cancelVideo(request, "v3", "cancel-key");
   assert.equal(cancelled.taskId, "v3");
   assert.equal(cancelled.status, "cancelled");
-  assert.equal(calls[0][0], "/videos/v3/content"); assert.equal((calls[1][1] as { method: string }).method, "DELETE");
+  assert.deepEqual(calls.map(([path]) => path), ["/videos/v3", "/videos/v3"]);
+  assert.equal((calls[1][1] as { method: string }).method, "DELETE");
   assert.equal((calls[1][1] as { headers: Record<string, string> }).headers["Idempotency-Key"], "cancel-key");
+  assert.deepEqual(fetches.map(([url]) => url), [signedURL]);
+  assert.equal(fetches[0][1]?.credentials, "omit");
+  assert.equal(calls.some(([path]) => path.endsWith("/content")), false);
 });
 
 test("cancellation reports the server snapshot without inventing a terminal state", async () => {
@@ -810,39 +834,45 @@ test("cancellation reports the server snapshot without inventing a terminal stat
 test("content reads retry eventual media_asset_not_ready without retrying permanent errors", async () => {
   let reads = 0;
   const blob = new Blob(["mp4"], { type: "video/mp4" });
-  const value = await readVideoContent(async (path) => {
+  const signedURL = "https://objects.example/video.mp4?signature=temporary";
+  const value = await readVideoContent(async path => {
+    assert.equal(path, "/videos/v-ready");
+    return { id: "v-ready", status: "completed", content_url: signedURL };
+  }, "v-ready", { delay: async () => {}, fetchResource: async () => {
     reads += 1;
     if (reads < 3) throw { code: "media_asset_not_ready", message: "media asset is not ready" };
-    return blob;
-  }, "v-ready", { delay: async () => {} });
-  assert.equal(value, blob);
+    return new Response(blob);
+  } });
+  assert.equal(value.size, blob.size);
+  assert.equal(value.type, blob.type);
   assert.equal(reads, 3);
 
   let permanentReads = 0;
-  await assert.rejects(
-    readVideoContent(async () => {
-      permanentReads += 1;
-      throw { status: 401, code: "media_task_access_denied", message: "无权读取视频" };
-    }, "v-denied", { delay: async () => {} }),
-  );
+  await assert.rejects(readVideoContent(async path => {
+    assert.equal(path, "/videos/v-denied");
+    return { id: "v-denied", status: "completed", content_url: signedURL };
+  }, "v-denied", { delay: async () => {}, fetchResource: async () => {
+    permanentReads += 1;
+    throw { status: 401, code: "media_task_access_denied", message: "无权读取视频" };
+  } }));
   assert.equal(permanentReads, 1);
 });
 
 test("content reads reject a successful non-video response instead of handing it to the decoder", async () => {
   await assert.rejects(
-    readVideoContent(async () => new Blob(["<html>login</html>"], { type: "text/html" }), "v-html", { attempts: 1 }),
+    readVideoContent(async () => ({ id: "v-html", status: "completed", content_url: "https://objects.example/video.mp4?signature=temporary" }), "v-html", { attempts: 1, fetchResource: async () => new Response("<html>login</html>", { headers: { "content-type": "text/html" } }) }),
     /不是视频内容/,
   );
 });
 
 test("content reads detect containers, repair a generic MIME type and retain a safe diagnostic", async () => {
   const mp4Bytes = new TextEncoder().encode("\0\0\0\x18ftypisom\0\0\0\0avc1");
-  const blob = await readVideoContent(async () => new Blob([mp4Bytes], { type: "application/octet-stream" }), "v-mime", { attempts: 1 });
+  const blob = await readVideoContent(async () => ({ id: "v-mime", status: "completed", content_url: "https://objects.example/video.mp4?signature=temporary" }), "v-mime", { attempts: 1, fetchResource: async () => new Response(mp4Bytes, { headers: { "content-type": "application/octet-stream" } }) });
   assert.equal(blob.type, "video/mp4");
   assert.match(videoContentDiagnostic(blob) || "", /video\/mp4.*MP4.*H\.264\/AVC/);
 
   const webmBytes = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x84]);
-  const webm = await readVideoContent(async () => new Blob([webmBytes], { type: "video/mp4" }), "v-webm", { attempts: 1 });
+  const webm = await readVideoContent(async () => ({ id: "v-webm", status: "completed", content_url: "https://objects.example/video.mp4?signature=temporary" }), "v-webm", { attempts: 1, fetchResource: async () => new Response(webmBytes, { headers: { "content-type": "video/mp4" } }) });
   assert.equal(webm.type, "video/webm");
   assert.match(videoContentDiagnostic(webm) || "", /WebM\/EBML/);
 });
@@ -850,8 +880,20 @@ test("content reads detect containers, repair a generic MIME type and retain a s
 test("content reads identify a successful HTML or JSON gateway response", async () => {
   for (const [body, type] of [["<html>session expired</html>", "text/html"], ['{"error":"unavailable"}', "application/octet-stream"]]) {
     await assert.rejects(
-      readVideoContent(async () => new Blob([body], { type }), "v-invalid", { attempts: 1 }),
+      readVideoContent(async () => ({ id: "v-invalid", status: "completed", content_url: "https://objects.example/video.mp4?signature=temporary" }), "v-invalid", { attempts: 1, fetchResource: async () => new Response(body, { headers: { "content-type": type } }) }),
       /接口返回的不是视频内容/,
     );
   }
+});
+
+test("automatic recovery never recreates a video task after an idempotency lookup miss", async () => {
+  const paths: string[] = [];
+  await assert.rejects(generateVideo(async path => {
+    paths.push(path);
+    if (path === "/videos/by-idempotency-key/auto-video") throw { status: 404, code: "video_task_not_found" };
+    assert.fail(`automatic recovery must not submit to ${path}`);
+  }, { model: "m", prompt: "p", idempotencyKey: "auto-video" }, undefined, {
+    recovery: { inputReferencesAvailable: true, allowResubmit: false },
+  }), error => error instanceof VideoGenerationError && error.pending && !error.terminalTask && error.code === "VIDEO_SUBMISSION_NOT_FOUND");
+  assert.deepEqual(paths, ["/videos/by-idempotency-key/auto-video"]);
 });

@@ -81,50 +81,36 @@ test("task-backed audio nodes retain task identity instead of a temporary previe
   assert.equal(reusableNodeKind({ id: "music-node", ...result, text: "", x: 0, y: 0, width: 320, height: 160, color: "" } as CanvasNode), "audio");
 });
 
-test("local recordings insert with a stable cache identity after preview URLs are released", () => {
+test("local recordings are rejected by the node conversion boundary until promoted to a platform asset", () => {
   const localAudio = "proxy-canvas:audio:v1:12345678-1234-1234-1234-123456789abc";
   const asset: CanvasAsset = {
     schemaVersion: 1, id: "recording", name: "人声录音", kind: "audio", category: "sound", tags: [],
     createdAt: "2026-10-14T00:00:00Z", updatedAt: "2026-10-14T00:00:00Z",
     source: { type: "local", localAudio },
   };
-  const result = nodeFromLibraryAsset(asset, "blob:temporary-recording-preview");
-  assert.equal(result.localAudio, localAudio);
-  assert.equal(result.audio, undefined);
-  assert.equal(result.localImage, undefined);
-  assert.equal(result.taskId, undefined);
-  assert.equal(reusableNodeKind({ ...node, ...result, image: undefined }), "audio");
+  assert.throws(() => nodeFromLibraryAsset(asset, "blob:temporary-recording-preview"), /必须先上传/);
 });
 
-test("local video assets insert with their cache identity and do not retain temporary preview URLs", () => {
+test("local video assets are rejected by the node conversion boundary", () => {
   const localVideo = "proxy-canvas:video:v1:12345678-1234-1234-1234-123456789abc";
   const asset: CanvasAsset = {
     schemaVersion: 1, id: "local-video", name: "提取视频", kind: "video", category: "other", tags: [],
     createdAt: "2026-10-15T00:00:00Z", updatedAt: "2026-10-15T00:00:00Z",
     source: { type: "local", localVideo },
   };
-  const result = nodeFromLibraryAsset(asset, "blob:temporary-video-preview");
-  assert.equal(result.localVideo, localVideo);
-  assert.equal(result.video, undefined);
-  assert.equal(reusableNodeKind({ ...node, ...result, image: undefined, mediaType: "video" }), "video");
+  assert.throws(() => nodeFromLibraryAsset(asset, "blob:temporary-video-preview"), /必须先上传/);
 });
 
-test("a reinserted local video remains readable after the asset preview is released", async () => {
+test("a local video draft remains readable from its cache without a platform request", async () => {
   const bytes = new Uint8Array([0, 0, 0, 20, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 0, 0, 97, 118, 99, 49]);
   const localVideo = await storeLocalVideo(new Blob([bytes], { type: "video/mp4" }));
   const api = { request: async () => { assert.fail("local video reuse must not contact the media gateway"); } };
   let playerSource: Awaited<ReturnType<typeof resolveVideoSource>> | undefined;
   try {
     const preview = await resolveVideoSource(api, { localVideo });
-    const asset: CanvasAsset = {
-      schemaVersion: 1, id: "local-video", name: "提取视频", kind: "video", category: "other", tags: [],
-      createdAt: "2026-10-15T00:00:00Z", updatedAt: "2026-10-15T00:00:00Z", source: { type: "local", localVideo },
-    };
-    const inserted = nodeFromLibraryAsset(asset, preview.url);
-    preview.release?.();
-    playerSource = await resolveVideoSource(api, inserted);
-    assert.notEqual(playerSource.url, preview.url);
-    const blob = await readVideoSourceBlob(api, inserted);
+    assert.match(preview.url, /^blob:/);
+    playerSource = preview;
+    const blob = await readVideoSourceBlob(api, { localVideo });
     assert.deepEqual(new Uint8Array(await blob.arrayBuffer()), bytes);
   } finally {
     playerSource?.release?.();

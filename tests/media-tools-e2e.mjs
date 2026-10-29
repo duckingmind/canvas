@@ -5,12 +5,13 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const { chromium } = await import(process.env.CANVAS_PLAYWRIGHT_MODULE || "playwright");
 const root = fileURLToPath(new URL("../", import.meta.url));
 const artifacts = fileURLToPath(new URL("./artifacts/", import.meta.url));
+const batchVideo = await readFile(new URL("./fixtures/media-tools.webm", import.meta.url));
 const base = "http://127.0.0.1:5391";
 const checks = [], errors = [], consoleErrors = [], unexpectedNetworks = [], measurements = {};
 let fixtureOutput = "", browser, context, page, failure;
@@ -34,6 +35,11 @@ const openTool = async (kind, name) => {
   await button(`${kind}工具`).hover();
   await menu(`${kind}工具`).waitFor();
   await menu(`${kind}工具`).getByRole("menuitem", { name, exact: true }).click();
+};
+const moveToMenuItem = async (panel, index) => {
+  const bounds = await panel.getByRole("menuitem").nth(index).boundingBox();
+  assert.ok(bounds, "menu command has a visible pointer target");
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2, { steps: 1 });
 };
 
 const html = `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>媒体工具独立回归</title></head><body><div id="root"></div><script type="module">
@@ -90,7 +96,7 @@ async function mount(target) {
     const thumbnailCanvas = document.createElement("canvas"); thumbnailCanvas.width = 120; thumbnailCanvas.height = 80;
     thumbnailCanvas.getContext("2d").drawImage(originalCanvas, 0, 0, 120, 80);
     const thumbnail = thumbnailCanvas.toDataURL("image/png");
-    const telemetry = { resolveCalls: 0, sourceFailures: 0, outputs: [], captures: 0, processCalls: [], cancels: 0, notices: [] };
+    const telemetry = { resolveCalls: 0, sourceFailures: 0, outputs: [], captures: 0, captureFrames: [], processCalls: [], cancels: 0, notices: [] };
     function Harness() {
       const [state, setState] = React.useState({ tick: 0, captureReady: true, busy: false, progress: 0, error: "", position: "normal", long: false });
       window.mediaToolsFixture = {
@@ -101,7 +107,7 @@ async function mount(target) {
       const edge = state.position !== "normal";
       const position = state.position === "bottom" ? { top: "auto", bottom: "12px", left: "20px" } : state.position === "top" ? { top: "8px", left: "8px" } : state.position === "right" ? { top: "8px", left: "auto", right: "8px" } : {};
       const image = h(ImageTools, { source: thumbnail, title: "山间日落", resolveSource: async () => { telemetry.resolveCalls++; if (telemetry.sourceFailures > 0) { telemetry.sourceFailures--; throw new Error("原图加载失败：测试连接中断"); } await new Promise(resolve => setTimeout(resolve, 30)); return original; }, onApply: outputs => { telemetry.outputs.push(...outputs); }, onNotice: notice => telemetry.notices.push(notice) });
-      const video = h(VideoTools, { source: "data:video/webm;base64,GkXfo0A=", captureReady: state.captureReady, duration: 60, currentTime: 8, processBusy: state.busy, processProgress: state.progress, processError: state.error, onCapture: () => { telemetry.captures++; }, onProcess: options => { telemetry.processCalls.push({ ...options }); setState(current => ({ ...current, busy: true, progress: 40, error: "" })); }, onCancelProcess: () => { telemetry.cancels++; setState(current => ({ ...current, busy: false, error: "处理已取消" })); }, onClearProcessError: () => setState(current => current.error ? { ...current, error: "" } : current) });
+      const video = h(VideoTools, { source: "http://127.0.0.1:5391/media-tools-batch.webm", captureReady: state.captureReady, duration: 60, currentTime: 8, processBusy: state.busy, processProgress: state.progress, processStatus: state.processStatus, processError: state.error, onCapture: () => { telemetry.captures++; }, onCaptureFrameAt: async frame => { telemetry.captureFrames.push(frame.time); await new Promise(resolve => setTimeout(resolve, 60)); }, onProcess: options => { telemetry.processCalls.push({ ...options }); const extractingVideo = options.operation === "extract-video"; setState(current => ({ ...current, busy: true, progress: extractingVideo ? 25 : 40, processStatus: extractingVideo ? "正在读取视频 · 2.0 / 8.0 MB" : "", error: "" })); }, onCancelProcess: () => { telemetry.cancels++; setState(current => ({ ...current, busy: false, error: "处理已取消" })); }, onClearProcessError: () => setState(current => current.error ? { ...current, error: "" } : current) });
       const toolCard = (kind, tool, media) => h("div", { className: `fixture-card node ${kind}` }, h("div", { className: "fixture-card-label" }, kind === "image" ? "图片 · 山间日落" : "视频 · 山间漫游"), h("div", { className: "node-toolbar" }, h("button", { id: `before-${kind}`, className: "fixture-neutral icon-button", "aria-label": `${kind}前一个按钮` }, "↖"), tool, h("button", { id: `after-${kind}`, className: "node-generate", "aria-label": `${kind}生成按钮` }, "生成")), media);
       return h(React.Fragment, null,
         h("header", { className: "fixture-heading" }, h("strong", null, "媒体创作工具"), h("small", null, "图片与视频 · 统一工具菜单")),
@@ -120,6 +126,16 @@ try {
   context = await browser.newContext({ viewport: { width: 1440, height: 960 }, reducedMotion: "reduce" });
   await context.route("**/*", route => {
     const url = new URL(route.request().url());
+    if (url.pathname === "/media-tools-batch.webm") {
+      const range = route.request().headers().range;
+      const match = range && /^bytes=(\d+)-(\d*)$/.exec(range);
+      if (match) {
+        const start = Math.min(Number(match[1]), batchVideo.length - 1);
+        const end = Math.min(match[2] ? Number(match[2]) : batchVideo.length - 1, batchVideo.length - 1);
+        return route.fulfill({ status: 206, contentType: "video/webm", body: batchVideo.subarray(start, end + 1), headers: { "access-control-allow-origin": "*", "accept-ranges": "bytes", "content-range": `bytes ${start}-${end}/${batchVideo.length}`, "content-length": String(end - start + 1) } });
+      }
+      return route.fulfill({ status: 200, contentType: "video/webm", body: batchVideo, headers: { "access-control-allow-origin": "*", "accept-ranges": "bytes", "content-length": String(batchVideo.length) } });
+    }
     if (["http:", "https:"].includes(url.protocol) && !["127.0.0.1", "localhost"].includes(url.hostname)) { unexpectedNetworks.push(`${route.request().method()} ${url.origin}`); return route.abort("blockedbyclient"); }
     return route.continue();
   });
@@ -162,15 +178,15 @@ try {
   const imageTriggerBox = await button("图片工具").boundingBox();
   const imageMenuBox = await menu("图片工具").boundingBox();
   assert.ok(imageMenuBox.x >= imageTriggerBox.x - 1, "menu aligns its left edge with the trigger when there is room to the right");
-  await page.mouse.move(imageTriggerBox.x + imageTriggerBox.width / 2, imageTriggerBox.y + imageTriggerBox.height + 4);
+  await page.mouse.move(imageTriggerBox.x + imageTriggerBox.width / 2, imageTriggerBox.y + imageTriggerBox.height / 2);
   await pause(60);
   assert.equal(await menu("图片工具").isVisible(), true, "crossing the trigger-menu gap preserves the hover menu");
-  await menu("图片工具").getByRole("menuitem").nth(1).hover();
+  await moveToMenuItem(menu("图片工具"), 1);
   await pause(260);
   assert.equal(await menu("图片工具").isVisible(), true, "entering the portal menu cancels the gap-close timer");
   await page.mouse.move(1300, 800); await pause(60);
   assert.equal(await menu("图片工具").isVisible(), true, "pointer leave uses a short grace period");
-  await menu("图片工具").getByRole("menuitem").nth(1).hover(); await pause(280);
+  await moveToMenuItem(menu("图片工具"), 1); await pause(280);
   assert.equal(await menu("图片工具").isVisible(), true, "returning to the menu cancels pending dismissal");
   await page.mouse.move(1300, 800);
   await eventually(async () => await menu("图片工具").count() === 0, "pointer leave dismisses the menu", 2500);
@@ -179,9 +195,9 @@ try {
   await menu("图片工具").waitFor();
   assert.equal(await focused(button("图片工具")), true, "pointer opening keeps focus on the trigger");
   assert.equal(await menu("图片工具").getByRole("menuitem").first().evaluate(element => element.matches(":focus-visible")), false);
-  assert.equal(await menu("图片工具").getByRole("menuitem").count(), 4);
+  assert.equal(await menu("图片工具").getByRole("menuitem").count(), 5);
   await snapshot("image-menu");
-  await menu("图片工具").getByRole("menuitem").nth(1).hover(); await settle();
+  await moveToMenuItem(menu("图片工具"), 1); await settle();
   const imageHoverRows = await menu("图片工具").getByRole("menuitem").evaluateAll(items => items.map(item => ({ background: getComputedStyle(item).backgroundColor, hover: item.matches(":hover"), focusVisible: item.matches(":focus-visible") })));
   assert.equal(imageHoverRows.filter(item => item.hover).length, 1);
   assert.equal(imageHoverRows[1].hover, true);
@@ -199,16 +215,20 @@ try {
   assert.equal(await focused(button("图片工具")), true, "Escape preserves focus outside the hover-open menu");
   await page.mouse.move(1300, 800);
   await button("视频工具").hover(); await menu("视频工具").waitFor();
-  await menu("视频工具").getByRole("menuitem").nth(1).hover(); await settle();
+  await moveToMenuItem(menu("视频工具"), 1); await settle();
   const videoHoverRows = await menu("视频工具").getByRole("menuitem").evaluateAll(items => items.map(item => ({ background: getComputedStyle(item).backgroundColor, hover: item.matches(":hover"), focusVisible: item.matches(":focus-visible") })));
   assert.equal(videoHoverRows.filter(item => item.hover).length, 1);
   assert.equal(videoHoverRows[1].hover, true);
   assert.equal(videoHoverRows.filter(item => !transparent(item.background)).length, 1);
   assert.equal(videoHoverRows.filter(item => item.focusVisible).length, 0);
   await snapshot("video-menu-hover");
-  const videoNames = ["裁剪视频", "提取视频", "视频压缩", "画面裁剪", "基础调色", "旋转", "镜像", "调整速度", "文字水印", "截取当前帧", "提取音频", "移除音轨"];
-  assert.equal(await menu("视频工具").getByRole("menuitem").count(), 12);
+  const videoNames = ["裁剪视频", "提取视频", "视频压缩", "画面裁剪", "截取当前帧", "批量截取画面", "提取音频"];
+  assert.equal(await menu("视频工具").getByRole("menuitem").count(), 7);
   for (const name of videoNames) assert.equal(await menu("视频工具").getByRole("menuitem", { name, exact: true }).count(), 1);
+  for (const name of ["基础调色", "旋转", "镜像", "文字水印", "移除音轨"]) {
+    assert.equal(await menu("视频工具").getByRole("menuitem", { name, exact: true }).count(), 0);
+  }
+  assert.equal(await menu("视频工具").getByRole("menuitem", { name: "调整速度", exact: true }).count(), 0);
   assert.equal(await menu("视频工具").getByRole("menuitem", { name: "格式转换", exact: true }).count(), 0);
   const rowGeometry = await menu("视频工具").getByRole("menuitem").evaluateAll(items => items.map(item => ({ height: item.getBoundingClientRect().height, secondary: item.querySelector("small") !== null })));
   assert.ok(rowGeometry.every(row => row.height >= 32 && row.height <= 40 && !row.secondary), "compact command rows have no secondary description line");
@@ -218,7 +238,7 @@ try {
   await eventually(async () => await menu("视频工具").count() === 0, "pointer leave closes a hover-open menu");
   assert.equal(await focused(button("图片工具")), true);
   measurements.hoverGap = { trigger: imageTriggerBox, panel: imageMenuBox };
-  passed("hover menus open, preserve trigger-to-panel gap crossing, delay dismissal, cancel pending close on return, and expose twelve video commands without format conversion");
+  passed("hover menus open, preserve trigger-to-panel gap crossing, delay dismissal, cancel pending close on return, and expose the supported video commands without format conversion");
 
   for (const kind of ["图片", "视频"]) {
     const trigger = button(`${kind}工具`), panel = menu(`${kind}工具`);
@@ -239,7 +259,7 @@ try {
     }
     await trigger.focus(); await page.keyboard.press("ArrowDown");
     await eventually(() => focused(panel.getByRole("menuitem").first()), `${kind} ArrowDown focuses first item`);
-    await panel.getByRole("menuitem").nth(1).hover(); await settle();
+    await moveToMenuItem(panel, 1); await settle();
     const changedToPointer = await panel.getByRole("menuitem").evaluateAll(items => items.map(item => ({ background: getComputedStyle(item).backgroundColor, hover: item.matches(":hover"), outlineWidth: getComputedStyle(item).outlineWidth, outlineStyle: getComputedStyle(item).outlineStyle })));
     assert.equal(await panel.getAttribute("data-navigation"), "pointer");
     assert.equal(changedToPointer.filter(item => !transparent(item.background)).length, 1, "keyboard-to-pointer input never leaves two highlighted rows");
@@ -327,21 +347,41 @@ try {
   await openTool("视频", "截取当前帧");
   assert.equal((await stats()).captures, 1); assert.equal(await menu("视频工具").count(), 0);
   await eventually(() => focused(button("视频工具")), "capture restores trigger focus");
+  await openTool("视频", "批量截取画面");
+  const batchDialog = dialog("批量截取视频画面"); await batchDialog.waitFor();
+  await page.waitForFunction(() => { const video = document.querySelector(".video-frame-preview video"); return video?.readyState >= 2 && video.videoWidth > 0; });
+  await batchDialog.getByRole("button", { name: "添加首帧", exact: true }).click();
+  const batchTimeInput = batchDialog.getByRole("spinbutton", { name: "当前时间（秒）", exact: true });
+  await batchTimeInput.fill("1");
+  await eventually(async () => await batchTimeInput.inputValue() === "1", "batch preview seeks to the entered time");
+  await page.waitForFunction(() => { const video = document.querySelector(".video-frame-preview video"); return video?.readyState >= 2 && !video.seeking && Math.abs(video.currentTime - 1) < 0.02; }, null, { timeout: 5000 }).catch(async cause => {
+    const state = await page.locator(".video-frame-preview video").evaluate(video => ({ time: video.currentTime, seeking: video.seeking, readyState: video.readyState, duration: video.duration, networkState: video.networkState, error: video.error?.message }));
+    throw new Error(`Batch preview did not reach the requested time: ${JSON.stringify(state)}; ${cause}`);
+  });
+  await batchDialog.getByRole("button", { name: "添加当前帧", exact: true }).click();
+  assert.match(await batchDialog.locator(".video-frame-selected-heading").innerText(), /2\/30/, "batch capture accepts separate time points");
+  await batchDialog.getByRole("button", { name: "添加首帧", exact: true }).click();
+  assert.equal(await batchDialog.getByRole("alert").innerText(), "这个时间点已经添加。", "duplicate timestamps are rejected with feedback");
+  await batchDialog.getByRole("button", { name: "生成 2 张图片", exact: true }).click();
+  await batchDialog.getByRole("progressbar", { name: /正在截取/ }).waitFor();
+  await batchDialog.waitFor({ state: "hidden" });
+  assert.deepEqual((await stats()).captureFrames, [0, 1], "selected timestamps decode into individual frame callbacks");
+  await eventually(() => focused(button("视频工具")), "closing batch capture restores trigger focus");
   passed("unready-video commands explain their disabled state, and capture closes the menu and restores focus");
 
   await openTool("视频", "裁剪视频");
   const trimDialog = dialog("裁剪视频"); await trimDialog.waitFor();
   await trimDialog.getByRole("slider", { name: "裁剪开始位置", exact: true }).waitFor();
-  assert.equal(await trimDialog.getByRole("button", { name: "确认裁剪", exact: true }).count(), 1);
+  assert.equal(await trimDialog.getByRole("button", { name: "处理并添加节点", exact: true }).count(), 1);
   const trimStartBefore = await trimDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).inputValue();
   await trimDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).fill("4");
-  assert.equal(await trimDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).inputValue(), "4");
+  assert.equal(Number(await trimDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).inputValue()), 4);
   await trimDialog.getByRole("slider", { name: "裁剪开始位置", exact: true }).focus();
   await page.keyboard.press("ArrowRight");
   assert.notEqual(await trimDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).inputValue(), trimStartBefore);
   await page.keyboard.press("Escape"); await trimDialog.waitFor({ state: "hidden" });
   await openTool("视频", "裁剪视频");
-  await dialog("裁剪视频").getByRole("button", { name: "确认裁剪", exact: true }).click();
+  await dialog("裁剪视频").getByRole("button", { name: "处理并添加节点", exact: true }).click();
   await dialog("裁剪视频").getByRole("button", { name: "取消处理", exact: true }).waitFor();
   assert.equal((await stats()).processCalls.at(-1).operation, "trim");
   await dialog("裁剪视频").getByRole("button", { name: "取消处理", exact: true }).click();
@@ -349,16 +389,92 @@ try {
   await page.keyboard.press("Escape"); await dialog("裁剪视频").waitFor({ state: "hidden" });
   passed("video trim workspace exposes linked preview controls, timeline handles, keyboard nudging, cancellation, and trim export requests");
 
+  await openTool("视频", "画面裁剪");
+  const cropDialog = dialog("视频画面裁剪"); await cropDialog.waitFor();
+  const cropBox = await cropDialog.boundingBox();
+  assert.ok(cropBox && cropBox.width > 1000 && cropBox.height > 650, "video crop opens as a large composition workspace");
+  await page.waitForFunction(() => { const video = document.querySelector(".video-crop-viewport video"); return video?.readyState >= 1 && video.videoWidth > 0; });
+  await snapshot("video-crop-dialog");
+  assert.equal(await cropDialog.getByRole("radio", { name: "自由", exact: true }).count(), 1);
+  assert.equal(await cropDialog.getByRole("radio", { name: "1:1", exact: true }).count(), 1);
+  await cropDialog.getByRole("radio", { name: "1:1", exact: true }).click();
+  assert.equal(await cropDialog.getByText("180 × 180 px", { exact: true }).count(), 1, "square preset updates the crop output dimensions");
+  await cropDialog.getByRole("button", { name: "水平镜像", exact: true }).click();
+  assert.equal(await cropDialog.getByRole("button", { name: "水平镜像", exact: true }).getAttribute("aria-pressed"), "true");
+  const cropSelection = cropDialog.locator(".video-crop-selection");
+  const beforeCropDrag = await cropSelection.boundingBox();
+  const cropHandle = cropDialog.getByRole("button", { name: "调整右下裁剪边界", exact: true });
+  const cropHandleBox = await cropHandle.boundingBox();
+  assert.ok(beforeCropDrag && cropHandleBox, "video crop exposes a visible resize handle");
+  await page.mouse.move(cropHandleBox.x, cropHandleBox.y); await page.mouse.down(); await page.mouse.move(cropHandleBox.x - 32, cropHandleBox.y - 24); await page.mouse.up();
+  const afterCropDrag = await cropSelection.boundingBox();
+  assert.ok(afterCropDrag && afterCropDrag.width < beforeCropDrag.width && afterCropDrag.height < beforeCropDrag.height, "video crop handles resize the selection");
+  await cropDialog.getByRole("complementary", { name: "裁剪设置", exact: true }).getByRole("button", { name: "重置", exact: true }).click();
+  assert.equal(await cropDialog.getByRole("radio", { name: "自由", exact: true }).getAttribute("aria-checked"), "true");
+  await cropDialog.getByRole("radio", { name: "1:1", exact: true }).click();
+  await cropDialog.getByRole("button", { name: "开始处理", exact: true }).click();
+  await cropDialog.getByRole("button", { name: "取消处理", exact: true }).waitFor();
+  const cropRequest = (await stats()).processCalls.at(-1);
+  assert.equal(cropRequest.operation, "crop"); assert.equal(cropRequest.aspectRatio, "1:1"); assert.equal(cropRequest.flipHorizontal, false);
+  await cropDialog.getByRole("button", { name: "取消处理", exact: true }).click();
+  await cropDialog.getByRole("alert").waitFor(); await page.keyboard.press("Escape"); await cropDialog.waitFor({ state: "hidden" });
+  passed("video crop workspace supports preset ratios, drag resizing, mirror, reset, and crop export requests");
+
+  await openTool("视频", "提取视频");
+  const extractDialog = dialog("提取视频"); await extractDialog.waitFor();
+  const extractProgress = extractDialog.getByRole("progressbar");
+  await extractProgress.waitFor();
+  assert.equal(await extractProgress.getAttribute("aria-label"), "正在读取视频 · 2.0 / 8.0 MB");
+  assert.equal(await extractProgress.getAttribute("aria-valuenow"), "25");
+  assert.equal(await extractDialog.getByText("处理中 25%", { exact: true }).count(), 0, "video extraction presents source-byte progress instead of generic processing percent");
+  await snapshot("video-extraction-read-progress");
+  await control({ progress: 0, processStatus: "正在保存视频并创建节点…" });
+  await eventually(async () => await extractProgress.getAttribute("aria-valuenow") === null, "storage phase switches to an indeterminate progressbar");
+  assert.equal(await extractProgress.getAttribute("aria-label"), "正在保存视频并创建节点…");
+  assert.equal(await extractProgress.evaluate(element => element.parentElement.classList.contains("is-indeterminate")), true);
+  await snapshot("video-extraction-save-progress");
+  await extractDialog.getByRole("button", { name: "取消处理", exact: true }).click();
+  await extractDialog.getByRole("alert").waitFor();
+  await page.keyboard.press("Escape"); await extractDialog.waitFor({ state: "hidden" });
+  passed("video extraction reports measured read progress, uses an indeterminate save animation, and remains cancellable");
+
+  await openTool("视频", "提取音频");
+  const audioExtractDialog = dialog("提取音频"); await audioExtractDialog.waitFor();
+  assert.equal(await audioExtractDialog.getByLabel("开始时间").count(), 0, "audio extraction has no range configuration");
+  assert.equal(await audioExtractDialog.getByLabel("输出格式").count(), 0, "audio extraction uses its automatic output format");
+  const audioExtractRequest = (await stats()).processCalls.at(-1);
+  assert.equal(audioExtractRequest.operation, "extract-audio");
+  assert.equal(audioExtractRequest.startTime, 0, "one-click audio extraction starts at the beginning of the track");
+  assert.equal(audioExtractRequest.endTime, 60, "one-click audio extraction includes the complete track");
+  await audioExtractDialog.getByRole("button", { name: "取消处理", exact: true }).click();
+  await audioExtractDialog.getByRole("alert").waitFor();
+  await page.keyboard.press("Escape"); await audioExtractDialog.waitFor({ state: "hidden" });
+  passed("audio extraction starts automatically, covers the full track, and exposes no parameters");
+
   await openTool("视频", "视频压缩");
   const videoDialog = dialog("视频压缩"); await videoDialog.waitFor();
   await snapshot("video-dialog");
+  await eventually(() => focused(videoDialog.getByRole("spinbutton", { name: "开始时间", exact: true })), "video dialog focuses first editable control");
+  const compressionBox = await videoDialog.evaluate(element => { const rect = element.getBoundingClientRect(); return { width: rect.width, height: rect.height }; });
+  assert.ok(compressionBox.width > 1100 && compressionBox.height > 700, "compression opens as a large editing workspace");
+  await page.waitForFunction(() => { const video = document.querySelector(".video-compress-preview-shell video"); return video?.readyState >= 1 && video.videoWidth > 0; });
+  assert.equal(await videoDialog.getByRole("radio", { name: /^\s*540 px/ }).count(), 1, "compression exposes a resolution preset beside the compatibility select");
+  assert.equal(await videoDialog.getByRole("radio", { name: "15fps", exact: true }).count(), 1, "compression exposes output frame-rate presets");
+  await videoDialog.getByRole("radio", { name: /^\s*540 px/ }).click();
+  assert.equal(await videoDialog.getByRole("combobox", { name: "最大宽度", exact: true }).inputValue(), "540", "selecting a preset synchronizes the accessible width control");
+  await videoDialog.getByRole("radio", { name: "15fps", exact: true }).click();
+  assert.equal(await videoDialog.getByText("15 fps", { exact: true }).count(), 2, "frame-rate preset updates the output summary");
+  await videoDialog.getByRole("combobox", { name: "质量", exact: true }).selectOption("high");
+  await videoDialog.getByRole("button", { name: "重置", exact: true }).click();
+  assert.equal(await videoDialog.getByRole("combobox", { name: "最大宽度", exact: true }).inputValue(), "720");
+  assert.equal(await videoDialog.getByRole("combobox", { name: "质量", exact: true }).inputValue(), "standard");
+  assert.equal(await videoDialog.getByRole("radio", { name: "30fps", exact: true }).getAttribute("aria-checked"), "true");
   const desktopVideoActions = await videoDialog.locator(".image-tool-actions > button").evaluateAll(buttons => {
     const parent = buttons[0]?.parentElement?.getBoundingClientRect();
     return { parent: { left: parent.left, right: parent.right }, buttons: buttons.map(button => { const rect = button.getBoundingClientRect(); return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom }; }) };
   });
   assert.ok(desktopVideoActions.buttons.every(button => button.left >= desktopVideoActions.parent.left - 1 && button.right <= desktopVideoActions.parent.right + 1));
   assert.equal(new Set(desktopVideoActions.buttons.map(button => button.top)).size, 1, "desktop video actions stay on one row");
-  await eventually(() => focused(videoDialog.getByRole("spinbutton", { name: "开始时间", exact: true })), "video dialog focuses first editable control");
   const videoFocusables = videoDialog.locator("button:not(:disabled),input:not(:disabled),select:not(:disabled)");
   await videoFocusables.last().focus(); await page.keyboard.press("Tab"); assert.equal(await focused(videoFocusables.first()), true);
   await page.keyboard.press("Shift+Tab"); assert.equal(await focused(videoFocusables.last()), true);
@@ -372,21 +488,25 @@ try {
   await openTool("视频", "视频压缩");
   await videoDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).fill("4");
   await videoDialog.getByRole("combobox", { name: "最大宽度", exact: true }).selectOption("480");
+  await videoDialog.getByRole("radio", { name: "24fps", exact: true }).click();
   await videoDialog.getByRole("button", { name: "开始处理", exact: true }).click();
+  const compressionRequest = (await stats()).processCalls.filter(call => call.operation === "compress").at(-1);
+  assert.equal(compressionRequest.maxWidth, 480);
+  assert.equal(compressionRequest.frameRate, 24, "selected frame rate reaches the video processor");
   await videoDialog.getByRole("button", { name: "取消处理", exact: true }).waitFor();
   await page.keyboard.press("Escape"); await page.mouse.click(20, 20);
   assert.equal(await videoDialog.isVisible(), true, "busy processing cannot be dismissed by Escape or backdrop");
   await videoDialog.getByRole("button", { name: "取消处理", exact: true }).click();
   await videoDialog.getByRole("alert").waitFor();
-  assert.equal(await videoDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).inputValue(), "4");
+  assert.equal(Number(await videoDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).inputValue()), 4);
   assert.equal(await videoDialog.getByRole("combobox", { name: "最大宽度", exact: true }).inputValue(), "480");
   await videoDialog.getByRole("button", { name: "重试处理", exact: true }).click();
   await videoDialog.getByRole("button", { name: "取消处理", exact: true }).waitFor();
   await control({ busy: false, error: "编码失败：测试错误" });
   await videoDialog.getByRole("alert").waitFor();
-  assert.equal(await videoDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).inputValue(), "4");
+  assert.equal(Number(await videoDialog.getByRole("spinbutton", { name: "开始时间", exact: true }).inputValue()), 4);
   assert.equal(await videoDialog.getByRole("combobox", { name: "最大宽度", exact: true }).inputValue(), "480");
-  assert.equal((await stats()).processCalls.length, 2);
+  assert.equal((await stats()).processCalls.filter(call => call.operation === "compress").length, 2);
   await videoDialog.getByRole("button", { name: "重置", exact: true }).click();
   assert.equal(await videoDialog.getByRole("alert").count(), 0);
   assert.equal(await videoDialog.getByRole("combobox", { name: "最大宽度", exact: true }).inputValue(), "720");
@@ -394,7 +514,7 @@ try {
   passed("video dialogs focus and trap controls, close by Escape/backdrop, protect active work, and preserve/retry/reset cancelled or failed parameters");
 
   const beforeResolve = (await stats()).resolveCalls;
-  await openTool("图片", "裁剪 / 压缩 / 镜像");
+  await openTool("图片", "图片基础编辑");
   const imageDialog = page.getByRole("dialog"); await imageDialog.waitFor();
   await eventually(() => focused(imageDialog.getByRole("spinbutton", { name: "左", exact: true })), "image dialog focuses crop control");
   await imageDialog.locator(".image-tool-source").waitFor();
@@ -402,10 +522,57 @@ try {
   for (let tick = 1; tick <= 4; tick++) await control({ tick });
   await pause(100);
   assert.equal((await stats()).resolveCalls - beforeResolve, 1, "inline resolver identity changes do not restart original loading");
-  assert.equal(await imageDialog.getByRole("tab").count(), 3);
+  assert.equal(await imageDialog.getByRole("tab").count(), 0, "basic image editing uses one combined workspace instead of mutually exclusive tabs");
   await imageDialog.getByRole("spinbutton", { name: "左", exact: true }).fill("20");
   await imageDialog.getByRole("button", { name: "重置", exact: true }).click();
-  assert.equal(await imageDialog.getByRole("spinbutton", { name: "左", exact: true }).inputValue(), "5");
+  assert.equal(await imageDialog.getByRole("spinbutton", { name: "左", exact: true }).inputValue(), "0");
+  const cropRatioGroup = imageDialog.getByRole("group", { name: "裁剪比例", exact: true });
+  assert.equal(await cropRatioGroup.getByRole("button").count(), 6);
+  const ratioHeading = await imageDialog.locator(".image-crop-ratio-section .image-crop-margin-heading").boundingBox();
+  const firstRatioShortcut = await cropRatioGroup.getByRole("button").first().boundingBox();
+  assert.ok(ratioHeading && firstRatioShortcut && ratioHeading.y + ratioHeading.height <= firstRatioShortcut.y, "ratio heading stays clear of its shortcut controls");
+  const squareRatio = imageDialog.getByRole("button", { name: "裁剪比例 1:1 方形", exact: true });
+  await squareRatio.click();
+  const squareWidth = Number(await imageDialog.getByRole("spinbutton", { name: "裁剪宽度", exact: true }).inputValue());
+  const squareHeight = Number(await imageDialog.getByRole("spinbutton", { name: "裁剪高度", exact: true }).inputValue());
+  assert.equal(squareWidth, squareHeight, "square crop ratio keeps width and height equal");
+  await imageDialog.getByRole("button", { name: "裁剪比例 16:9 横屏", exact: true }).click();
+  assert.equal(await imageDialog.getByRole("button", { name: "裁剪比例 16:9 横屏", exact: true }).getAttribute("aria-pressed"), "true");
+  const landscapeWidth = Number(await imageDialog.getByRole("spinbutton", { name: "裁剪宽度", exact: true }).inputValue());
+  const landscapeHeight = Number(await imageDialog.getByRole("spinbutton", { name: "裁剪高度", exact: true }).inputValue());
+  assert.ok(Math.abs(landscapeWidth / landscapeHeight - 16 / 9) < 0.02, "landscape crop ratio matches the selected aspect ratio");
+  const imageCropSelection = imageDialog.getByRole("group", { name: "裁剪选区", exact: true });
+  const leftMargin = imageDialog.getByRole("spinbutton", { name: "左", exact: true });
+  await imageCropSelection.focus(); await page.keyboard.press("ArrowDown");
+  assert.ok(Number(await imageDialog.getByRole("spinbutton", { name: "上", exact: true }).inputValue()) > 0, "arrow keys nudge the focused crop selection");
+  await imageDialog.locator(".image-crop-viewport .image-tool-source").evaluate(element => element.dispatchEvent(new Event("error")));
+  await imageDialog.getByRole("alert").filter({ hasText: "预览加载失败" }).waitFor();
+  await imageDialog.getByRole("button", { name: "重新加载", exact: true }).click();
+  await page.waitForFunction(() => {
+    const image = document.querySelector(".image-crop-viewport .image-tool-source");
+    return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0;
+  });
+  await imageDialog.getByRole("button", { name: "重置", exact: true }).click();
+  await imageDialog.getByRole("button", { name: "裁剪比例 16:9 横屏", exact: true }).click();
+  await imageDialog.getByRole("button", { name: "水平镜像", exact: true }).click();
+  assert.equal(await imageDialog.getByRole("button", { name: "水平镜像", exact: true }).getAttribute("aria-pressed"), "true");
+  await imageDialog.getByRole("combobox", { name: "输出格式", exact: true }).selectOption("image/webp");
+  const imageQuality = imageDialog.getByRole("slider", { name: "输出质量", exact: true });
+  await imageQuality.evaluate(element => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    setter.call(element, "76");
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  assert.equal(await imageQuality.inputValue(), "76");
+  await imageDialog.getByRole("button", { name: "生成预览", exact: true }).click();
+  await imageDialog.getByRole("button", { name: "添加到画布", exact: true }).waitFor();
+  assert.match(await imageDialog.locator(".image-crop-result-info").innerText(), /WEBP/);
+  assert.match(await imageDialog.locator(".image-crop-result-info").innerText(), /1200 × 675 px/);
+  await imageDialog.getByRole("button", { name: "继续调整", exact: true }).click();
+  await imageDialog.getByRole("button", { name: "生成预览", exact: true }).waitFor();
+  assert.equal(await imageDialog.getByRole("button", { name: "水平镜像", exact: true }).getAttribute("aria-pressed"), "true", "continuing from preview preserves combined edit settings");
+  assert.equal(await imageDialog.getByRole("combobox", { name: "输出格式", exact: true }).inputValue(), "image/webp");
+  await imageDialog.getByRole("button", { name: "重置", exact: true }).click();
   await snapshot("image-dialog");
   const desktopImageActions = await imageDialog.locator(".image-tool-actions > button").evaluateAll(buttons => {
     const parent = buttons[0]?.parentElement?.getBoundingClientRect();
@@ -413,23 +580,101 @@ try {
   });
   assert.ok(desktopImageActions.buttons.every(button => button.left >= desktopImageActions.parent.left - 1 && button.right <= desktopImageActions.parent.right + 1));
   assert.equal(new Set(desktopImageActions.buttons.map(button => button.top)).size, 1, "desktop image actions stay on one row");
-  await imageDialog.getByRole("tab", { name: "裁剪", exact: true }).focus(); await page.keyboard.press("ArrowRight");
-  assert.equal(await imageDialog.getByRole("tab", { name: "压缩", exact: true }).getAttribute("aria-selected"), "true");
-  await page.keyboard.press("End");
-  assert.equal(await imageDialog.getByRole("tab", { name: "镜像", exact: true }).getAttribute("aria-selected"), "true");
-  assert.equal((await stats()).resolveCalls - beforeResolve, 1, "switching basic-operation tabs reuses the resolved original");
+  assert.equal((await stats()).resolveCalls - beforeResolve, 1, "the combined editing session reuses the resolved original through preview and apply");
   const imageFocusables = imageDialog.locator("button:not(:disabled):not([tabindex='-1']),input:not(:disabled),select:not(:disabled),textarea:not(:disabled)");
   await imageFocusables.last().focus(); await page.keyboard.press("Tab"); assert.equal(await focused(imageFocusables.first()), true);
   await page.keyboard.press("Shift+Tab"); assert.equal(await focused(imageFocusables.last()), true);
-  await imageDialog.getByRole("button", { name: "生成派生图片", exact: true }).click();
+  await imageDialog.getByRole("button", { name: "生成预览", exact: true }).click();
+  await imageDialog.getByRole("button", { name: "添加到画布", exact: true }).waitFor();
+  assert.match(await imageDialog.locator(".image-crop-result-info").innerText(), /1200 × 800 px[\s\S]*PNG/);
+  await imageDialog.getByRole("button", { name: "添加到画布", exact: true }).click();
   await imageDialog.waitFor({ state: "hidden" });
   const imageStats = await stats();
-  assert.equal(imageStats.outputs.length, 1); assert.equal(imageStats.outputs[0].operationId, "mirror");
+  assert.equal(imageStats.outputs.length, 1); assert.equal(imageStats.outputs[0].operationId, "basic-edit");
   assert.equal(imageStats.outputs[0].width, 1200); assert.equal(imageStats.outputs[0].height, 800);
+  assert.equal(imageStats.outputs[0].params.format, "image/png");
   assert.equal(imageStats.resolveCalls - beforeResolve, 1, "applying reuses the source already loaded for editing");
   await eventually(() => focused(button("图片工具")), "image apply restores trigger focus");
-  passed("image basics share accessible tabs, focus editable controls, resolve the original only once across rerenders/tabs/apply, reset parameters, and generate original-resolution output");
+  passed("image basics combine crop, mirror, and export settings in one accessible workspace, preserve parameters through preview, resolve the original once, reset cleanly, and create a new output node");
 
+  await openTool("图片", "标记修图");
+  const annotateDialog = dialog("标记编辑"); await annotateDialog.waitFor();
+  const annotateDialogBox = await annotateDialog.boundingBox();
+  assert.ok(annotateDialogBox && annotateDialogBox.width >= 1000 && annotateDialogBox.height >= 700, "annotation editor uses the large desktop workspace");
+  assert.equal(await annotateDialog.getByRole("toolbar", { name: "标记工具", exact: true }).count(), 1);
+  const annotationSurface = annotateDialog.locator("canvas[aria-label='图片标注画布']");
+  await annotationSurface.waitFor();
+  const surfaceBox = await annotationSurface.boundingBox();
+  assert.ok(surfaceBox && surfaceBox.width > 200 && surfaceBox.height > 120, "annotation canvas has a visible drawing surface");
+  await annotateDialog.getByRole("button", { name: "箭头", exact: true }).click();
+  await page.mouse.move(surfaceBox.x + surfaceBox.width * 0.2, surfaceBox.y + surfaceBox.height * 0.7);
+  await page.mouse.down();
+  await page.mouse.move(surfaceBox.x + surfaceBox.width * 0.65, surfaceBox.y + surfaceBox.height * 0.35, { steps: 4 });
+  await page.mouse.up();
+  await annotateDialog.getByRole("button", { name: "编号", exact: true }).click();
+  await page.mouse.click(surfaceBox.x + surfaceBox.width * 0.72, surfaceBox.y + surfaceBox.height * 0.28);
+  await annotateDialog.getByRole("button", { name: "文字", exact: true }).click();
+  await page.mouse.click(surfaceBox.x + surfaceBox.width * 0.34, surfaceBox.y + surfaceBox.height * 0.2);
+  const annotationText = annotateDialog.getByRole("textbox", { name: "标记文字", exact: true });
+  await annotationText.fill("重点入口");
+  assert.equal(await annotateDialog.getByText("3 个标记", { exact: true }).count(), 1, "annotation layer count tracks drawn items");
+  assert.equal(await annotateDialog.getByRole("button", { name: "撤销", exact: true }).isDisabled(), false, "annotation history enables undo after drawing");
+  await annotateDialog.getByRole("button", { name: "生成预览", exact: true }).click();
+  const annotatePreviewDialog = dialog("标记预览");
+  await annotatePreviewDialog.getByRole("button", { name: "添加到画布", exact: true }).waitFor();
+  assert.equal(await annotatePreviewDialog.getByText("3 个标记 · 输出 PNG", { exact: true }).count(), 1);
+  assert.equal(await annotatePreviewDialog.getByRole("img", { name: "山间日落标记预览" }).count(), 1);
+  await annotatePreviewDialog.getByRole("button", { name: "添加到画布", exact: true }).click();
+  await annotatePreviewDialog.waitFor({ state: "hidden" });
+  const annotationOutputStats = await stats();
+  assert.equal(annotationOutputStats.outputs.at(-1).operationId, "annotate");
+  assert.equal(annotationOutputStats.outputs.at(-1).width, 1200);
+  assert.equal(annotationOutputStats.outputs.at(-1).height, 800);
+  await eventually(() => focused(button("图片工具")), "annotation apply restores trigger focus");
+  passed("annotation editor supports drawing tools, numbered and text labels, layer history, preview confirmation, and original-resolution output");
+
+  const beforeLayerSplitOutputs = (await stats()).outputs.length;
+  await openTool("图片", "图层拆分");
+  const layerSplitDialog = dialog("图层拆分"); await layerSplitDialog.waitFor();
+  await layerSplitDialog.locator(".layer-split-image-frame img").waitFor();
+  await layerSplitDialog.getByRole("tab", { name: "自然语言", exact: true }).click();
+  assert.equal(await layerSplitDialog.getByRole("textbox", { name: "图层拆分描述", exact: true }).count(), 1);
+  await layerSplitDialog.getByRole("tab", { name: "智能识别", exact: true }).click();
+  assert.equal(await layerSplitDialog.getByText(/需要平台视觉模型/, { exact: false }).count(), 1);
+  await layerSplitDialog.getByRole("tab", { name: "区域框选", exact: true }).click();
+  const splitFrame = await layerSplitDialog.locator(".layer-split-image-frame").boundingBox();
+  assert.ok(splitFrame && splitFrame.width > 200 && splitFrame.height > 120, "layer split editor has a visible image frame");
+  await page.mouse.move(splitFrame.x + splitFrame.width * 0.12, splitFrame.y + splitFrame.height * 0.16);
+  await page.mouse.down();
+  await page.mouse.move(splitFrame.x + splitFrame.width * 0.38, splitFrame.y + splitFrame.height * 0.44, { steps: 3 });
+  await page.mouse.up();
+  await page.mouse.move(splitFrame.x + splitFrame.width * 0.58, splitFrame.y + splitFrame.height * 0.2);
+  await page.mouse.down();
+  await page.mouse.move(splitFrame.x + splitFrame.width * 0.84, splitFrame.y + splitFrame.height * 0.48, { steps: 3 });
+  await page.mouse.up();
+  assert.equal(await layerSplitDialog.getByText("已框选区域 2", { exact: true }).count(), 1);
+  await layerSplitDialog.getByRole("textbox", { name: "图层 1 名称", exact: true }).fill("主体");
+  await layerSplitDialog.getByRole("textbox", { name: "图层 2 名称", exact: true }).fill("细节");
+  await layerSplitDialog.getByRole("checkbox", { name: "同时保留背景层", exact: true }).check();
+  await layerSplitDialog.getByRole("combobox", { name: "图层输出分辨率", exact: true }).selectOption("1K");
+  await layerSplitDialog.getByRole("button", { name: "拆分", exact: true }).click();
+  const layerSplitPreviewDialog = dialog("图层拆分预览"); await layerSplitPreviewDialog.waitFor();
+  await layerSplitPreviewDialog.getByRole("button", { name: "添加到画布", exact: true }).waitFor();
+  assert.equal(await layerSplitPreviewDialog.locator(".layer-split-preview-card").count(), 3, "two regions plus the optional background become separate layer previews");
+  await snapshot("layer-split-preview");
+  await layerSplitPreviewDialog.getByRole("button", { name: "继续调整", exact: true }).click();
+  await layerSplitDialog.getByRole("button", { name: "拆分", exact: true }).click();
+  const secondLayerSplitPreviewDialog = dialog("图层拆分预览"); await secondLayerSplitPreviewDialog.waitFor();
+  await secondLayerSplitPreviewDialog.getByRole("button", { name: "添加到画布", exact: true }).waitFor();
+  await secondLayerSplitPreviewDialog.getByRole("button", { name: "添加到画布", exact: true }).click();
+  await secondLayerSplitPreviewDialog.waitFor({ state: "hidden" });
+  const layerSplitStats = await stats();
+  assert.equal(layerSplitStats.outputs.length - beforeLayerSplitOutputs, 3);
+  assert.ok(layerSplitStats.outputs.slice(-3).every(output => output.operationId === "layer-split"));
+  await eventually(() => focused(button("图片工具")), "layer split apply restores trigger focus");
+  passed("layer split supports multiple region selections, labels, optional background layer, resolution choice, preview confirmation, and separate canvas outputs");
+
+  const beforeSourceFailureResolve = (await stats()).resolveCalls;
   await control({ sourceFailures: 1 });
   await openTool("图片", "图片调整");
   await imageDialog.getByRole("alert").waitFor();
@@ -437,7 +682,7 @@ try {
   await imageDialog.getByRole("button", { name: "重试加载", exact: true }).click();
   await imageDialog.locator(".image-tool-source").waitFor();
   assert.equal(await imageDialog.locator(".image-tool-source").evaluate(element => element.naturalWidth), 1200);
-  assert.equal((await stats()).resolveCalls - imageStats.resolveCalls, 2);
+  assert.equal((await stats()).resolveCalls - beforeSourceFailureResolve, 2);
   await page.keyboard.press("Escape"); await imageDialog.waitFor({ state: "hidden" });
   await openTool("图片", "宫格裁剪"); await page.mouse.click(20, 20); await imageDialog.waitFor({ state: "hidden" });
   passed("original-source failures remain visible and retryable; image Escape and backdrop dismissal both return to the canvas");
@@ -445,7 +690,7 @@ try {
   // Hold only the apply-time browser decode so busy keyboard/backdrop behavior
   // can be verified deterministically without making processing artificially
   // expensive or changing production component behavior.
-  await openTool("图片", "裁剪 / 压缩 / 镜像");
+  await openTool("图片", "图片基础编辑");
   await imageDialog.locator(".image-tool-source").waitFor();
   await page.evaluate(() => {
     window.__mediaToolsNativeImage = window.Image;
@@ -454,7 +699,7 @@ try {
       get onload() { return super.onload; }
     };
   });
-  await imageDialog.getByRole("button", { name: "生成派生图片", exact: true }).click();
+  await imageDialog.getByRole("button", { name: "生成预览", exact: true }).click();
   await page.waitForFunction(() => typeof window.__mediaToolsReleaseImageDecode === "function");
   assert.equal(await imageDialog.getAttribute("aria-busy"), "true");
   await page.keyboard.press("Tab");
@@ -465,9 +710,11 @@ try {
   assert.equal(await imageDialog.isVisible(), true);
   assert.equal(await imageDialog.getByRole("button", { name: "关闭图片工具", exact: true }).isDisabled(), true);
   await page.evaluate(() => { window.Image = window.__mediaToolsNativeImage; window.__mediaToolsReleaseImageDecode(); });
+  await imageDialog.getByRole("button", { name: "添加到画布", exact: true }).waitFor();
+  await imageDialog.getByRole("button", { name: "添加到画布", exact: true }).click();
   await imageDialog.waitFor({ state: "hidden" });
   const busyOutput = (await stats()).outputs.at(-1);
-  assert.equal(busyOutput.operationId, "crop"); assert.equal(busyOutput.width, 1080); assert.equal(busyOutput.height, 720);
+  assert.equal(busyOutput.operationId, "basic-edit"); assert.equal(busyOutput.width, 1200); assert.equal(busyOutput.height, 800);
   passed("busy image processing keeps focus inside the dialog, disables dismiss actions, and completes with original-resolution crop output");
 
   const touchContext = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, reducedMotion: "reduce" });
@@ -494,7 +741,7 @@ try {
   const mobileVideoBox = await menu("视频工具").boundingBox();
   assert.ok(mobileVideoBox.x >= 7 && mobileVideoBox.y >= 7 && mobileVideoBox.x + mobileVideoBox.width <= 383 && mobileVideoBox.y + mobileVideoBox.height <= 837);
   await snapshot("mobile-video-menu"); await page.keyboard.press("Escape");
-  await openTool("图片", "裁剪 / 压缩 / 镜像");
+  await openTool("图片", "图片基础编辑");
   await imageDialog.locator(".image-tool-source").waitFor();
   const mobileImageBox = await imageDialog.boundingBox();
   assert.ok(mobileImageBox.x >= 0 && mobileImageBox.y >= 0 && mobileImageBox.x + mobileImageBox.width <= 390 && mobileImageBox.y + mobileImageBox.height <= 844);
@@ -509,8 +756,15 @@ try {
   assert.equal(mobileGrid, 1);
   await snapshot("mobile-image-dialog");
   await page.keyboard.press("Escape"); await imageDialog.waitFor({ state: "hidden" });
-  measurements.mobile = { videoMenu: mobileVideoBox, imageDialog: mobileImageBox };
-  passed("390px mobile menu and image dialog stay within the viewport with stacked image settings and no horizontal overflow");
+  await openTool("图片", "标记修图");
+  const mobileAnnotateDialog = dialog("标记编辑"); await mobileAnnotateDialog.waitFor();
+  const mobileAnnotateBox = await mobileAnnotateDialog.boundingBox();
+  assert.ok(mobileAnnotateBox && mobileAnnotateBox.x === 0 && mobileAnnotateBox.y === 0 && mobileAnnotateBox.width === 390 && mobileAnnotateBox.height === 844, "mobile annotation editor fills the viewport without backdrop gutters");
+  assert.equal(await mobileAnnotateDialog.evaluate(element => element.scrollWidth <= element.clientWidth + 1), true, "mobile annotation toolbar never overflows horizontally");
+  await snapshot("mobile-image-annotator");
+  await page.keyboard.press("Escape"); await mobileAnnotateDialog.waitFor({ state: "hidden" });
+  measurements.mobile = { videoMenu: mobileVideoBox, imageDialog: mobileImageBox, annotateDialog: mobileAnnotateBox };
+  passed("390px mobile media menus, image tools, and full-screen annotation editor stay within the viewport");
 
   assert.deepEqual(errors, [], "no browser runtime errors");
   assert.deepEqual(unexpectedNetworks, [], "no non-loopback network requests");

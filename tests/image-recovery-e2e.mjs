@@ -131,7 +131,7 @@ async function waitForRecoveredImage(page) {
 
 async function readLocalDocument(page) {
   return page.evaluate((id) => new Promise((resolve, reject) => {
-    const open = indexedDB.open("proxy-canvas:library:v1:account:acs_" + "f".repeat(64), 1);
+    const open = indexedDB.open("proxy-canvas:library:v1:account:acs_" + "f".repeat(64));
     open.onerror = () => reject(open.error);
     open.onsuccess = () => {
       const database = open.result;
@@ -321,7 +321,7 @@ try {
     const state = await (await fetch(`${api}/__fixture/state`)).json();
     const signatures = await page.evaluate(async ({ canvasId, remote, expiredUrl }) => {
       const local = await new Promise((resolve, reject) => {
-        const open = indexedDB.open("proxy-canvas:library:v1:account:acs_" + "f".repeat(64), 1);
+    const open = indexedDB.open("proxy-canvas:library:v1:account:acs_" + "f".repeat(64));
         open.onerror = () => reject(open.error);
         open.onsuccess = () => {
           const request = open.result.transaction("documents", "readonly").objectStore("documents").get(canvasId);

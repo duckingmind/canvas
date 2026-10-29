@@ -12,7 +12,7 @@ const apiPort = Number(process.env.CANVAS_MUSIC_ASSET_API_PORT || port + 1);
 const base = `http://127.0.0.1:${port}`, api = `http://127.0.0.1:${apiPort}`;
 const fixture = spawn(process.execPath, ["tests/platform-fixture.mjs", `--port=${port}`, `--api-port=${apiPort}`], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
 let output = "", browser, page;
-const requests = [], errors = [], checks = [];
+const requests = [], objectRequests = [], errors = [], checks = [];
 const ready = new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error(`Music asset fixture startup timeout: ${output}`)), 30000);
   const read = chunk => { output += String(chunk); if (output.includes('"event":"ready"')) { clearTimeout(timer); resolve(); } };
@@ -52,13 +52,18 @@ try {
     const request = route.request(), path = new URL(request.url()).pathname;
     const json = (value, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(value) });
     if (path === "/v1/music/models") return json({ data: [song, cover] });
-    if (path === "/v1/asset-audio.wav" || path.endsWith("/music/tasks/asset-cover-result/content")) return route.fulfill({ status: 200, contentType: "audio/wav", body: wav });
+    if (path === "/v1/asset-audio.wav") return route.fulfill({ status: 200, contentType: "audio/wav", body: wav });
     if (path.startsWith("/v1/music/by-idempotency-key/")) return json({ error: { code: "music_task_not_found", message: "not found" } }, 404);
     if (path === "/v1/music/generations") {
       requests.push({ body: request.postDataJSON(), key: request.headers()["idempotency-key"] });
-      return json({ id: "asset-cover-result", status: "completed", content_url: "/v1/music/tasks/asset-cover-result/content" });
+      const url = "https://objects.example/asset-cover.wav?signature=temporary";
+      return json({ id: "asset-cover-result", status: "completed", content_url: url, data: [{ asset_id: "asset-cover-result-asset", url }] });
     }
     return route.continue();
+  });
+  await context.route("https://objects.example/**", async route => {
+    objectRequests.push(route.request().url());
+    return route.fulfill({ status: 200, contentType: "audio/wav", headers: { "Access-Control-Allow-Origin": "*" }, body: wav });
   });
   page = await context.newPage(); page.setDefaultTimeout(20000);
   page.on("pageerror", error => errors.push(error.message));
@@ -94,6 +99,7 @@ try {
   await eventually(async () => (await readDocument()).nodes.find(node => node.id === "music-node")?.status === "completed", "asset Cover completes");
   assert.equal(requests.length, 1); assert.equal(requests[0].body.model, cover.id);
   assert.equal(requests[0].body.audio_base64, wav.toString("base64")); assert.ok(requests[0].key);
+  assert.equal(requests.some(request => request.path?.endsWith("/content")), false, "music bytes must not pass through Gateway content routes");
   await eventually(async () => {
     const state = await (await fetch(`${api}/__fixture/state`)).json();
     return state.storage["canvas:doc:v1:music-asset-reference"]?.nodes.some(node => node.id === "music-node" && node.status === "completed");

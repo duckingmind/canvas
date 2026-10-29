@@ -4,7 +4,6 @@ import {
   Brush,
   Check,
   ChevronDown,
-  Copy,
   Film,
   ImagePlus,
   Library,
@@ -15,6 +14,7 @@ import {
   Music2,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   Sparkles,
   SlidersHorizontal,
@@ -26,6 +26,7 @@ import {
   compatibleModels,
   modelsForType,
   modelUnavailableReason,
+  isMediaModelRecovering,
   preferredModel,
   selectedModelIdForNode,
   resolveVideoSettings,
@@ -37,7 +38,7 @@ import { compatibleMusicModels, musicModelUnavailableReason, musicModels, musicO
 import { compatibleVoiceDesignModels, isVoiceDesignModel, preferredVoiceDesignModel, voiceDesignModelUnavailableReason, type VoiceDesignModel } from "./voice-design-models";
 import { isTTSNode } from "./audio-creation";
 import { hasPendingNodeTask } from "./node-interaction";
-import { canCreateNewCanvasTask, canvasTaskRetryPolicy, canvasTaskState, isVideoResultUnconfirmed, pendingTaskLabel } from "./video-task-state";
+import { canCreateNewCanvasTask, canRetryMissedSubmission, canvasTaskRetryPolicy, canvasTaskState, isVideoResultUnconfirmed, pendingTaskLabel } from "./video-task-state";
 import { creationInputSignature } from "./creation-state";
 import { isComposingKey, isGenerateShortcut } from "./keyboard";
 import { imageOptions, imageAspectRatios, imageQualityLabel, imageSettingsSummary, resolveImageSettings } from "./image-models";
@@ -49,7 +50,7 @@ import { imagePreviewURL } from "./image-variants";
 import AudioRecorder from "./AudioRecorder";
 import PromptMentionInput, { type MentionCandidate } from "./PromptMentionInput";
 import type { PromptMentionAssetCandidate } from "./usePromptMentionAssets";
-import { normalizePromptSegments, promptSegmentsHaveReferences, promptSegmentsText } from "./prompt-segments.ts";
+import { normalizePromptSegments, promptReferenceDisplayLabel, promptSegmentsHaveReferences, promptSegmentsText } from "./prompt-segments.ts";
 import type { PromptSegment } from "./canvas-types";
 import "./creator.css";
 
@@ -156,6 +157,7 @@ export type CreatorPanelProps = {
   modelPlaceholder: string;
   onChange: (patch: Partial<Node>) => void;
   onGenerate: (inputChanged?: boolean) => void;
+  /** Create an editable copy without replaying the unresolved submission. */
   onCancel?: () => void;
   canceling?: boolean;
   onRefresh: () => void;
@@ -206,8 +208,10 @@ export default function CreatorPanel(p: CreatorPanelProps) {
   const [referenceBusy, setReferenceBusy] = React.useState(false);
   const [recordingSaving, setRecordingSaving] = React.useState(false);
   const [recordingSaved, setRecordingSaved] = React.useState(false);
+  const [recordingRedo, setRecordingRedo] = React.useState(false);
+  const [recordingSaveFailed, setRecordingSaveFailed] = React.useState(false);
+  const [recordingHasUncommittedCapture, setRecordingHasUncommittedCapture] = React.useState(false);
   const [recorderCycle, setRecorderCycle] = React.useState(0);
-  const [voiceIdCopied, setVoiceIdCopied] = React.useState(false);
   const audioScope = `${p.node.id}:${audioMode}`;
   const currentAudioScope = React.useRef({ identity: audioScope });
   if (currentAudioScope.current.identity !== audioScope) currentAudioScope.current = { identity: audioScope };
@@ -215,14 +219,23 @@ export default function CreatorPanel(p: CreatorPanelProps) {
   const saveInFlight = React.useRef(false);
   const referenceInFlight = React.useRef(false);
   const lyricsInFlight = React.useRef(false);
-  const voiceCopyTimer = React.useRef<number | null>(null);
   React.useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
-      if (voiceCopyTimer.current !== null) window.clearTimeout(voiceCopyTimer.current);
     };
   }, []);
+  const lastErrorNotice = React.useRef("");
+  React.useEffect(() => {
+    const message = p.validationError || p.connectionError;
+    if (!message) {
+      lastErrorNotice.current = "";
+      return;
+    }
+    if (message === lastErrorNotice.current) return;
+    lastErrorNotice.current = message;
+    p.onNotice(message, p.connectionError && !p.validationError ? { label: "重新加载模型", run: p.onRefresh } : undefined);
+  }, [p.connectionError, p.onNotice, p.onRefresh, p.validationError]);
   const musicReferenceInput = React.useRef<HTMLInputElement>(null);
   const audioReferenceCandidates = (p.audioReferenceCandidates || []).filter(candidate => candidate.id !== p.node.id);
   const [modelOpen, setModelOpen] = React.useState(false);
@@ -271,11 +284,12 @@ export default function CreatorPanel(p: CreatorPanelProps) {
     setReferenceBusy(false);
     setRecordingSaving(false);
     setRecordingSaved(false);
-    setVoiceIdCopied(false);
+    setRecordingRedo(false);
+    setRecordingSaveFailed(false);
+    setRecordingHasUncommittedCapture(false);
     saveInFlight.current = false;
     referenceInFlight.current = false;
     lyricsInFlight.current = false;
-    if (voiceCopyTimer.current !== null) window.clearTimeout(voiceCopyTimer.current);
   }, [audioScope]);
   React.useEffect(() => {
     setReferenceSearch("");
@@ -328,7 +342,15 @@ export default function CreatorPanel(p: CreatorPanelProps) {
   const resultUnconfirmed = isVideoResultUnconfirmed(p.node);
   const taskState = canvasTaskState(p.node, p.active);
   const retryPolicy = canvasTaskRetryPolicy(p.node);
+  const canRetryOriginalSubmission = canRetryMissedSubmission(p.node);
   const needsRecovery = pending || resultUnconfirmed || ["unknown", "reconciliation", "no_task_id"].includes(taskState);
+  // Task submission and prompt editing are separate concerns. Once a request
+  // has been frozen, the model/references/parameter controls must stay stable
+  // so the in-flight request cannot be changed. The prompt itself remains
+  // editable while that request runs, which lets the user prepare the next
+  // generation without mutating the captured `taskPrompt`.
+  const controlsLocked = pending || p.active || needsRecovery || recordingSaving || recordingHasUncommittedCapture || referenceBusy || lyricsGenerating || retiredTTS && Boolean(p.node.taskId || p.node.ttsSubmission || p.node.audioTaskType);
+  const promptReadOnly = canRetryOriginalSubmission || recordingSaving || recordingHasUncommittedCapture || referenceBusy || lyricsGenerating || retiredTTS && Boolean(p.node.taskId || p.node.ttsSubmission || p.node.audioTaskType);
   const draftChanged = draft !== p.node.text || JSON.stringify(promptSegmentsHaveReferences(promptSegments) ? promptSegments : undefined) !== JSON.stringify(p.node.promptSegments);
   // Upstream text is shown as source chips above the editor. Keep the textarea
   // scoped to the creator's own description so long source text cannot be
@@ -336,7 +358,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
   const fullPrompt = [...p.textReferences.map(reference => reference.text.trim()), draft.trim()].filter(Boolean).join("\n\n");
   const usesImages = visibleReferences.length > 0 && !p.node.ignoreImageRefs;
   const kind = isVideo ? "video" : "image";
-  const referenceCount = usesImages ? new Set(visibleReferences.map(ref => ref.image || ref.localImage || ref.video || ref.videoContentUrl || ref.assetId || ref.nodeId)).size : 0;
+  const referenceCount = usesImages ? new Set(visibleReferences.map(ref => ref.image || ref.video || ref.videoContentUrl || ref.assetId || ref.nodeId)).size : 0;
   const musicHasReference = Boolean(p.node.musicReference);
   const typeModels = (retiredTTS ? [] : isMusic
     ? isVoiceDesign ? voiceModels : musicModels(p.models as MusicModel[])
@@ -357,7 +379,10 @@ export default function CreatorPanel(p: CreatorPanelProps) {
   const imageRatios = imageAspectRatios(chosen, imageSettings.resolution);
   const imageSizes = imageConfig?.resolutionSizes[imageSettings.resolution || ""] || imageConfig?.sizes || [];
   const hasImageSettings = Boolean(imageConfig && (imageConfig.qualities.length || imageConfig.resolutions.length || imageSizes.length || imageConfig.ratios.length || imageConfig.maxCount > 1));
-  const changeImageSetting = (patch: NonNullable<Node["imageSettings"]>) => p.onChange({ imageSettings: resolveImageSettings(chosen, { ...imageSettings, ...patch }) });
+  const changeImageSetting = (patch: NonNullable<Node["imageSettings"]>) => {
+    if (controlsLocked) return;
+    p.onChange({ imageSettings: resolveImageSettings(chosen, { ...imageSettings, ...patch }) });
+  };
   const resolvedVideo = isVideo
     ? resolveVideoSettings(chosen as MediaModel | undefined, {
         duration: p.node.videoSettings?.duration ?? p.node.videoDuration,
@@ -388,8 +413,10 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           ? isVoiceDesign ? "先描述你希望生成的音色。" : isMusic ? "先描述你希望生成的音乐。" : "先描述你希望生成的画面。"
         : "";
   const generateLabel = isVideo ? "生成视频" : isVoiceDesign ? "生成音色" : isMusic ? "生成音乐" : "生成图片";
-  const submitLabel = p.active || needsRecovery ? pendingTaskLabel(p.node, p.active) : generateLabel;
-  const submitIcon = p.active || needsRecovery
+  const submitLabel = canRetryOriginalSubmission ? "重试原提交" : p.active || needsRecovery ? pendingTaskLabel(p.node, p.active) : generateLabel;
+  const submitIcon = canRetryOriginalSubmission
+    ? <RefreshCw size={17} />
+    : p.active || needsRecovery
     ? <LoaderCircle className="spin" size={18} />
     : <ArrowUp size={19} />;
   const costEstimate = useCostEstimate(p.node.id, chosen?.id && !p.needsLogin && !p.connecting && !isMusic
@@ -408,14 +435,24 @@ export default function CreatorPanel(p: CreatorPanelProps) {
   };
   const submit = () => {
     if (submitDisabled) return;
+    if (canRetryOriginalSubmission) {
+      p.onGenerate(false);
+      return;
+    }
     persistDraft();
     p.onGenerate(inputChanged);
   };
   const close = () => {
+    if (recordingSaving) {
+      p.onNotice("录音正在保存，请稍候再关闭。");
+      return;
+    }
+    if (isRecording && recordingHasUncommittedCapture && !window.confirm("录音尚未保存，关闭后会丢弃这段录音。确定关闭吗？")) return;
     persistDraft();
     p.onClose();
   };
   const openReferencePicker = () => {
+    if (controlsLocked) return;
     if (pickerDismissTimer.current !== null) {
       window.clearTimeout(pickerDismissTimer.current);
       pickerDismissTimer.current = null;
@@ -447,14 +484,14 @@ export default function CreatorPanel(p: CreatorPanelProps) {
   // after continuing a task). Treat the image itself as the identity so the
   // picker does not show the same reference again above the selected strip.
   const connectedImages = new Set(
-    visibleReferences.map((reference) => reference.image || reference.localImage || reference.video || reference.audio || reference.videoContentUrl || reference.assetId).filter(Boolean),
+    visibleReferences.map((reference) => reference.image || reference.video || reference.audio || reference.videoContentUrl || reference.assetId).filter(Boolean),
   );
   // Asset mode uses the same server-provided canvas assets, but keeps selected
   // items visible so the user can see which references are already attached.
   // Category metadata is optional; when it is absent the platform has not
   // classified the asset yet, so tabs remain a visual filter without hiding it.
   const assetCandidates = p.referenceCandidates.filter(
-    (candidate) => candidate.id !== p.node.id && (Boolean(candidate.image || candidate.localImage) || (isVideo && Boolean(candidate.video || candidate.audio || candidate.videoContentUrl || candidate.assetId))),
+    (candidate) => candidate.id !== p.node.id && (Boolean(candidate.image) || (isVideo && Boolean(candidate.video || candidate.audio || candidate.videoContentUrl || candidate.assetId))),
   );
   const assetCategoryValue = (candidate: Node) => {
     const value = candidate.assetCategory || candidate.category;
@@ -487,18 +524,20 @@ export default function CreatorPanel(p: CreatorPanelProps) {
   const inputChanged =
     p.inputChanged || Boolean(p.node.inputSignature && draft !== p.node.text);
   const canCreateNewTask = canCreateNewCanvasTask(p.node, inputChanged);
-  const submitDisabled = p.active || needsRecovery || !canCreateNewTask || p.needsLogin || p.connecting || Boolean(blocked) || referenceBusy || lyricsGenerating;
-  const modeLocked = pending || p.active || needsRecovery || recordingSaving || referenceBusy || lyricsGenerating || retiredTTS && Boolean(p.node.taskId || p.node.ttsSubmission || p.node.audioTaskType);
+  const submitDisabled = p.active || needsRecovery && !canRetryOriginalSubmission || !canCreateNewTask || p.needsLogin || p.connecting || Boolean(blocked) && !canRetryOriginalSubmission || referenceBusy || lyricsGenerating;
   const musicObservedStatus = String(p.node.taskDiagnostic?.status || p.node.status || "").trim().toLowerCase();
   const musicCancellationPending = ["cancel_requested", "cancel_pending", "canceling"].includes(musicObservedStatus);
-  const canCancelAudio = isMusic && !isRecording && Boolean(p.node.taskId) && ["queued", "running"].includes(taskState) && !["completed", "succeeded", "success", "failed", "cancelled", "canceled"].includes(musicObservedStatus);
+  const canCancelAudio = isMusic && !isRecording && Boolean(p.node.taskId) && taskState === "queued" && !["completed", "succeeded", "success", "failed", "cancelled", "canceled"].includes(musicObservedStatus);
   const modelPlaceholder = p.connecting ? "正在加载模型…" : p.needsLogin ? "请先登录"
-    : p.connectionError ? `${isVideo ? "视频" : isVoiceDesign ? "音色" : isMusic ? "音乐" : "图片"}模型加载失败`
-      : !typeModels.length ? `暂无${isVideo ? "视频" : isVoiceDesign ? "音色" : isMusic ? "音乐" : "图片"}模型` : `选择${isVideo ? "视频" : isVoiceDesign ? "音色" : isMusic ? "音乐" : "图片"}模型`;
-  const changeVideoSetting = (patch: VideoSettings) =>
+    : !typeModels.length ? `暂无${isVideo ? "视频" : isVoiceDesign ? "音色" : isMusic ? "音乐" : "图片"}模型` : `选择${isVideo ? "视频" : isVoiceDesign ? "音色" : isMusic ? "音乐" : "图片"}模型`;
+  const changeVideoSetting = (patch: VideoSettings) => {
+    if (controlsLocked) return;
     p.onChange({ videoSettings: { ...(p.node.videoSettings || {}), ...patch } });
-  const changeMusicSetting = (patch: NonNullable<Node["musicSettings"]>) =>
+  };
+  const changeMusicSetting = (patch: NonNullable<Node["musicSettings"]>) => {
+    if (controlsLocked) return;
     p.onChange({ musicSettings: { ...(p.node.musicSettings || {}), ...patch } });
+  };
   const videoSettingsSummary = resolvedVideo
     ? [
         resolvedVideo.aspect_ratio,
@@ -513,16 +552,18 @@ export default function CreatorPanel(p: CreatorPanelProps) {
       ].filter(Boolean).join(" · ") || "音乐参数"
     : "音乐参数";
   const selectModel = (id: string) => {
+    if (controlsLocked) return;
     p.onChange({ modelId: id, modelSelection: "user" });
     setModelOpen(false);
     modelTrigger.current?.focus({ preventScroll: true });
   };
-  const modelLabel = chosen?.name || chosen?.id || modelPlaceholder;
+  const chosenRecovering = !isMusic && isMediaModelRecovering(chosen as MediaModel | undefined);
+  const modelLabel = `${chosen?.name || chosen?.id || modelPlaceholder}${chosenRecovering ? " · 恢复试流中" : ""}`;
   const modelReason = (model: MediaModel & MusicModel) => isMusic
     ? isVoiceDesign ? voiceDesignModelUnavailableReason(model as VoiceDesignModel) : musicModelUnavailableReason(model, musicHasReference ? "reference_audio" : "text")
     : modelUnavailableReason(model, kind, referenceCount);
   const changeAudioMode = (mode: "music" | "voice_design" | "recording") => {
-    if (modeLocked || mode === audioMode) return;
+    if (controlsLocked || mode === audioMode) return;
     setPickingReference(false);
     setSettingsOpen(false);
     setModelOpen(false);
@@ -532,6 +573,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
     p.onChange({ audioMode: mode });
     if (mode === "recording") {
       setRecordingSaved(false);
+      setRecordingRedo(false);
       setRecorderCycle(value => value + 1);
     }
   };
@@ -543,15 +585,31 @@ export default function CreatorPanel(p: CreatorPanelProps) {
     setRecordingSaving(true);
     try {
       await p.onSaveRecording(file);
-      if (audioScopeIsCurrent(scope)) setRecordingSaved(true);
+      if (audioScopeIsCurrent(scope)) {
+        setRecordingRedo(false);
+        setRecordingSaved(true);
+        setRecordingSaveFailed(false);
+        setRecordingHasUncommittedCapture(false);
+      }
     } catch (error) {
-      if (audioScopeIsCurrent(scope)) p.onNotice(error instanceof Error ? error.message : "录音保存失败，请重试。");
+      if (audioScopeIsCurrent(scope)) {
+        setRecordingSaveFailed(true);
+        p.onNotice(error instanceof Error ? error.message : "录音保存失败，请重试。");
+      }
     } finally {
       if (audioScopeIsCurrent(scope)) {
         saveInFlight.current = false;
         setRecordingSaving(false);
       }
     }
+  };
+  const recordingHasSavedNode = isRecording && p.node.status === "completed" && Boolean(p.node.audio || p.node.localAudio || p.node.assetId);
+  const recordingIsSaved = recordingSaved || (recordingHasSavedNode && !recordingRedo);
+  const startAnotherRecording = () => {
+    setRecordingSaved(false);
+    setRecordingRedo(true);
+    setRecordingSaveFailed(false);
+    setRecorderCycle(value => value + 1);
   };
   const uploadMusicReference = async (file?: File) => {
     if (!file || !p.onUploadMusicReference || referenceInFlight.current) return;
@@ -610,22 +668,6 @@ export default function CreatorPanel(p: CreatorPanelProps) {
       }
     }
   };
-  const copyVoiceId = async () => {
-    if (!p.node.voiceId) return;
-    const scope = currentAudioScope.current;
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error("当前环境无法访问剪贴板，请手动复制音色 ID。");
-      await navigator.clipboard.writeText(p.node.voiceId);
-      if (!audioScopeIsCurrent(scope)) return;
-      setVoiceIdCopied(true);
-      if (voiceCopyTimer.current !== null) window.clearTimeout(voiceCopyTimer.current);
-      voiceCopyTimer.current = window.setTimeout(() => {
-        if (audioScopeIsCurrent(scope)) setVoiceIdCopied(false);
-      }, 1600);
-    } catch {
-      if (audioScopeIsCurrent(scope)) p.onNotice("复制失败，请手动选择并复制音色 ID。");
-    }
-  };
   return (
     <aside
       className={`creator-panel context-creator${isMusic ? " is-audio-composer" : ""}${expanded ? " is-expanded" : ""}`}
@@ -667,7 +709,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
               aria-selected={audioMode === mode}
               tabIndex={audioMode === mode || retiredTTS && mode === "music" ? 0 : -1}
               className={audioMode === mode ? "is-active" : ""}
-              disabled={modeLocked}
+              disabled={controlsLocked}
               onClick={() => changeAudioMode(mode)}
               onKeyDown={event => {
                 if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -697,6 +739,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
               aria-label="添加输入引用"
               aria-expanded={pickingReference}
               aria-controls={pickerId}
+              disabled={controlsLocked}
               onMouseEnter={openReferencePicker}
               onMouseLeave={scheduleReferencePickerDismiss}
               onFocus={openReferencePicker}
@@ -741,7 +784,6 @@ export default function CreatorPanel(p: CreatorPanelProps) {
             </button>
           </div>
         </div>
-        {p.validationError && !retiredTTS && <div className="context-feedback is-error" role="alert"><p>{p.validationError}</p></div>}
         {retiredTTS ? (
           <div className="context-feedback" role="status">
             <p>画布暂不支持文本转语音。</p>
@@ -751,9 +793,17 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           </div>
         ) : isRecording ? (
           <div className="context-recording-content">
-            <AudioRecorder key={`${p.node.id}:${recorderCycle}`} onSave={file => void saveRecording(file)} disabled={recordingSaving || recordingSaved || !p.onSaveRecording} />
+            {!recordingIsSaved && <AudioRecorder
+              key={`${p.node.id}:${recorderCycle}`}
+              onSave={file => void saveRecording(file)}
+              onReset={() => setRecordingSaveFailed(false)}
+              onCaptureStateChange={setRecordingHasUncommittedCapture}
+              onNotice={message => p.onNotice(message)}
+              disabled={recordingSaving || !p.onSaveRecording}
+            />}
             {recordingSaving && <p className="context-audio-status" role="status">正在保存录音…</p>}
-            {recordingSaved && <div className="context-recording-saved"><p className="context-audio-status is-success" role="status">录音已保存到画布，可试听或下载。</p><button type="button" onClick={() => { setRecordingSaved(false); setRecorderCycle(value => value + 1); }}>再录一段</button></div>}
+            {recordingSaveFailed && <div className="context-recording-error" role="status"><p>录音仍保留，可重新确认使用。</p></div>}
+            {recordingIsSaved && <div className="context-recording-saved" role="status"><div className="context-recording-saved-copy"><Check size={14} aria-hidden="true" /><p>录音已保存到画布</p><small>可在节点中试听或下载；重新录制并确认后会替换此音频</small></div><button type="button" aria-label="重新录制并替换当前节点音频" title="确认新录音后会替换当前节点音频" onClick={startAnotherRecording}><RotateCcw size={13} aria-hidden="true" />重新录制</button></div>}
           </div>
         ) : <>
         {pickingReference && (
@@ -768,16 +818,16 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           >
             {referencePickerMode === "menu" ? (
               <div className="reference-action-menu" role="menu" aria-label="添加输入引用方式">
-                <button role="menuitem" onClick={() => { setPickingReference(false); p.onUploadReference(); focusPrompt(); }}><Upload size={15} /><span>从本地上传</span></button>
-                <button role="menuitem" onClick={() => { if (p.onOpenAssetLibrary) { setPickingReference(false); p.onOpenAssetLibrary(); } else { setAssetLibraryTab("assets"); setReferencePickerMode("assets"); } }}><ImagePlus size={15} /><span>从资产库选择</span></button>
-                <button role="menuitem" onClick={() => { setPickingReference(false); p.onPickCanvasReference(); }}><Link2 size={15} /><span>从画布选择</span></button>
-                <button role="menuitem" onClick={() => { setPickingReference(false); p.onPickCanvasTextReference(); }}><Type size={15} /><span>从画布引用文本</span></button>
-                <button role="menuitem" onClick={() => { setPickingReference(false); p.onDrawReference(); }}><Brush size={15} /><span>手绘参考图</span></button>
+                <button role="menuitem" disabled={controlsLocked} onClick={() => { setPickingReference(false); p.onUploadReference(); focusPrompt(); }}><Upload size={15} /><span>从本地上传</span></button>
+                <button role="menuitem" disabled={controlsLocked} onClick={() => { if (p.onOpenAssetLibrary) { setPickingReference(false); p.onOpenAssetLibrary(); } else { setAssetLibraryTab("assets"); setReferencePickerMode("assets"); } }}><ImagePlus size={15} /><span>从资产库选择</span></button>
+                <button role="menuitem" disabled={controlsLocked} onClick={() => { setPickingReference(false); p.onPickCanvasReference(); }}><Link2 size={15} /><span>从画布选择</span></button>
+                <button role="menuitem" disabled={controlsLocked} onClick={() => { setPickingReference(false); p.onPickCanvasTextReference(); }}><Type size={15} /><span>从画布引用文本</span></button>
+                <button role="menuitem" disabled={controlsLocked} onClick={() => { setPickingReference(false); p.onDrawReference(); }}><Brush size={15} /><span>手绘参考图</span></button>
               </div>
             ) : referencePickerMode === "assets" ? (
               <div className="asset-picker-panel">
                 <div className="asset-picker-head">
-                  <button className="context-picker-back" onClick={() => setReferencePickerMode("menu")}><ChevronDown size={13} />添加参考图片</button>
+                  <button className="context-picker-back" disabled={controlsLocked} onClick={() => setReferencePickerMode("menu")}><ChevronDown size={13} />添加参考图片</button>
                   <div className="asset-picker-tabs-main" role="tablist" aria-label="资产类型">
                     <button className={assetLibraryTab === "assets" ? "is-active" : ""} role="tab" aria-selected={assetLibraryTab === "assets"} onClick={() => setAssetLibraryTab("assets")}>资产</button>
                     <button className={assetLibraryTab === "actors" ? "is-active" : ""} role="tab" aria-selected={assetLibraryTab === "actors"} onClick={() => setAssetLibraryTab("actors")}>演员库</button>
@@ -801,12 +851,12 @@ export default function CreatorPanel(p: CreatorPanelProps) {
                   <button className="asset-picker-favorite" aria-label="收藏资产" title="收藏资产" disabled>☆</button>
                 </div>}
                 <div className="asset-picker-grid" role="list" aria-label="资产列表">
-                  {assetLibraryTab === "assets" && <button className="asset-create-card" onClick={() => { setPickingReference(false); p.onUploadReference(); }}>
+                  {assetLibraryTab === "assets" && <button className="asset-create-card" disabled={controlsLocked} onClick={() => { setPickingReference(false); p.onUploadReference(); }}>
                     <Plus size={20} />
                     <span>创建</span>
                   </button>}
                   {assetLibraryTab === "assets" && assetVisibleCandidates.map((candidate) => {
-                    const candidateImage = candidate.image || candidate.localImage;
+                    const candidateImage = candidate.image;
                     const candidatePreview = imagePreviewURL(candidate.image, candidate.imageThumbnail);
     const candidateMedia = candidateImage || candidate.video || candidate.audio || candidate.videoContentUrl || candidate.assetId;
                     const selected = connectedIds.has(candidate.id) || Boolean(candidateMedia && connectedImages.has(candidateMedia));
@@ -815,7 +865,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
                       <div key={candidate.id} className={`asset-picker-card${selected ? " is-selected" : ""}`} role="listitem">
                         <button
                           className="asset-picker-card-main"
-                          disabled={selected || !usable}
+                          disabled={controlsLocked || selected || !usable}
                           aria-label={`${selected ? "已添加参考" : usable ? "添加参考" : "素材待恢复"} ${candidate.title}`}
                           onClick={() => {
                             if (selected || !usable) return;
@@ -831,7 +881,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
                         </button>
                         <button
                           className="asset-picker-card-action"
-                          disabled={selected || !usable}
+                          disabled={controlsLocked || selected || !usable}
                           aria-label={`${selected ? "已添加" : usable ? "添加" : "素材待恢复"} ${candidate.title}`}
                           onClick={() => {
                             if (selected || !usable) return;
@@ -860,6 +910,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
               aria-label={isVideo ? "添加视频参考图片" : "添加参考图片"}
               aria-expanded={pickingReference}
               aria-controls={pickerId}
+              disabled={controlsLocked}
               onMouseEnter={openReferencePicker}
               onMouseLeave={scheduleReferencePickerDismiss}
               onFocus={openReferencePicker}
@@ -873,21 +924,22 @@ export default function CreatorPanel(p: CreatorPanelProps) {
                 setPickingReference(true);
               }}
             ><Plus size={19} /></button>
-            {visibleReferences.map((reference) => {
+            {visibleReferences.map((reference, index) => {
               const direct = Boolean(reference.embedded) || p.sources.some(
                 (source) => source.id === reference.nodeId,
               );
+              const referenceLabel = promptReferenceDisplayLabel(reference.title, reference.nodeId, index + 1, reference.assetId);
               const referenceImage = imagePreviewURL(reference.image, reference.imageThumbnail);
               return (
                 <div key={reference.nodeId} className="context-reference">
                   <button
                     className="context-reference-preview"
-                    title={`${reference.title}${direct ? "" : " · 来自上游节点，可在输入来源中管理"}`}
-                    aria-label={`预览参考 ${reference.title}`}
+                    title={`${referenceLabel}${direct ? "" : " · 来自上游节点，可在输入来源中管理"}`}
+                    aria-label={`预览参考 ${referenceLabel}`}
                     onClick={() => !reference.embedded && p.onLocate(reference.nodeId)}
                   >
                     {referenceImage ? (
-                      <img src={referenceImage} alt={reference.title} draggable={false} />
+                      <img src={referenceImage} alt={referenceLabel} draggable={false} />
                     ) : reference.image ? (
                       <span className="context-missing-reference">正在获取缩略图</span>
                     ) : reference.video ? (
@@ -898,7 +950,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
                       <span className="context-missing-reference">音频</span>
                     ) : (
                       <span className="context-missing-reference">
-                        {reference.localImage ? "图片待恢复" : "图片缺失"}
+                        "图片待恢复"
                       </span>
                     )}
                     {!direct && (
@@ -911,8 +963,9 @@ export default function CreatorPanel(p: CreatorPanelProps) {
                     <button
                       type="button"
                       className="context-reference-remove"
-                      aria-label={`移除参考 ${reference.title}`}
-                      title={`移除参考 ${reference.title}`}
+                      aria-label={`移除参考 ${referenceLabel}`}
+                      title={`移除参考 ${referenceLabel}`}
+                      disabled={controlsLocked}
                       onClick={() => reference.embedded
                         ? p.onChange({ embeddedReferences: p.node.embeddedReferences?.filter((item) => item.id !== reference.nodeId) })
                         : p.onDisconnect(reference.nodeId)}
@@ -944,6 +997,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
                     className="context-text-reference-remove"
                     aria-label={`移除文本来源 ${reference.title || "文本节点"}`}
                     title={`移除文本来源 ${reference.title || "文本节点"}`}
+                    disabled={controlsLocked}
                     onClick={() => p.onDisconnect(reference.nodeId)}
                   ><X size={11} /></button>
                 )}
@@ -964,13 +1018,12 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           onLoadMoreAssets={p.onLoadMoreMentionAssets}
           onRetryAssets={p.onRetryMentionAssets}
           onOpenAssetLibrary={p.onOpenAssetLibrary}
-          embeddedCandidates={visibleReferences.filter(reference => Boolean(reference.image || reference.imageThumbnail || reference.localImage)).map((reference) => ({
+          embeddedCandidates={visibleReferences.filter(reference => Boolean(reference.image || reference.imageThumbnail)).map((reference) => ({
             id: reference.nodeId,
             title: reference.title,
             type: "image" as const,
             image: reference.image,
             imageThumbnail: reference.imageThumbnail,
-            localImage: reference.localImage,
             assetId: reference.assetId,
             assetCategory: undefined,
             category: undefined,
@@ -980,6 +1033,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           label={isVideo ? "视频创作描述" : isVoiceDesign ? "音色描述" : isMusic ? "音乐创作描述" : "创作画面描述"}
           describedBy={promptHintId}
           maxLength={20000}
+          readOnly={promptReadOnly}
           placeholder={
             isVoiceDesign
               ? "描述音色的音域、音质、年龄感、情绪和说话方式…"
@@ -995,6 +1049,11 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           }
           onChange={updatePromptSegments}
           onSelectCandidate={(id) => {
+            // The editor remains writable while a task is running, but adding
+            // or resolving a mention changes the frozen media inputs. Keep
+            // reference selection behind the same control lock as the other
+            // model and reference controls.
+            if (controlsLocked) return false;
             if (p.onSelectMentionCandidate) return p.onSelectMentionCandidate(id);
             // References that are already attached to the creator can be
             // ordered inline without creating a duplicate edge. New canvas
@@ -1019,18 +1078,13 @@ export default function CreatorPanel(p: CreatorPanelProps) {
             </span>
           )}
         </div>
-        {isVoiceDesign && p.node.voiceId && <div className="context-voice-result" role="status">
-          <span><Check size={14} aria-hidden="true" />音色已生成</span>
-          <code title={p.node.voiceId}>{p.node.voiceId}</code>
-          <button type="button" onClick={() => void copyVoiceId()} aria-label="复制音色 ID"><Copy size={13} />{voiceIdCopied ? "已复制" : "复制 ID"}</button>
-        </div>}
         {isMusic && !isVoiceDesign && <input
           ref={musicReferenceInput}
           type="file"
           accept="audio/*"
           hidden
           aria-label="选择参考音频"
-          disabled={referenceBusy || modeLocked}
+          disabled={referenceBusy || controlsLocked}
           onChange={event => {
             const file = event.currentTarget.files?.[0];
             event.currentTarget.value = "";
@@ -1045,7 +1099,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
         >
           <label className="context-voice-preview-field">
             <span><strong>试听文本</strong><small>生成后用来试听音色，最多 500 字</small></span>
-            <textarea data-popover-autofocus aria-label="音色试听文本" rows={4} maxLength={1000} value={voicePreviewText} onChange={event => p.onChange({ voicePreviewText: [...event.target.value].slice(0, 500).join("") })} placeholder="输入用于试听音色的文字…" />
+            <textarea data-popover-autofocus aria-label="音色试听文本" rows={4} maxLength={1000} value={voicePreviewText} disabled={controlsLocked} onChange={event => { if (!controlsLocked) p.onChange({ voicePreviewText: [...event.target.value].slice(0, 500).join("") }); }} placeholder="输入用于试听音色的文字…" />
             <small className={[...voicePreviewText].length > 500 ? "is-error" : ""}>{[...voicePreviewText].length}/500</small>
           </label>
         </ParameterPopover>}
@@ -1058,23 +1112,23 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           <section className="context-music-reference" aria-label="音乐参考音频">
             <div className="context-video-settings-head"><Music2 size={13} aria-hidden="true" /><span>参考音频</span><span className="context-video-hint">仅兼容模型会使用</span><button className="context-settings-close" aria-label="关闭参考音频" onClick={() => { setMusicReferenceOpen(false); musicReferenceTrigger.current?.focus({ preventScroll: true }); }}><X size={14} /></button></div>
             {!p.node.musicReference ? <div className="context-music-reference-empty">
-            <button type="button" className="context-music-reference-add" data-popover-autofocus aria-label="上传音乐参考音频" disabled={referenceBusy || modeLocked || !p.onUploadMusicReference} onClick={() => musicReferenceInput.current?.click()}>
+            <button type="button" className="context-music-reference-add" data-popover-autofocus aria-label="上传音乐参考音频" disabled={referenceBusy || controlsLocked || !p.onUploadMusicReference} onClick={() => musicReferenceInput.current?.click()}>
                 {referenceBusy ? <LoaderCircle size={16} className="spin" /> : <Plus size={18} />}
               </button>
               <div className="context-music-reference-copy"><strong>{referenceBusy ? "正在读取参考音频…" : "添加参考音频"}</strong><span>选择画布、资产库或本地音频（6 秒–6 分钟，≤50 MB）</span></div>
               <div className="context-music-reference-actions">
-                {p.onOpenAssetLibrary && <button type="button" className="context-music-reference-action" aria-label="从资产库选择参考音频" disabled={referenceBusy || modeLocked} onClick={() => { setMusicReferenceOpen(false); p.onOpenAssetLibrary?.(); }}><Library size={13} />资产库</button>}
-                {p.onUploadMusicReference && <button type="button" className="context-music-reference-action" disabled={referenceBusy || modeLocked} onClick={() => musicReferenceInput.current?.click()}><Upload size={13} />上传</button>}
+                {p.onOpenAssetLibrary && <button type="button" className="context-music-reference-action" aria-label="从资产库选择参考音频" disabled={referenceBusy || controlsLocked} onClick={() => { setMusicReferenceOpen(false); p.onOpenAssetLibrary?.(); }}><Library size={13} />资产库</button>}
+                {p.onUploadMusicReference && <button type="button" className="context-music-reference-action" disabled={referenceBusy || controlsLocked} onClick={() => musicReferenceInput.current?.click()}><Upload size={13} />上传</button>}
               </div>
             </div> : <div className="context-music-reference-chip">
               <Music2 size={14} aria-hidden="true" />
               <span title={p.node.musicReference.title}>{p.node.musicReference.title}</span>
               <small>{Math.round(p.node.musicReference.duration)} 秒 · {(p.node.musicReference.size / (1024 * 1024)).toFixed(1)} MB</small>
-              <button type="button" className="context-music-reference-action" disabled={modeLocked} onClick={() => p.onChange({ musicReference: undefined })}>更换</button>
-              <button type="button" aria-label="移除参考音频" title="移除参考音频" disabled={modeLocked} onClick={() => p.onChange({ musicReference: undefined })}><X size={13} /></button>
+              <button type="button" className="context-music-reference-action" disabled={controlsLocked} onClick={() => p.onChange({ musicReference: undefined })}>更换</button>
+              <button type="button" aria-label="移除参考音频" title="移除参考音频" disabled={controlsLocked} onClick={() => p.onChange({ musicReference: undefined })}><X size={13} /></button>
             </div>}
             {!p.node.musicReference && audioReferenceCandidates.length > 0 && (
-              <label className="context-music-reference-select"><span>从画布选择</span><select data-popover-autofocus aria-label="选择画布中的参考音频" disabled={referenceBusy || modeLocked || !p.onSelectMusicReference} value="" onChange={event => void selectMusicReference(event.target.value)}><option value="">选择音频节点…</option>{audioReferenceCandidates.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.title || "音频"}</option>)}</select><ChevronDown size={13} aria-hidden="true" /></label>
+              <label className="context-music-reference-select"><span>从画布选择</span><select data-popover-autofocus aria-label="选择画布中的参考音频" disabled={referenceBusy || controlsLocked || !p.onSelectMusicReference} value="" onChange={event => void selectMusicReference(event.target.value)}><option value="">选择音频节点…</option>{audioReferenceCandidates.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.title || "音频"}</option>)}</select><ChevronDown size={13} aria-hidden="true" /></label>
             )}
           </section>
         </ParameterPopover>}
@@ -1085,8 +1139,8 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           onClose={() => setLyricsExpanded(false)}
         >
           <section className="context-music-lyrics" aria-label="歌曲歌词">
-            <div className="context-music-lyrics-head"><label htmlFor={`${settingsId}-lyrics`}>歌词</label><div className="context-music-lyrics-actions"><button type="button" disabled={!p.onGenerateLyrics || lyricsGenerating || !fullPrompt.trim() || modeLocked} onClick={() => void generateLyrics()}>{lyricsGenerating ? <LoaderCircle size={12} className="spin" /> : <Sparkles size={12} />}{lyricsGenerating ? "正在生成歌词…" : "AI 生成歌词"}</button><button type="button" aria-label="关闭歌词" onClick={() => { setLyricsExpanded(false); musicLyricsTrigger.current?.focus({ preventScroll: true }); }}><X size={13} /></button></div></div>
-            <textarea data-popover-autofocus id={`${settingsId}-lyrics`} aria-label="歌词内容" value={p.node.musicLyrics || ""} onChange={event => { setLyricsReady(false); p.onChange({ musicLyrics: event.target.value }); }} placeholder="歌词内容，可手动编辑；也可使用 AI 生成歌词。支持 [Verse]、[Chorus] 等标记分段" rows={4} disabled={modeLocked} />
+            <div className="context-music-lyrics-head"><label htmlFor={`${settingsId}-lyrics`}>歌词</label><div className="context-music-lyrics-actions"><button type="button" disabled={!p.onGenerateLyrics || lyricsGenerating || !fullPrompt.trim() || controlsLocked} onClick={() => void generateLyrics()}>{lyricsGenerating ? <LoaderCircle size={12} className="spin" /> : <Sparkles size={12} />}{lyricsGenerating ? "正在生成歌词…" : "AI 生成歌词"}</button><button type="button" aria-label="关闭歌词" onClick={() => { setLyricsExpanded(false); musicLyricsTrigger.current?.focus({ preventScroll: true }); }}><X size={13} /></button></div></div>
+            <textarea data-popover-autofocus id={`${settingsId}-lyrics`} aria-label="歌词内容" value={p.node.musicLyrics || ""} onChange={event => { setLyricsReady(false); p.onChange({ musicLyrics: event.target.value }); }} placeholder="歌词内容，可手动编辑；也可使用 AI 生成歌词。支持 [Verse]、[Chorus] 等标记分段" rows={4} disabled={controlsLocked} />
             {lyricsReady && <p className="context-audio-status is-success" role="status">歌词已生成，可继续编辑。</p>}
           </section>
         </ParameterPopover>}
@@ -1094,8 +1148,8 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           <ParameterPopover anchor={settingsButton} id={settingsId} label="音乐参数" onClose={() => setSettingsOpen(false)}>
           <div className="context-video-settings">
             <div className="context-video-settings-head"><Music2 size={13} /><span>音乐参数</span><span className="context-video-hint">修改后下次生成生效</span><button className="context-settings-close" aria-label="关闭音乐参数" onClick={() => setSettingsOpen(false)}><X size={14} /></button></div>
-            {musicConfig.formats.length > 0 && <ParameterChoices label="格式" values={musicConfig.formats} value={resolvedMusic?.output_format} onChange={output_format => changeMusicSetting({ output_format })} render={value => value.toUpperCase()} />}
-            {musicConfig.durations.length > 0 && <label className="context-parameter-section context-parameter-count context-video-duration"><span className="context-choice-label">时长</span><span className="context-parameter-select"><select aria-label="音乐时长" value={resolvedMusic?.duration === undefined ? "" : String(resolvedMusic.duration)} onChange={event => changeMusicSetting({ duration: Number(event.target.value) })}>{musicConfig.durations.map(value => <option key={value} value={value}>{value} 秒</option>)}</select><ChevronDown size={13} aria-hidden="true" /></span></label>}
+            {musicConfig.formats.length > 0 && <ParameterChoices label="格式" values={musicConfig.formats} value={resolvedMusic?.output_format} onChange={output_format => changeMusicSetting({ output_format })} render={value => value.toUpperCase()} disabled={controlsLocked} />}
+            {musicConfig.durations.length > 0 && <label className="context-parameter-section context-parameter-count context-video-duration"><span className="context-choice-label">时长</span><span className="context-parameter-select"><select aria-label="音乐时长" value={resolvedMusic?.duration === undefined ? "" : String(resolvedMusic.duration)} disabled={controlsLocked} onChange={event => changeMusicSetting({ duration: Number(event.target.value) })}>{musicConfig.durations.map(value => <option key={value} value={value}>{value} 秒</option>)}</select><ChevronDown size={13} aria-hidden="true" /></span></label>}
           </div>
           </ParameterPopover>
         )}
@@ -1104,15 +1158,15 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           <div className="context-video-settings">
             <div className="context-video-settings-head"><Film size={13} /><span>视频参数</span><span className="context-video-hint">修改后下次生成生效</span><button className="context-settings-close" aria-label="关闭视频参数" onClick={() => setSettingsOpen(false)}><X size={14} /></button></div>
             {videoConfig.resolutions.length > 0 && <ParameterChoices label="分辨率" values={videoConfig.resolutions} value={resolvedVideo?.resolution}
-              onChange={resolution => changeVideoSetting({ resolution, size: undefined })} render={value => value.toUpperCase()} />}
+              onChange={resolution => changeVideoSetting({ resolution, size: undefined })} render={value => value.toUpperCase()} disabled={controlsLocked} />}
             {videoConfig.sizes.length > 0 && videoConfig.resolutions.length === 0 && <ParameterChoices label="尺寸" values={videoConfig.sizes} value={resolvedVideo?.size}
-              onChange={size => changeVideoSetting({ size, resolution: undefined })} />}
+              onChange={size => changeVideoSetting({ size, resolution: undefined })} disabled={controlsLocked} />}
             {videoConfig.aspectRatios.length > 0 && <ParameterChoices label="比例" values={videoConfig.aspectRatios} value={resolvedVideo?.aspect_ratio}
-              onChange={aspect_ratio => changeVideoSetting({ aspect_ratio })} ratios />}
+              onChange={aspect_ratio => changeVideoSetting({ aspect_ratio })} ratios disabled={controlsLocked} />}
             {videoConfig.durations.length > 0 && <label className="context-parameter-section context-parameter-count context-video-duration">
               <span className="context-choice-label">时长</span>
               <span className="context-parameter-select">
-                <select aria-label="视频时长" value={resolvedVideo?.duration === undefined ? "" : String(resolvedVideo.duration)} onChange={event => changeVideoSetting({ duration: Number(event.target.value) })}>
+                <select aria-label="视频时长" value={resolvedVideo?.duration === undefined ? "" : String(resolvedVideo.duration)} disabled={controlsLocked} onChange={event => changeVideoSetting({ duration: Number(event.target.value) })}>
                   {videoConfig.durations.map(value => <option key={value} value={value}>{value} 秒</option>)}
                 </select>
                 <ChevronDown size={13} aria-hidden="true" />
@@ -1125,17 +1179,17 @@ export default function CreatorPanel(p: CreatorPanelProps) {
           <ParameterPopover anchor={settingsButton} id={settingsId} label="图片参数" onClose={() => setSettingsOpen(false)}>
             <ParameterChoices label="画质" values={imageConfig.qualities} value={imageSettings.quality}
               onChange={quality => changeImageSetting({ quality })}
-              render={value => imageConfig.qualityLabels[value] || imageQualityLabel(value)} />
+              render={value => imageConfig.qualityLabels[value] || imageQualityLabel(value)} disabled={controlsLocked} />
             <ParameterChoices label="清晰度" values={imageConfig.resolutions} value={imageSettings.resolution}
-              onChange={resolution => changeImageSetting({ resolution })} render={value => value.toUpperCase()} />
+              onChange={resolution => changeImageSetting({ resolution })} render={value => value.toUpperCase()} disabled={controlsLocked} />
             <ParameterChoices label="比例" values={imageRatios} value={imageSettings.aspectRatio} ratios
-              onChange={aspectRatio => changeImageSetting({ aspectRatio })} />
+              onChange={aspectRatio => changeImageSetting({ aspectRatio })} disabled={controlsLocked} />
             {(!imageSettings.resolution || !imageRatios.length) && <ParameterChoices label="图片尺寸"
-              values={imageSizes} value={imageSettings.size} onChange={size => changeImageSetting({ size })} />}
+              values={imageSizes} value={imageSettings.size} onChange={size => changeImageSetting({ size })} disabled={controlsLocked} />}
             {imageConfig.maxCount > 1 && <label className="context-parameter-section context-parameter-count">
               <span className="context-choice-label">生成数量</span>
               <span className="context-parameter-select">
-                <select value={imageSettings.count || 1} onChange={event => changeImageSetting({ count: Number(event.target.value) })}>
+                <select value={imageSettings.count || 1} disabled={controlsLocked} onChange={event => changeImageSetting({ count: Number(event.target.value) })}>
                   {imageConfig.countOptions.map(count => <option key={count} value={count}>{count} 张</option>)}
                 </select>
                 <ChevronDown size={13} aria-hidden="true" />
@@ -1158,15 +1212,16 @@ export default function CreatorPanel(p: CreatorPanelProps) {
               className="context-model-native"
               aria-label={`创作${isVideo ? "视频" : isVoiceDesign ? "音色" : isMusic ? "音乐" : "图片"}模型`}
               value={chosen?.id || ""}
-              disabled={p.connecting || typeModels.length === 0}
+              disabled={controlsLocked || p.connecting || typeModels.length === 0}
               tabIndex={-1}
               onChange={(event) => selectModel(event.target.value)}
             >
               <option value="" disabled>{modelPlaceholder}</option>
               {typeModels.map((model) => {
                 const reason = modelReason(model);
+                const recovering = !isMusic && !reason && isMediaModelRecovering(model);
                 return <option key={model.id} value={model.id} disabled={Boolean(reason)}>
-                  {model.name || model.id}{reason ? ` · ${reason}` : ""}
+                  {model.name || model.id}{reason ? ` · ${reason}` : recovering ? " · 恢复试流中" : ""}
                 </option>;
               })}
             </select>
@@ -1177,7 +1232,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
               aria-label={`${modelLabel}，打开${isVideo ? "视频" : isVoiceDesign ? "音色" : isMusic ? "音乐" : "图片"}模型选择`}
               aria-haspopup="listbox"
               aria-expanded={modelOpen}
-              disabled={p.connecting || typeModels.length === 0}
+              disabled={controlsLocked || p.connecting || typeModels.length === 0}
               onClick={() => {
                 setSettingsOpen(false);
                 setMusicReferenceOpen(false);
@@ -1205,13 +1260,14 @@ export default function CreatorPanel(p: CreatorPanelProps) {
                 <div className="context-model-menu-title">选择{isVideo ? "视频" : isVoiceDesign ? "音色" : isMusic ? "音乐" : "图片"}模型</div>
                 {typeModels.map((model) => {
                   const reason = modelReason(model);
+                  const recovering = !isMusic && !reason && isMediaModelRecovering(model);
                   const id = model.id || "";
                   return <button
                     key={id}
                     type="button"
                     role="option"
                     aria-selected={chosen?.id === id}
-                    disabled={Boolean(reason) || !id}
+                    disabled={controlsLocked || Boolean(reason) || !id}
                     className={`context-model-option${chosen?.id === id ? " is-selected" : ""}`}
                     onClick={() => !reason && id && selectModel(id)}
                     onKeyDown={(event) => {
@@ -1229,7 +1285,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
                     }}
                   >
                     <span className="context-model-option-name">{model.name || id}</span>
-                    {reason ? <span className="context-model-option-reason">{reason}</span> : chosen?.id === id ? <Check size={13} aria-hidden="true" /> : null}
+                    {reason || recovering ? <span className="context-model-option-reason">{reason || "恢复试流中"}</span> : chosen?.id === id ? <Check size={13} aria-hidden="true" /> : null}
                   </button>;
                 })}
               </div>
@@ -1243,7 +1299,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
             aria-expanded={voicePreviewOpen}
             aria-controls={voicePreviewOpen ? voicePreviewId : undefined}
             title={voicePreviewText.trim() ? `试听文本：${voicePreviewText}` : "设置用于试听音色的文本"}
-            disabled={modeLocked}
+            disabled={controlsLocked}
             onClick={() => {
               setPickingReference(false);
               setModelOpen(false);
@@ -1257,7 +1313,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
             {musicConfig.modes.map(mode => {
               const instrumental = /instrumental|pure|纯音乐/i.test(mode);
               const selected = resolvedMusic?.audio_mode === mode;
-              return <button key={mode} type="button" className={selected ? "is-active" : ""} aria-pressed={selected} disabled={modeLocked} onClick={() => changeMusicSetting({ audio_mode: mode })}>{instrumental ? "纯音乐" : /song|auto|adaptive|lyric|text/i.test(mode) ? "自适应" : mode}</button>;
+              return <button key={mode} type="button" className={selected ? "is-active" : ""} aria-pressed={selected} disabled={controlsLocked} onClick={() => changeMusicSetting({ audio_mode: mode })}>{instrumental ? "纯音乐" : /song|auto|adaptive|lyric|text/i.test(mode) ? "自适应" : mode}</button>;
             })}
           </div> : null}
           {isMusic && !isVoiceDesign && <button
@@ -1268,7 +1324,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
             aria-expanded={musicReferenceOpen}
             aria-controls={musicReferenceOpen ? musicReferenceId : undefined}
             title={p.node.musicReference ? `编辑参考音频：${p.node.musicReference.title}` : "添加参考音频"}
-            disabled={modeLocked}
+            disabled={controlsLocked}
             onClick={() => {
               setPickingReference(false);
               setModelOpen(false);
@@ -1286,7 +1342,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
             aria-expanded={lyricsEditorOpen}
             aria-controls={lyricsEditorOpen ? musicLyricsId : undefined}
             title={musicIsInstrumental ? "纯音乐无需歌词" : p.node.musicLyrics?.trim() ? "编辑已有歌词" : "编辑歌词或使用 AI 生成"}
-            disabled={modeLocked || musicIsInstrumental}
+            disabled={controlsLocked || musicIsInstrumental}
             onClick={() => {
               setMusicReferenceOpen(false);
               setSettingsOpen(false);
@@ -1296,7 +1352,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
             }}
           ><Type size={14} aria-hidden="true" /><span>歌词</span>{p.node.musicLyrics?.trim() && <span className="context-music-quick-status">已填写</span>}</button>}
           {(p.connectionError || !compatible.length) && <button className="icon-button context-model-refresh" aria-label={p.connectionActionLabel}
-            title={p.connectionError || p.connectionActionLabel} disabled={p.connecting} onClick={p.onRefresh}>
+            title={p.connectionActionLabel} disabled={p.connecting} onClick={p.onRefresh}>
             <RefreshCw size={13} className={p.connecting ? "spin" : ""} />
           </button>}
           {((isVideo && videoConfig && chosen) || (isMusic && musicConfig && chosen) || (!isVideo && !isMusic && chosen && hasImageSettings)) && (
@@ -1308,6 +1364,7 @@ export default function CreatorPanel(p: CreatorPanelProps) {
               aria-label={settingsOpen ? "收起生成参数" : "展开生成参数"}
               aria-expanded={settingsOpen}
               title={settingsOpen ? "收起生成参数" : "调整生成参数"}
+              disabled={controlsLocked}
               onClick={() => {
                 setPickingReference(false);
                 setModelOpen(false);
@@ -1345,6 +1402,8 @@ export default function CreatorPanel(p: CreatorPanelProps) {
             title={
               p.active
                 ? "当前任务尚未结束，请先完成其他编辑。"
+                : canRetryOriginalSubmission
+                  ? "将先核查原提交，再使用原参数和同一个请求编号继续；不会自动重复提交。"
                 : needsRecovery
                   ? "任务仍在处理中，完成后会自动更新结果。"
                   : retryPolicy.requiresConfirmation && !canCreateNewTask

@@ -1,12 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { replaceVideoNodeMedia, sameVideoNodeSource, videoAutoRecoveryKey, VideoAutoRecoveryGuard, VideoNodeSourceGuard } from "../src/video-node-media.ts";
+import { canReuseVideoContent, replaceVideoNodeMedia, sameVideoNodeSource, videoAutoRecoveryKey, VideoAutoRecoveryGuard, VideoNodeSourceGuard } from "../src/video-node-media.ts";
 import type { CanvasNode } from "../src/canvas-types.ts";
 
 const node: CanvasNode = {
   id: "video-1", type: "video", title: "Original", text: "A useful note", x: 40, y: 70,
   width: 400, height: 225, color: "#f88", video: "data:video/mp4;base64,b2xk", groupId: "group-1",
 };
+
+test("video extraction reuses only durable references and materializes inline or temporary media", () => {
+  assert.equal(canReuseVideoContent({ localVideo: "proxy-canvas:video:v1:local" }), true);
+  assert.equal(canReuseVideoContent({ assetId: "asset-1", video: "https://cdn.test/video.mp4" }), true);
+  assert.equal(canReuseVideoContent({ assetId: "asset-1", video: "data:video/mp4;base64,AAAA", videoContentUrl: "https://cdn.test/video.mp4" }), false);
+  assert.equal(canReuseVideoContent({ taskId: "task-1", status: "completed", videoContentUrl: "/videos/task-1/content" }), true);
+  assert.equal(canReuseVideoContent({ videoContentUrl: "/videos/task-1/content", status: "completed" }), true);
+  assert.equal(canReuseVideoContent({ taskId: "task-1", status: "queued", videoContentUrl: "/videos/task-1/content" }), false);
+  assert.equal(canReuseVideoContent({ assetId: "asset-1", video: "data:video/mp4;base64,AAAA" }), false);
+  assert.equal(canReuseVideoContent({ video: "blob:temporary-video" }), false);
+  assert.equal(canReuseVideoContent({ video: "https://cdn.test/temporary.mp4" }), false);
+});
 
 test("source identity ignores layout, title and poster changes", () => {
   assert.equal(sameVideoNodeSource(node, { ...node, title: "Renamed", x: 100, videoPoster: "cover" } as CanvasNode), true);

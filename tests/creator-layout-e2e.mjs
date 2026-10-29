@@ -37,8 +37,19 @@ try {
   const closeList = page.getByRole("button", { name: "收起画布列表", exact: true }).first();
   if (await closeList.isVisible()) await closeList.click();
 
-  // A prompt node is the target whose editor is rendered in the screen layer.
-  await page.getByRole("button", { name: "创建图片", exact: true }).click();
+  // The empty-canvas guide is passive so a real double-click can open the
+  // node picker without the guide swallowing either pointer event.
+  const emptyGuide = page.locator(".empty-canvas");
+  await emptyGuide.getByText("双击画布开始创作", { exact: true }).waitFor();
+  await emptyGuide.getByText("也可点击底部「添加节点」", { exact: true }).waitFor();
+  assert.equal(await emptyGuide.evaluate(element => getComputedStyle(element).pointerEvents), "none");
+  const board = await page.getByLabel("无限创作画布").boundingBox();
+  assert.ok(board);
+  await page.mouse.dblclick(board.x + board.width / 2, board.y + board.height / 2);
+  const picker = page.getByRole("dialog", { name: "添加节点", exact: true });
+  await picker.waitFor();
+  await picker.getByRole("button", { name: /图片生成/ }).click();
+  await emptyGuide.waitFor({ state: "detached" });
   const editor = page.getByRole("complementary", { name: "图片创作", exact: true });
   await editor.waitFor();
   const targetId = await page.locator(".node.selected").getAttribute("data-node-id");

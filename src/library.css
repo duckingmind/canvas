@@ -54,6 +54,13 @@
   opacity: 1;
   transform: translateY(0) scale(1);
 }
+.canvas-editor-enter.is-switching {
+  animation: canvas-editor-switch-in 220ms cubic-bezier(.2,.75,.25,1) both;
+}
+@keyframes canvas-editor-switch-in {
+  from { opacity: .72; transform: translateY(5px) scale(.994); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
 .canvas-workbench-empty {
   position: absolute;
   inset: 0;
@@ -88,106 +95,56 @@
   padding: 32px 24px;
   text-align: center;
 }
-.canvas-loading-indicator {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 20px;
-  min-width: 220px;
-  padding: 18px;
-  color: #d7d7da;
-  animation: canvas-loading-enter 360ms cubic-bezier(.2,.75,.25,1) both;
-}
-.canvas-loading-brand {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-.canvas-loading-mark {
-  position: relative;
-  display: grid;
-  place-items: center;
-  width: 48px;
-  height: 48px;
-  color: #e7e7e9;
-}
-.canvas-loading-mark > svg {
-  filter: drop-shadow(0 0 10px #ffffff30);
-}
-.canvas-loading-orbit {
+.canvas-switch-indicator {
   position: absolute;
-  inset: 0;
-  border: 1px solid #ffffff19;
-  border-radius: 50%;
+  z-index: 12;
+  top: 64px;
+  left: 50%;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  max-width: min(440px, calc(100% - 32px));
+  padding: 0 12px;
+  border: 1px solid #ffffff1c;
+  border-radius: 999px;
+  background: #202022e8;
+  color: #d4d4da;
+  box-shadow: 0 8px 24px #0004;
+  backdrop-filter: blur(14px);
+  transform: translateX(-50%);
+  animation: canvas-switch-indicator-in 180ms ease-out both;
+  pointer-events: none;
 }
-.canvas-loading-orbit-a {
-  border-top-color: #e4e4e6;
-  border-right-color: #929297;
-  animation: canvas-loading-orbit 1.65s cubic-bezier(.55,.08,.45,.92) infinite;
+.canvas-switch-indicator > svg {
+  flex: 0 0 auto;
+  color: #d9d9df;
+  animation: canvas-loading-orbit .95s linear infinite;
 }
-.canvas-loading-orbit-b {
-  inset: 6px;
-  border-bottom-color: #ffffffa0;
-  border-left-color: #ffffff08;
-  animation: canvas-loading-orbit 2.2s linear infinite reverse;
+.canvas-switch-indicator > span {
+  color: #b9b9c1;
+  font-size: 11px;
+  white-space: nowrap;
 }
-.canvas-loading-copy {
-  display: grid;
-  gap: 4px;
-  min-width: 132px;
-}
-.canvas-loading-copy strong {
-  color: #eeeeef;
-  font-size: 20px;
-  font-weight: 580;
-  line-height: 1.15;
-}
-.canvas-loading-copy > span {
-  color: #85858d;
-  font-size: 12px;
-  line-height: 1.5;
-}
-.canvas-loading-track {
-  position: relative;
-  display: block;
-  width: 152px;
-  height: 2px;
+.canvas-switch-indicator > strong {
+  max-width: 220px;
   overflow: hidden;
-  border-radius: 2px;
-  background: #ffffff14;
+  color: #ededf0;
+  font-size: 11px;
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.canvas-loading-track > span {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 38%;
-  border-radius: inherit;
-  background: #d4d4d8;
-  box-shadow: 0 0 9px #ffffff55;
-  animation: canvas-loading-progress 1.5s cubic-bezier(.4,0,.6,1) infinite;
+.canvas-switch-indicator.is-dismissing {
+  animation: canvas-switch-indicator-out 220ms ease-in both;
 }
-@keyframes canvas-loading-orbit {
-  to { transform: rotate(360deg); }
+@keyframes canvas-switch-indicator-in {
+  from { opacity: 0; transform: translate(-50%, -5px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
 }
-@keyframes canvas-loading-progress {
-  0% { transform: translateX(-110%); }
-  100% { transform: translateX(280%); }
-}
-@keyframes canvas-loading-enter {
-  from { opacity: 0; transform: translateY(5px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-@media (max-width: 520px) {
-  .canvas-loading-indicator {
-    gap: 17px;
-    min-width: 0;
-  }
-  .canvas-loading-mark {
-    width: 44px;
-    height: 44px;
-  }
-  .canvas-loading-copy strong {
-    font-size: 18px;
-  }
+@keyframes canvas-switch-indicator-out {
+  from { opacity: 1; transform: translate(-50%, 0); }
+  to { opacity: 0; transform: translate(-50%, -4px); }
 }
 @media (prefers-reduced-motion: reduce) {
   .canvas-library-panel,
@@ -206,15 +163,10 @@
   .canvas-workbench-empty.is-dismissing {
     opacity: 0;
   }
-  .canvas-loading-indicator,
-  .canvas-loading-orbit-a,
-  .canvas-loading-orbit-b,
-  .canvas-loading-track > span {
+  .canvas-editor-enter.is-switching,
+  .canvas-switch-indicator,
+  .canvas-switch-indicator.is-dismissing {
     animation: none;
-  }
-  .canvas-loading-track > span {
-    left: 31%;
-    width: 38%;
   }
 }
 .canvas-workbench-empty h1 {
@@ -917,16 +869,16 @@
   padding: 24px;
   overflow: auto;
   background: #0008;
-  backdrop-filter: blur(6px);
+  backdrop-filter: blur(4px);
   animation: library-backdrop-in 150ms ease-out both;
 }
 .library-dialog {
-  width: min(100%, 456px);
-  padding: 22px 24px 24px;
+  width: min(100%, 440px);
+  padding: 20px 22px 22px;
   border: 1px solid var(--library-border);
-  border-radius: 16px;
-  background: #242427f5;
-  box-shadow: 0 24px 90px #000a, 0 4px 18px #0007;
+  border-radius: 14px;
+  background: #242427fa;
+  box-shadow: 0 20px 72px #0009, 0 3px 14px #0006;
   animation: library-dialog-in 180ms cubic-bezier(.2, .75, .25, 1) both;
 }
 @keyframes library-backdrop-in {
@@ -942,46 +894,49 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin: -3px -8px 20px 0;
+  margin: 0 0 16px;
 }
 .library-dialog-head h2 {
   margin: 0;
   color: #f4f4f6;
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 600;
 }
 .library-dialog .library-icon-button {
-  width: 40px;
-  height: 40px;
-  flex-basis: 40px;
-  border-radius: 9px;
+  width: 34px;
+  height: 34px;
+  flex-basis: 34px;
+  border-radius: 8px;
 }
 .library-dialog .library-icon-button:hover:not(:disabled) {
   background: #ffffff12;
 }
 .library-name-label {
   display: block;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
   color: #cdccd4;
-  font-size: 13px;
+  font-size: var(--canvas-form-control-font-size);
   font-weight: 500;
 }
 .library-name-input {
   width: 100%;
-  min-height: 48px;
-  padding: 11px 13px;
-  border: 1px solid #ffffff25;
-  border-radius: 9px;
+  height: var(--canvas-form-control-height);
+  padding: 0 11px;
+  border: 1px solid #ffffff1c;
+  border-radius: var(--canvas-form-control-radius);
   outline: 0;
   background: #18181b;
   color: var(--library-text);
-  font-size: 13px;
+  font-size: var(--canvas-form-control-font-size);
   transition: border-color 150ms, box-shadow 150ms, background-color 150ms;
 }
 .library-name-input:focus {
-  border-color: #d7d7df;
+  border-color: #9c9ca5;
   background: #1b1b1f;
-  box-shadow: 0 0 0 3px #ffffff14;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--library-accent) 16%, transparent);
+}
+.library-dialog .library-name-input:focus-visible {
+  outline: none;
 }
 .library-name-input::placeholder {
   color: #91919d;
@@ -992,9 +947,9 @@
 .library-form-help,
 .library-form-error {
   font-size: 12px;
-  line-height: 1.7;
-  min-height: 20px;
-  margin: 9px 0 22px;
+  line-height: 1.55;
+  min-height: 18px;
+  margin: 8px 0 18px;
 }
 .library-form-help {
   color: var(--library-muted);
@@ -1008,9 +963,9 @@
   gap: 10px;
 }
 .library-dialog-actions .library-button {
-  min-height: 40px;
+  min-height: 38px;
   min-width: 88px;
-  border-radius: 9px;
+  border-radius: 8px;
 }
 .library-dialog-actions .library-button-primary:disabled {
   color: #85858e;
@@ -1298,7 +1253,7 @@
     min-height: 44px;
   }
   .library-dialog {
-    padding: 18px 20px 20px;
+    padding: 20px 22px 22px;
   }
 }
 @media (max-width: 480px) {
@@ -1321,17 +1276,13 @@
 .canvas-workbench-editor {
   container: canvas-editor / inline-size;
 }
-.canvas-workbench-editor .top-actions > .button,
-.canvas-workbench-editor .empty-actions > .button {
+.canvas-workbench-editor .top-actions > .button {
   white-space: nowrap;
   flex-shrink: 0;
 }
 .canvas-workbench-editor .empty-canvas {
   width: max-content;
   max-width: calc(100% - 32px);
-}
-.canvas-workbench-editor .empty-actions {
-  width: min(440px, calc(100cqw - 48px));
 }
 @container canvas-editor (max-width: 1000px) {
   .canvas-workbench-editor .canvas-utilities {
@@ -1437,15 +1388,6 @@
   }
 }
 @container canvas-editor (max-width: 480px) {
-  .canvas-workbench-editor .empty-actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    width: min(360px, calc(100cqw - 40px));
-  }
-  .canvas-workbench-editor .empty-actions .button {
-    min-width: 0;
-    padding: 0 8px;
-  }
   .canvas-workbench-editor .top-actions {
     gap: 3px;
   }

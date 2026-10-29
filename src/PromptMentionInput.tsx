@@ -2,7 +2,7 @@ import React from "react";
 import { createPortal } from "react-dom";
 import { ArrowLeft, ChevronRight, Folder, ImagePlus, Library, Search } from "lucide-react";
 import type { PromptSegment } from "./canvas-types";
-import { promptSegmentsText } from "./prompt-segments.ts";
+import { isGenericImageFilename, promptReferenceDisplayLabel, promptSegmentsText } from "./prompt-segments.ts";
 import { imagePreviewURL } from "./image-variants";
 import { isComposingKey, isGenerateShortcut } from "./keyboard";
 
@@ -45,6 +45,7 @@ type Props = {
   onFocus?: () => void;
   inputRef: React.MutableRefObject<HTMLElement | null>;
   maxLength?: number;
+  readOnly?: boolean;
 };
 
 const mentionSelector = '[data-prompt-reference="true"]';
@@ -94,15 +95,17 @@ function createMention(
   candidate: MentionCandidate | undefined,
   displayLabel: string,
 ) {
+  const image = candidate && imagePreviewURL(candidate.image, candidate.imageThumbnail);
+  const imageOnly = Boolean(image && isGenericImageFilename(displayLabel));
   const element = document.createElement("span");
-  element.className = "context-prompt-mention";
+  element.className = `context-prompt-mention${imageOnly ? " is-image-only" : ""}`;
   element.contentEditable = "false";
   element.dataset.promptReference = "true";
   element.dataset.referenceId = segment.referenceId;
   element.dataset.referenceLabel = segment.label;
   element.setAttribute("role", "img");
-  element.setAttribute("aria-label", `引用 ${displayLabel}`);
-  const image = candidate && imagePreviewURL(candidate.image || candidate.localImage, candidate.imageThumbnail);
+  element.setAttribute("aria-label", `引用图片 ${displayLabel}`);
+  element.title = displayLabel;
   if (image) {
     const thumbnail = document.createElement("img");
     thumbnail.src = image;
@@ -116,10 +119,12 @@ function createMention(
     icon.textContent = "@";
     element.append(icon);
   }
-  const text = document.createElement("span");
-  text.className = "context-prompt-mention-label";
-  text.textContent = displayLabel;
-  element.append(text);
+  if (!imageOnly) {
+    const text = document.createElement("span");
+    text.className = "context-prompt-mention-label";
+    text.textContent = displayLabel;
+    element.append(text);
+  }
   return element;
 }
 
@@ -131,7 +136,10 @@ function renderSegments(root: HTMLElement, segments: readonly PromptSegment[], c
     else {
       referenceNumber++;
       const candidate = candidates.get(segment.referenceId);
-      const label = naming === "number" ? `参考图 ${referenceNumber}` : candidate?.title || segment.label;
+      const sourceLabel = candidate?.title || segment.label;
+      const label = naming === "number"
+        ? `参考图 ${referenceNumber}`
+        : promptReferenceDisplayLabel(sourceLabel, segment.referenceId, referenceNumber, candidate?.assetId);
       fragment.append(createMention(segment, candidate, label));
     }
   }
@@ -291,14 +299,14 @@ export default function PromptMentionInput(props: Props) {
   const libraryCandidates = React.useMemo(() => {
     const referenceIds = new Set(referenceCandidates.map(candidate => candidate.id));
     const assetIds = new Set(referenceCandidates.flatMap(candidate => candidate.assetId ? [candidate.assetId] : []));
-    const images = new Set(referenceCandidates.flatMap(candidate => [candidate.localImage, candidate.image].filter(Boolean)));
+    const images = new Set(referenceCandidates.flatMap(candidate => [candidate.image].filter(Boolean)));
     const seen = new Set<string>();
     return props.candidates.filter(candidate => {
       if (candidate.type !== "image" || referenceIds.has(candidate.id)) return false;
       if (candidate.assetId && assetIds.has(candidate.assetId)) return false;
-      if (candidate.localImage && images.has(candidate.localImage) || candidate.image && images.has(candidate.image)) return false;
-      if (!candidate.image && !candidate.imageThumbnail && !candidate.localImage && candidate.source !== "library") return false;
-      const identity = candidate.assetId || candidate.localImage || candidate.id;
+      if (candidate.image && images.has(candidate.image)) return false;
+      if (!candidate.image && !candidate.imageThumbnail && candidate.source !== "library") return false;
+      const identity = candidate.assetId || candidate.id;
       if (seen.has(identity)) return false;
       seen.add(identity);
       return true;
@@ -478,9 +486,11 @@ export default function PromptMentionInput(props: Props) {
       if (selected === false) return false;
       const resolvedCandidate = selected && typeof selected === "object" ? selected : candidate;
       const currentText = input.value;
-      const segment: Extract<PromptSegment, { type: "reference" }> = { type: "reference", referenceId: resolvedCandidate.id, label: resolvedCandidate.title };
       const nextSegments: PromptSegment[] = [];
       appendText(nextSegments, currentText.slice(0, plainRange.start));
+      const nextNumber = nextSegments.filter(item => item.type === "reference").length + 1;
+      const label = promptReferenceDisplayLabel(resolvedCandidate.title, resolvedCandidate.id, nextNumber, resolvedCandidate.assetId);
+      const segment: Extract<PromptSegment, { type: "reference" }> = { type: "reference", referenceId: resolvedCandidate.id, label };
       nextSegments.push(segment);
       appendText(nextSegments, currentText.slice(plainRange.end));
       setInlineMode(true);
@@ -512,15 +522,16 @@ export default function PromptMentionInput(props: Props) {
     if (selected === false) return false;
     const resolvedCandidate = selected && typeof selected === "object" ? selected : candidate;
     const nextNumber = currentSegments.filter(segment => segment.type === "reference").length + 1;
+    const label = promptReferenceDisplayLabel(resolvedCandidate.title, resolvedCandidate.id, nextNumber, resolvedCandidate.assetId);
     const segment: Extract<PromptSegment, { type: "reference" }> = {
       type: "reference",
       referenceId: resolvedCandidate.id,
       // Keep the canonical label stable; referenceNaming only controls the
       // compact visual caption and can be changed without rewriting prompts.
-      label: resolvedCandidate.title,
+      label,
     };
     range.deleteContents();
-    const mention = createMention(segment, resolvedCandidate, props.referenceNaming === "number" ? `参考图 ${nextNumber}` : resolvedCandidate.title);
+    const mention = createMention(segment, resolvedCandidate, props.referenceNaming === "number" ? `参考图 ${nextNumber}` : label);
     range.insertNode(mention);
     range.setStartAfter(mention);
     range.collapse(true);
@@ -656,7 +667,7 @@ export default function PromptMentionInput(props: Props) {
     }
   };
   const renderCandidate = (candidate: MentionCandidate, index: number) => {
-    const preview = imagePreviewURL(candidate.image || candidate.localImage, candidate.imageThumbnail);
+    const preview = imagePreviewURL(candidate.image, candidate.imageThumbnail);
     const selectableIndex = index >= 0;
     return <button key={candidate.id} type="button" role="option" aria-selected={selectableIndex && index === activeIndex} className={selectableIndex && index === activeIndex ? "is-active" : ""} disabled={selectionPending}
       onMouseEnter={event => { if (selectableIndex) setActiveIndex(index); previewAnchor.current = event.currentTarget; setHoveredCandidate(candidate); }}
@@ -760,7 +771,7 @@ export default function PromptMentionInput(props: Props) {
       {libraryStatus}
     </div>
   </div>, document.body) : null;
-  const hoveredPreview = hoveredCandidate && imagePreviewURL(hoveredCandidate.image || hoveredCandidate.localImage, hoveredCandidate.imageThumbnail);
+  const hoveredPreview = hoveredCandidate && imagePreviewURL(hoveredCandidate.image, hoveredCandidate.imageThumbnail);
   const candidatePreview = menuOpen && hoveredCandidate && hoveredPreview && !previewFailed && previewPosition && typeof document !== "undefined"
     ? createPortal(<figure className="prompt-mention-hover-preview" aria-label="引用素材预览" style={previewPosition}>
       <img src={hoveredPreview} alt={hoveredCandidate.title} draggable={false} onError={() => setPreviewFailed(true)} />
@@ -773,10 +784,12 @@ export default function PromptMentionInput(props: Props) {
       className="context-prompt"
       aria-label={props.label}
       aria-describedby={props.describedBy}
+      aria-readonly={props.readOnly || undefined}
       placeholder={props.placeholder}
       value={props.initialSegments.map(segment => segment.type === "text" ? segment.text : `@${segment.label}`).join("")}
       maxLength={props.maxLength ?? 20000}
       rows={props.expanded ? 9 : 3}
+      readOnly={props.readOnly}
       onChange={plainInput}
       onKeyDown={keyDown}
       onCompositionStart={() => { composing.current = true; }}
@@ -790,9 +803,10 @@ export default function PromptMentionInput(props: Props) {
       aria-label={props.label}
       aria-describedby={props.describedBy}
       aria-multiline="true"
+      aria-readonly={props.readOnly || undefined}
       aria-placeholder={props.placeholder}
       data-placeholder={props.placeholder}
-      contentEditable
+      contentEditable={!props.readOnly}
       suppressContentEditableWarning
       spellCheck
       onInput={handleInput}

@@ -5,7 +5,7 @@ import { mediaUrlIdentity } from "./image-recovery.ts";
 export function reusableNodeKind(node: CanvasNode): AssetKind | null {
   if (node.audio || node.localAudio || (node.type === "audio" || node.mediaType === "audio") && (node.assetId || node.taskId && node.status === "completed")) return "audio";
   if (node.localVideo || node.video || node.videoContentUrl || ((node.type === "video" || node.mediaType === "video") && (node.assetId || node.taskId && node.status === "completed"))) return "video";
-  if (node.image || node.localImage) return "image";
+  if (node.image || ((node.type === "image" || node.mediaType === "image") && node.assetId)) return "image";
   if ((node.type === "note" || node.type === "prompt") && node.text.trim()) return "prompt";
   return null;
 }
@@ -26,15 +26,17 @@ export function matchNodeMediaAsset(node: CanvasNode, assets: readonly StoredAss
 }
 
 export function nodeFromLibraryAsset(asset: CanvasAsset, mediaURL?: string, urlExpiresAt?: string, thumbnailURL?: string): Pick<CanvasNode, "type" | "title" | "text"> & Partial<CanvasNode> {
+  if (asset.source.type === "local") {
+    throw new Error("本机素材必须先上传为平台资产，才能插入画布节点。");
+  }
   if (asset.kind !== "prompt" && !mediaURL) throw new Error("素材内容暂不可用，请刷新后重试。");
   const source = asset.source;
   return {
     type: asset.kind === "prompt" ? "note" : asset.kind,
     title: asset.name,
     text: source.type === "text" ? source.text : asset.prompt || "",
-    ...(asset.kind === "image" ? { image: mediaURL, ...(thumbnailURL ? { imageThumbnail: thumbnailURL } : {}) } : asset.kind === "video" && source.type !== "local" ? { video: mediaURL } : asset.kind === "audio" && source.type !== "task" && source.type !== "local" ? { audio: mediaURL } : {}),
+    ...(asset.kind === "image" ? { image: mediaURL, ...(thumbnailURL ? { imageThumbnail: thumbnailURL } : {}) } : asset.kind === "video" ? { video: mediaURL } : asset.kind === "audio" && source.type !== "task" ? { audio: mediaURL } : {}),
     ...(asset.kind === "video" && urlExpiresAt ? { videoContentUrlExpiresAt: urlExpiresAt } : {}),
-    ...(source.type === "local" ? source.localAudio ? { localAudio: source.localAudio } : source.localVideo ? { localVideo: source.localVideo } : { localImage: source.localImage } : {}),
     ...(source.type === "platform" ? { assetId: source.assetId, taskId: source.taskId, resultIndex: source.resultIndex, ...(source.audioTaskType ? { audioTaskType: source.audioTaskType } : {}), ...(source.voiceId ? { voiceId: source.voiceId } : {}) } : {}),
     ...(source.type === "task" ? { taskId: source.taskId, resultIndex: source.resultIndex, status: "completed" as const, ...(source.audioTaskType ? { audioTaskType: source.audioTaskType } : {}), ...(source.voiceId ? { voiceId: source.voiceId } : {}), ...(source.audioTaskType === "tts" && source.voiceId ? { ttsSettings: { voice_id: source.voiceId } } : {}) } : {}),
     modelId: asset.modelId,

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createImageNode } from "./canvas-ui.mjs";
 
 const { chromium } = await import(
   process.env.CANVAS_PLAYWRIGHT_MODULE || "playwright"
@@ -67,20 +68,30 @@ const eventually = async (check, description, timeout = 15000) => {
   throw new Error(`Timed out: ${description}`);
 };
 const button = (page, name) => page.getByRole("button", { name, exact: true });
+const current = async (page, name) => {
+  void name;
+  await page.getByLabel("无限创作画布").waitFor();
+};
 const management = async (page) => {
   await page.getByLabel("无限创作画布").waitFor();
-  if (await button(page, "管理画布").isVisible())
-    await button(page, "管理画布").click();
+  const managementButton = button(page, "管理画布");
+  const libraryButton = button(page, "我的画布");
+  if (await managementButton.isVisible()) await managementButton.click();
+  else if (await libraryButton.isVisible()) await libraryButton.click();
   await page.getByLabel("搜索画布名称").waitFor();
 };
 const open = async (page, name) => {
   await management(page);
-  await button(page, `打开画布：${name}`).click();
-  await page.waitForFunction(
-    (value) => document.querySelector(".project-name")?.value === value,
-    name,
-  );
-  await page.getByLabel("无限创作画布").waitFor();
+  const card = button(page, `打开画布：${name}`);
+  const id = await card.evaluate((element) => element.closest("[data-canvas-id]")?.getAttribute("data-canvas-id"));
+  assert.ok(id, `canvas card has an ID: ${name}`);
+  await card.click();
+  await page.waitForFunction((expectedId) => location.hash === `#/canvas/${expectedId}`, id);
+  await current(page, name);
+};
+const reviewRecovery = async (page) => {
+  await page.getByRole("button", { name: /查看保存与恢复/ }).click();
+  await button(page, "查看待恢复版本").click();
 };
 const action = async (page, name, label) => {
   await management(page);
@@ -137,7 +148,7 @@ try {
       : { channel: process.env.CANVAS_BROWSER_CHANNEL || "chrome" }),
   });
   const first = await newPage();
-  // Prepare old IndexedDB records before mounting the application, using its real persistence API.
+  // Seed account-owned local canvases before mounting the application.
   await first.route("**/__recovery-seed", (route) =>
     route.fulfill({
       contentType: "text/html",
@@ -147,9 +158,11 @@ try {
   await first.goto(`${base}/__recovery-seed`);
   await first.evaluate(
     async ({ workspace, recovery }) => {
-      const { writeDraft } = await import("/src/draft-store.ts");
-      await writeDraft("workspace", workspace);
-      await writeDraft("recovery", recovery);
+      const { setLocalStorageScope } = await import("/src/local-storage-scope.ts");
+      const { saveCanvas } = await import("/src/library-store.ts");
+      setLocalStorageScope("acs_" + "f".repeat(64));
+      await saveCanvas({ ...workspace, id: "legacy-workspace", createdAt: workspace.updatedAt });
+      await saveCanvas({ ...recovery, id: "legacy-recovery", createdAt: recovery.updatedAt });
     },
     {
       workspace: legacyDocument("旧本机工作画布", "本机独有创作说明"),
@@ -158,8 +171,9 @@ try {
   );
   await first.unroute("**/__recovery-seed");
   await first.goto(base);
+  await management(first);
   await button(first, "打开画布：旧本机工作画布").waitFor();
-  await button(first, "打开画布：旧本机恢复画布 · 恢复备份").waitFor();
+  await button(first, "打开画布：旧本机恢复画布").waitFor();
   await eventually(
     async () =>
       (await state()).requests.some((r) =>
@@ -169,33 +183,45 @@ try {
   );
   assert.equal(await first.locator(".library-card").count(), 2);
   await open(first, "旧本机工作画布");
-  await button(first, "查看与恢复").waitFor();
   assert.match(await first.locator("body").innerText(), /本机独有创作说明/);
-  await button(first, "查看与恢复").click();
-  await first
-    .getByRole("heading", { name: "本机画布 · 旧本机工作画布" })
-    .waitFor();
-  await first
-    .getByRole("heading", { name: "云端画布 · 旧云端不同版本" })
-    .waitFor();
-  await button(first, "继续本机并同步到云端").click();
-  await first.getByRole("dialog").waitFor({ state: "hidden" });
+  await reviewRecovery(first);
+  await first.getByRole("button", { name: "重新加载", exact: true }).waitFor();
+  const dialog = first.getByRole("dialog", { name: "云端新版本" });
+  const overlay = first.locator(".cloud-version-backdrop");
+  assert.equal(await dialog.getByRole("heading").count(), 0);
+  assert.equal(await dialog.getByRole("button").count(), 1);
+  const overlayBox = await overlay.boundingBox();
+  assert.deepEqual(
+    { x: overlayBox?.x, y: overlayBox?.y, width: overlayBox?.width, height: overlayBox?.height },
+    { x: 0, y: 0, width: 1440, height: 960 },
+    "the version mask covers the entire app, including the canvas list",
+  );
+  assert.equal(await button(first, "重新加载").count(), 1);
+  assert.equal(await button(first, "继续当前画布并同步到云端").count(), 0);
+  await button(first, "重新加载").click();
+  await dialog.waitFor({ state: "hidden" });
   await eventually(
     async () =>
       (await state()).storage["canvas:doc:v1:legacy-workspace"]?.name ===
-      "旧本机工作画布",
-    "explicit local choice publishes canonical KV document",
+      "旧云端不同版本",
+    "automatic merge publishes the selected conflict resolution",
   );
+  const recovered = await first.evaluate(async () => {
+    const { readDraft } = await import("/src/draft-store.ts");
+    return readDraft("recovery:legacy-workspace");
+  });
+  assert.equal(recovered?.name, "旧本机工作画布");
+  assert.equal(recovered?.nodes[0]?.text, "本机独有创作说明");
+  assert.match(await first.locator("body").innerText(), /云端独有创作说明/);
   await management(first);
-  await first.reload();
-  await button(first, "打开画布：旧本机工作画布").waitFor();
-  await button(first, "打开画布：旧本机恢复画布 · 恢复备份").waitFor();
+  await button(first, "打开画布：旧云端不同版本").waitFor();
+  await button(first, "打开画布：旧本机恢复画布").waitFor();
   assert.equal(await first.locator(".library-card").count(), 2);
-  await open(first, "旧本机恢复画布 · 恢复备份");
+  await open(first, "旧本机恢复画布");
   assert.match(await first.locator("body").innerText(), /恢复区创作说明/);
   await management(first);
   console.log(
-    "PASS real legacy workspace/recovery migration, explicit old-cloud conflict choice, reload without duplicate migration",
+    "PASS account-scoped automatic cloud merge, full-screen version mask, recovery copy, and reload",
   );
 
   await button(first, "新建画布").first().click();
@@ -205,13 +231,14 @@ try {
     .fill("跨设备画布");
   await button(first, "创建画布").click();
   await first.getByRole("dialog").waitFor({ state: "hidden" });
-  await first.waitForFunction(
-    () => document.querySelector(".project-name")?.value === "跨设备画布",
-  );
-  await first.getByLabel("无限创作画布").waitFor();
+  await current(first, "跨设备画布");
   const sharedId = first.url().split("/canvas/")[1];
-  await button(first, "创建图片").click();
+  await createImageNode(first);
   await first.getByLabel("创作画面描述").fill("跨设备专属内容");
+  const delayedMerge = first.getByRole("button", { name: "重新加载", exact: true });
+  await delayedMerge.waitFor({ state: "visible", timeout: 20000 });
+  await delayedMerge.click();
+  await first.getByRole("dialog", { name: "云端新版本" }).waitFor({ state: "hidden" });
   await button(first, "保存画布").click();
   await eventually(
     async () =>
@@ -223,9 +250,8 @@ try {
   await management(first);
   const second = await newPage();
   await second.goto(`${base}/#/canvas/${sharedId}`);
-  await second.waitForFunction(
-    () => document.querySelector(".project-name")?.value === "跨设备画布",
-  );
+  await second.waitForFunction((id) => location.hash === `#/canvas/${id}`, sharedId);
+  await second.getByLabel("无限创作画布").waitFor();
   assert.equal(
     second.url().split("/canvas/")[1],
     sharedId,
@@ -236,7 +262,7 @@ try {
     0,
     "remote direct link does not create a stray blank canvas",
   );
-  await button(second, "打开画布：旧本机工作画布").waitFor();
+  await management(second);
   await button(second, "打开画布：跨设备画布").waitFor();
   await open(second, "跨设备画布");
   assert.match(await second.locator("body").innerText(), /跨设备专属内容/);
@@ -245,14 +271,13 @@ try {
     "PASS independent second browser context discovers multiple cloud canvases and their own contents",
   );
 
-  await control({ storageFailuresRemaining: 10 });
+  await control({ storageFailuresRemaining: 1 });
   await action(second, "跨设备画布", "重命名画布：跨设备画布");
   await second
     .getByRole("dialog")
     .getByRole("textbox", { name: "画布名称", exact: true })
     .fill("云端失败仍保留本机");
   await button(second, "保存名称").click();
-  await button(second, "打开画布：云端失败仍保留本机").waitFor();
   await eventually(
     async () =>
       (await state()).requests.some(
@@ -262,26 +287,45 @@ try {
   );
   await second.getByText(/本机操作已完成|已保存本机 · 云端同步失败/).waitFor();
   await second.reload();
+  await management(second);
   await button(second, "打开画布：云端失败仍保留本机").waitFor();
-  assert.equal(
-    (await state()).storage[`canvas:doc:v1:${sharedId}`].name,
-    "跨设备画布",
+  await eventually(
+    async () =>
+      (await state()).storage[`canvas:doc:v1:${sharedId}`]?.name ===
+      "云端失败仍保留本机",
+    "queued local revision resumes after reload",
   );
   console.log(
-    "PASS cloud write failure leaves successful local rename intact across reload",
+    "PASS cloud write failure preserves the local rename and resumes sync after reload",
   );
 
+  await control({ storageFailuresRemaining: 10000 });
+  const requestsBeforeTrash = (await state()).requests.length;
   await action(
     second,
     "云端失败仍保留本机",
     "将画布 云端失败仍保留本机 移入回收站",
   );
+  await eventually(
+    async () =>
+      (await state()).requests
+        .slice(requestsBeforeTrash)
+        .some((r) => r.outcome === "retryable-storage-failure"),
+    "injected cloud delete failure",
+  );
+  assert.equal(
+    (await state()).storage[`canvas:doc:v1:${sharedId}`].deletedAt,
+    undefined,
+    "failed deletion leaves the stale cloud copy active",
+  );
+  await management(second);
   await second.getByRole("tab", { name: /回收站/ }).click();
   await button(second, "恢复画布：云端失败仍保留本机").waitFor();
   await second.reload();
+  await management(second);
   await second.getByRole("tab", { name: /回收站/ }).click();
   await button(second, "恢复画布：云端失败仍保留本机").waitFor();
-  await second.getByRole("tab", { name: /全部画布/ }).click();
+  await second.getByRole("tab", { name: /^全部/ }).click();
   assert.equal(await button(second, "打开画布：跨设备画布").count(), 0);
   assert.equal(await button(second, "打开画布：云端失败仍保留本机").count(), 0);
   assert.equal(
@@ -304,9 +348,9 @@ try {
         passed: true,
         errors,
         checks: [
-          "legacy IndexedDB migration",
-          "legacy cloud conflict choice",
-          "migration idempotency",
+          "account-scoped local recovery",
+          "persisted local-only conflict choice",
+          "explicit conflict sync choice",
           "second-context cloud discovery",
           "cloud-only direct link without extra blank canvas",
           "local rename despite cloud write failure",

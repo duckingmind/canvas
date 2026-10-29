@@ -9,7 +9,6 @@ export type WorkflowNode = {
   text: string;
   image?: string;
   imageThumbnail?: string;
-  localImage?: string;
   audio?: string;
   localAudio?: string;
   localVideo?: string;
@@ -18,7 +17,6 @@ export type WorkflowNode = {
     title: string;
     image?: string;
     imageThumbnail?: string;
-    localImage?: string;
     video?: string;
     audio?: string;
     localAudio?: string;
@@ -36,32 +34,39 @@ export type WorkflowNode = {
   assetId?: string;
 };
 export type WorkflowEdge = { from: string; to: string };
-export type ImageReferenceValue = { image?: string; localImage?: string; assetId?: string };
+export type ImageReferenceValue = { image?: string; assetId?: string };
+
+/** Only server-delivered URLs or a stable platform asset identity are valid
+ * image inputs. Data/Blob URLs are browser-local intermediates. */
+const durableImageURL = (value: unknown): value is string =>
+  typeof value === "string" && /^(?:https?:\/\/|\/)/i.test(value.trim());
+const hasDurableImage = (value: ImageReferenceValue | undefined): boolean =>
+  Boolean(value?.assetId || durableImageURL(value?.image));
 
 export type VideoReferenceValue = { mediaType?: "video" | "audio"; video?: string; localVideo?: string; audio?: string; localAudio?: string; videoContentUrl?: string; videoContentUrlExpiresAt?: string; assetId?: string };
 
 /** Stable identity used when the same image is exposed through multiple nodes. */
 export const imageReferenceIdentity = (reference: ImageReferenceValue) =>
-  reference.assetId ? `asset:${reference.assetId}` : reference.image ? `image:${reference.image}` : reference.localImage ? `local:${reference.localImage}` : "";
+  reference.assetId ? `asset:${reference.assetId}` : durableImageURL(reference.image) ? `image:${reference.image}` : "";
 
 export const videoReferenceIdentity = (reference: Omit<VideoReferenceValue, "mediaType">) =>
-  reference.localVideo ? `local-video:${reference.localVideo}` :
-  reference.localAudio ? `local-audio:${reference.localAudio}` :
   reference.assetId ? `asset:${reference.assetId}` :
   reference.video ? `video:${reference.video}` :
   reference.audio ? `audio:${reference.audio}` :
-  reference.videoContentUrl ? `video:${reference.videoContentUrl}` : "";
+  reference.videoContentUrl ? `video:${reference.videoContentUrl}` :
+  reference.localVideo ? `local-video:${reference.localVideo}` :
+  reference.localAudio ? `local-audio:${reference.localAudio}` : "";
 
 const isMediaReferenceNode = (node: WorkflowNode) =>
   node.type === "image" || node.type === "video" || node.type === "audio" ||
-  node.type === "prompt" && Boolean(node.image || node.localImage || node.video || node.localVideo || node.audio || node.localAudio || node.videoContentUrl || node.assetId);
+  node.type === "prompt" && Boolean(hasDurableImage(node) || node.video || node.localVideo || node.audio || node.localAudio || node.videoContentUrl);
 
 /** Text nodes are values only when they do not already represent a generated image. */
 export const isWorkflowTextReference = (
-  node: Pick<WorkflowNode, "type" | "text" | "image" | "localImage">,
+  node: Pick<WorkflowNode, "type" | "text" | "image">,
 ) => Boolean(
   node.text.trim() &&
-  (node.type === "note" || (node.type === "prompt" && !node.image && !node.localImage)),
+  (node.type === "note" || (node.type === "prompt" && !node.image)),
 );
 export type PromptComposition = {
   prompt: string;
@@ -71,7 +76,6 @@ export type PromptComposition = {
     title: string;
     image?: string;
     imageThumbnail?: string;
-    localImage?: string;
     assetId?: string;
     embedded?: boolean;
   }[];
@@ -150,16 +154,15 @@ export function composePromptWithIndex(
   for (const segment of targetSegments || []) {
     if (segment.type !== "reference") continue;
     const node = byId.get(segment.referenceId);
-    if (!node || (!node.image && !node.localImage && !node.assetId) || !(node.type === "image" || (node.type === "prompt" && node.mediaType !== "video" && node.mediaType !== "audio" && Boolean(node.image || node.localImage || node.assetId)))) continue;
+    if (!node || !hasDurableImage(node) || !(node.type === "image" || (node.type === "prompt" && node.mediaType !== "video" && node.mediaType !== "audio"))) continue;
     const imageKey = imageReferenceIdentity(node);
     if (!imageKey || seenImages.has(imageKey)) continue;
     seenImages.add(imageKey);
     result.imageReferences.push({
       nodeId: node.id,
       title: node.title || segment.label,
-      ...(node.image ? { image: node.image } : {}),
+      ...(durableImageURL(node.image) ? { image: node.image } : {}),
       ...(node.imageThumbnail ? { imageThumbnail: node.imageThumbnail } : {}),
-      ...(node.localImage ? { localImage: node.localImage } : {}),
       ...(node.assetId ? { assetId: node.assetId } : {}),
     });
   }
@@ -191,9 +194,8 @@ export function composePromptWithIndex(
       nodeId: reference.id,
       title: reference.title,
       embedded: true,
-      ...(reference.image ? { image: reference.image } : {}),
+      ...(durableImageURL(reference.image) ? { image: reference.image } : {}),
       ...(reference.imageThumbnail ? { imageThumbnail: reference.imageThumbnail } : {}),
-      ...(reference.localImage ? { localImage: reference.localImage } : {}),
       ...(reference.assetId ? { assetId: reference.assetId } : {}),
     });
   }
@@ -239,16 +241,18 @@ export function composePromptWithIndex(
         ...(node.videoContentUrlExpiresAt ? { videoContentUrlExpiresAt: node.videoContentUrlExpiresAt } : {}),
         ...(node.assetId ? { assetId: node.assetId } : {}),
       });
-    } else if (node.type === "image" || (node.type === "prompt" && node.mediaType !== "video" && node.mediaType !== "audio" && Boolean(node.image || node.localImage || node.assetId))) {
+    } else if (node.type === "image" || (node.type === "prompt" && node.mediaType !== "video" && node.mediaType !== "audio" && hasDurableImage(node))) {
       const imageKey = imageReferenceIdentity(node);
-      if (imageKey && seenImages.has(imageKey)) continue;
-      if (imageKey) seenImages.add(imageKey);
+      // Image nodes can still be present while a COS upload is in progress.
+      // They are not text dependencies and must not produce an empty image
+      // input that later code could mistake for a valid submission.
+      if (!imageKey || seenImages.has(imageKey)) continue;
+      seenImages.add(imageKey);
       result.imageReferences.push({
         nodeId: node.id,
         title: node.title,
-        ...(node.image ? { image: node.image } : {}),
+        ...(durableImageURL(node.image) ? { image: node.image } : {}),
         ...(node.imageThumbnail ? { imageThumbnail: node.imageThumbnail } : {}),
-        ...(node.localImage ? { localImage: node.localImage } : {}),
         ...(node.assetId ? { assetId: node.assetId } : {}),
       });
     } else if (node.text.trim()) {

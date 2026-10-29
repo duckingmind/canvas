@@ -4,6 +4,7 @@ export type MediaModel = {
   /** Platform catalog default marker used when a new Canvas node has no saved selection. */
   is_default?: boolean;
   available?: boolean;
+  supply_status?: string;
   supported_operations?: string[]; supported_input_modes?: string[];
   supported_durations?: (number | string)[]; duration_constraints?: { min_seconds?: number; max_seconds?: number; step_seconds?: number };
   supported_sizes?: string[]; supported_resolutions?: string[]; resolution_tiers?: string[]; supported_aspect_ratios?: string[];
@@ -52,6 +53,12 @@ export function catalogModels(value: unknown, kind: "image" | "video"): MediaMod
 export function modelsForType(models: MediaModel[], kind: "image" | "video") {
   return models.filter(model => (model.type || model.model_type || "image") === kind);
 }
+export function isMediaModelRecovering(model?: Pick<MediaModel, "supply_status"> | null) {
+  return String(model?.supply_status || "").trim().toLowerCase() === "recovering";
+}
+export function canEnterMediaScheduler(model?: Pick<MediaModel, "available" | "supply_status"> | null) {
+  return Boolean(model && (model.available !== false || isMediaModelRecovering(model)));
+}
 export function mediaReferenceLimit(model?: MediaModel) {
   // The gateway currently serializes the optional max_reference_images field
   // as 0 when it is absent. A positive reference-specific limit is
@@ -70,7 +77,7 @@ export function mediaReferenceLimit(model?: MediaModel) {
     : undefined;
 }
 export function modelUnavailableReason(model: MediaModel, kind: "image" | "video", referenceCount = 0): string {
-  if (model.available === false) return "暂不可用";
+  if (!canEnterMediaScheduler(model)) return "暂不可用";
   const operations = capability(model, "supported_operations");
   if (Array.isArray(operations) && !operations.includes(kind === "image" && referenceCount > 0 ? "edit" : "generation"))
     return referenceCount > 0 ? "不支持参考图创作" : "不支持文字生成";

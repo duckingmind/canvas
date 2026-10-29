@@ -82,9 +82,16 @@ function imageAsset(id = "asset-one"): CanvasAsset {
   for (const id of ["", "../x", "a..b", "x/y", "a".repeat(129)]) assert.throws(() => assetKey(id), { code: "CANVAS_ASSET_INVALID" });
 });
 
-test("durable URL checks reject signed or credential-bearing links", () => {
+test("durable URL checks reject signed links, credentials and authenticated task content routes", () => {
   assert.equal(isDurableAssetUrl("https://cdn.example.com/image.png"), true);
-  for (const url of ["data:image/png;base64,abc", "https://cdn.example.com/a?X-Amz-Signature=x", "https://u:p@example.com/a", "not a url"]) assert.equal(isDurableAssetUrl(url), false);
+  for (const url of [
+    "data:image/png;base64,abc",
+    "https://cdn.example.com/a?X-Amz-Signature=x",
+    "https://u:p@example.com/a",
+    "https://app.example.com/v1/videos/task-1/content",
+    "https://app.example.com/v1/music/tasks/task-2/content?index=0",
+    "not a url",
+  ]) assert.equal(isDurableAssetUrl(url), false);
 });
 
 test("normalization validates source semantics and strips unknown fields", () => {

@@ -69,7 +69,7 @@ export default function CanvasSettingsPanel({ value, onChange, children }: Props
         </section>
         <section id="canvas-settings-notifications" ref={el => { sections.current.notifications = el; }} className="canvas-settings-section">
           <h3>任务提示</h3>
-          <p className="canvas-settings-help">结果在当前视野且已选中时不重复提示；失败原因和保存状态仍可直接查看。</p>
+          <p className="canvas-settings-help">结果在当前视野且已选中时不重复提示；失败详情通过全局提示反馈。</p>
           <Toggle label="后台任务完成提示" checked={value.notifyGeneration} onChange={notifyGeneration => onChange({ notifyGeneration })} />
           <Toggle label="生成失败提示" checked={value.notifyFailure} onChange={notifyFailure => onChange({ notifyFailure })} />
         </section>
@@ -90,8 +90,7 @@ export default function CanvasSettingsPanel({ value, onChange, children }: Props
           <Toggle label="显示小地图" checked={value.showMinimap} onChange={showMinimap => onChange({ showMinimap })} />
           <Toggle label="显示节点状态标签" checked={value.showNodeStatus} onChange={showNodeStatus => onChange({ showNodeStatus })} />
           <Choices label="节点内容密度" value={value.nodeDensity} options={[["comfortable", "舒适"], ["compact", "紧凑"]]} onChange={nodeDensity => onChange({ nodeDensity })} />
-          <Choices label="默认整理方式" value={value.autoLayout} options={[["flow", "流程"], ["grid", "网格"]]} onChange={autoLayout => onChange({ autoLayout })} />
-          <p className="canvas-settings-help">默认整理方式在下次使用「整理画布」时生效；网格吸附使用设定间距，不受缩放影响。</p>
+          <p className="canvas-settings-help">点击画布工具栏的「智能整理」即可自动识别工作流、分组和独立节点，并选择合适的布局方式；网格吸附使用设定间距，不受缩放影响。</p>
         </section>
         <section id="canvas-settings-appearance" ref={el => { sections.current.appearance = el; }} className="canvas-settings-section">
           <h3>画布外观</h3>

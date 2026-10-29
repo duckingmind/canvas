@@ -51,7 +51,9 @@ export function createImageUploads(now = () => Date.now()) {
       if (!item || item.documentId !== documentId) return fail('CANVAS_MEDIA_EXPIRED', 'Image upload expired or belongs to another document; upload again')
       if (imageMime(item.bytes) !== item.mime) fail('CANVAS_MEDIA_INVALID', 'Image bytes do not match MIME type')
       item.touched = now()
-      return { ...item, dataUrl: `data:${item.mime};base64,${bytesBase64(item.bytes)}` }
+      // The staged bytes are an in-memory upload buffer only. A data URL must
+      // never become a persisted Canvas image or a recovery fallback.
+      return { ...item, bytes: item.bytes.slice() }
     },
     remove(id: string) { uploads.delete(id) },
   }

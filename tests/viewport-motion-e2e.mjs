@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createImageNode } from "./canvas-ui.mjs";
 
 const { chromium } = await import(process.env.CANVAS_PLAYWRIGHT_MODULE || "playwright");
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -73,7 +74,7 @@ try {
   await page.goto("http://127.0.0.1:5237/");
   const closeLibrary = button("收起画布列表").first();
   if (await closeLibrary.isVisible()) await closeLibrary.click();
-  await button("创建图片").click();
+  await createImageNode(page);
   await creator().waitFor();
   const id = await page.locator(".node.selected").getAttribute("data-node-id");
   const node = page.locator(`[data-node-id="${id}"]`);

@@ -1,5 +1,6 @@
 import { kindLabels, normalizeAsset, normalizeAssetTags, type AssetFilters, type AssetRow, type AssetSource, type CanvasAsset } from "./asset-library.ts";
 import type { StoredAsset } from "./canvas-types.ts";
+import { uploadApplicationMediaAsset } from "@ducking-mind/proxy-app-sdk";
 import { readVoiceDesignTask } from "./voice-design.ts";
 
 /** Requests use the signed-in application session; app/user identity never comes from asset metadata. */
@@ -16,6 +17,8 @@ export type PlatformAssetUploadInput = {
   folder?: string;
   tags?: string[];
   idempotencyKey?: string;
+  signal?: AbortSignal;
+  onProgress?: (update: { phase: "preparing" | "uploading" | "completing"; percent?: number; loadedBytes?: number; totalBytes?: number }) => void;
 };
 
 type AssetReadOptions = { signal?: AbortSignal; forceRefresh?: boolean };
@@ -266,28 +269,11 @@ export async function readPlatformAsset(api: PlatformAssetApi, assetId: string, 
 }
 
 /**
- * Stream a user supplied or locally derived media file to the Gateway-owned
- * asset store. The response is validated here so callers never persist an
- * arbitrary URL or an asset belonging to another media type.
+ * Validate a durable platform asset response. One-shot upstream inputs (for
+ * example image-edit references) use their operation-specific multipart
+ * endpoint in generation.ts and must not create an asset here.
  */
-export async function uploadPlatformAsset(api: PlatformAssetApi, input: PlatformAssetUploadInput): Promise<StoredAsset> {
-  if (!(input.file instanceof File) || input.file.size <= 0) invalid("上传文件为空，请重新选择媒体文件。");
-  if (input.file.size > 100 * 1024 * 1024) invalid("媒体文件不能超过 100 MB。");
-  const idempotencyKey = input.idempotencyKey || (typeof crypto !== "undefined" && crypto.randomUUID
-    ? crypto.randomUUID()
-    : `canvas-upload-${Date.now().toString(36)}`);
-  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(idempotencyKey)) invalid("上传标识无效。");
-  const form = new FormData();
-  form.append("file", input.file, input.file.name || "media");
-  if (input.name?.trim()) form.append("name", input.name.trim());
-  if (input.category?.trim()) form.append("category", input.category.trim());
-  if (input.folder?.trim()) form.append("folder", input.folder.trim());
-  if (input.tags?.length) form.append("tags", JSON.stringify(normalizeAssetTags(input.tags)));
-  const asset = await api.request<StoredAsset>("/media/assets", {
-    method: "POST",
-    headers: { "Idempotency-Key": idempotencyKey },
-    body: form,
-  });
+function validateUploadedResponse(input: PlatformAssetUploadInput, asset: StoredAsset): StoredAsset {
   if (!asset || typeof asset.id !== "string" || !asset.id.trim() ||
     !["image", "video", "audio"].includes(asset.type) ||
     asset.size_bytes !== input.file.size || typeof asset.content_type !== "string") {
@@ -297,6 +283,23 @@ export async function uploadPlatformAsset(api: PlatformAssetApi, input: Platform
   const expectedType = input.file.type.split("/", 1)[0];
   if (expectedType && asset.type !== expectedType) invalid("上传文件类型与平台返回结果不一致。");
   return asset;
+}
+
+export async function uploadDurablePlatformAsset(api: PlatformAssetApi, input: PlatformAssetUploadInput): Promise<StoredAsset> {
+  const idempotencyKey = input.idempotencyKey || (typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `canvas-upload-${Date.now().toString(36)}`);
+  const asset = await uploadApplicationMediaAsset<StoredAsset>(api, {
+    file: input.file,
+    name: input.name,
+    category: input.category,
+    folder: input.folder,
+    tags: input.tags?.length ? normalizeAssetTags(input.tags) : undefined,
+    idempotencyKey,
+    signal: input.signal,
+    onProgress: input.onProgress,
+  });
+  return validateUploadedResponse(input, asset);
 }
 
 function platformId(asset: CanvasAsset): string {

@@ -32,12 +32,10 @@ function MediaKindIcon({ type }: { type: string }) {
 
 export default function ApplicationMediaManager({
   connected,
-  storageStatus,
   onUsageRefresh,
   onNotice,
 }: {
   connected: boolean;
-  storageStatus?: string;
   onUsageRefresh: () => Promise<unknown>;
   onNotice: (text: string, action?: { label: string; run: () => void }) => void;
 }) {
@@ -98,10 +96,6 @@ export default function ApplicationMediaManager({
   }, [error, load, onNotice]);
 
   React.useEffect(() => {
-    if (connected && storageStatus === "full") setExpanded(true);
-  }, [connected, storageStatus]);
-
-  React.useEffect(() => {
     if (connected) return;
     sequence.current += 1;
     loadingRef.current = false;
@@ -153,7 +147,7 @@ export default function ApplicationMediaManager({
     </button>
     {expanded && <div className="storage-manager-panel" aria-busy={loading || undefined}>
       <p className="storage-manager-help">
-        删除会移除媒体并释放空间，引用它的画布也将无法再使用；此操作无法撤销。取消收藏不会释放空间。此处仅管理 Canvas 媒体，其他应用的媒体请在对应应用中清理。
+		会员期间创建的媒体长期保留；普通媒体会按到期日清理。收录到资产库不会延长保留期限。删除会移除媒体并释放空间，引用它的画布也将无法再使用；此操作无法撤销。此处仅管理 Canvas 媒体，其他应用的媒体请在对应应用中清理。
       </p>
       {assets.length > 0 && <div className="storage-manager-list" aria-label="Canvas 生成媒体">
         {assets.map(asset => {
@@ -162,7 +156,7 @@ export default function ApplicationMediaManager({
             <span className="storage-manager-kind"><MediaKindIcon type={asset.type} /></span>
             <span className="storage-manager-item-info">
               <strong title={name}>{name}</strong>
-              <span>{mediaLabels[asset.type] || "媒体"} · {formatBytes(asset.size_bytes)}</span>
+              <span>{mediaLabels[asset.type] || "媒体"} · {formatBytes(asset.size_bytes)} · {asset.expires_at ? `保留至 ${new Date(asset.expires_at).toLocaleDateString()}` : "长期保留"}</span>
             </span>
             {confirmId === asset.id ? (
               <span className="storage-manager-confirm">

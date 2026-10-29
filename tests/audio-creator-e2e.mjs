@@ -43,7 +43,7 @@ try {
     // Keep this fixture below body-portaled popovers, like the real canvas.
     Object.assign(host.style, { position: "fixed", inset: "40px", zIndex: "10", background: "#111", containerType: "inline-size", containerName: "canvas-editor" });
     document.body.append(host);
-    const state = window.audioCreatorHarness = { lyricCalls: 0, saveCalls: 0, referenceCalls: 0, cancelCalls: 0, stoppedTracks: 0, nodes: {}, lyricResolve: null, lyricReject: null, saveResolve: null, saveReject: null, referenceResolve: null, referenceReject: null };
+    const state = window.audioCreatorHarness = { lyricCalls: 0, saveCalls: 0, referenceCalls: 0, cancelCalls: 0, closeCalls: 0, stoppedTracks: 0, notices: [], nodes: {}, lyricResolve: null, lyricReject: null, saveResolve: null, saveReject: null, referenceResolve: null, referenceReject: null };
     const defaultNode = { id: "voice-a", type: "prompt", title: "声音", text: "温柔低沉的青年声音", mediaType: "audio", audioMode: "voice_design", voicePreviewText: "你好，欢迎来到音乐创作。", voiceId: "voice-result-only-once" };
     const models = [
       { id: "voice-default", name: "音色模型", type: "audio", is_default: true, supported_operations: ["generation"], supported_input_modes: ["text"], supported_parameters: { prompt: {}, preview_text: {} } },
@@ -65,7 +65,7 @@ try {
       return React.createElement(CreatorPanel, {
         node, models, textReferences: [], references: [], referenceCandidates: [], mentionCandidates: [], referenceNaming: "name", onFocusHandled() {}, sources: [], inputChanged: true,
         style: { left: 0, top: 0 }, active: false, connecting: false, connectionError: "", needsLogin: false, connectionActionLabel: "刷新", modelPlaceholder: "选择模型",
-        onChange: patch => setNode(current => ({ ...current, ...patch })), onGenerate() {}, onCancel() { state.cancelCalls++; }, onRefresh() {}, onLocate() {}, onDisconnect() {}, onAddReference() {}, onPickCanvasReference() {}, onPickCanvasTextReference() {}, onUploadReference() {}, onDrawReference() {}, onClose() {},
+        onChange: patch => setNode(current => ({ ...current, ...patch })), onGenerate() {}, onCancel() { state.cancelCalls++; }, onRefresh() {}, onLocate() {}, onDisconnect() {}, onAddReference() {}, onPickCanvasReference() {}, onPickCanvasTextReference() {}, onUploadReference() {}, onDrawReference() {}, onClose() { state.closeCalls++; }, onNotice: message => state.notices.push(message),
         audioReferenceCandidates: [{ id: "reference-node", type: "audio", title: "参考音乐", text: "", audio: "https://fixture.invalid/audio.mp3" }, { id: "asset-reference", type: "audio", title: "可恢复音频资产", text: "", assetId: "stable-audio-asset" }],
         onGenerateLyrics: () => { state.lyricCalls++; return new Promise((resolve, reject) => { state.lyricResolve = resolve; state.lyricReject = reject; }); },
         onSaveRecording: () => { state.saveCalls++; return new Promise((resolve, reject) => { state.saveResolve = resolve; state.saveReject = reject; }); },
@@ -77,10 +77,8 @@ try {
 
   const panel = page.locator(".context-creator");
   await panel.waitFor();
-  assert.equal(await panel.locator(".context-voice-result code").count(), 1, "the voice ID appears once");
-  assert.equal(await panel.locator(".context-voice-result code").innerText(), "voice-result-only-once");
-  await panel.getByRole("button", { name: "复制音色 ID", exact: true }).click();
-  await panel.getByRole("alert").filter({ hasText: "复制失败" }).waitFor();
+  assert.equal(await panel.locator(".context-voice-result").count(), 0, "voice results are not embedded in the editor");
+  assert.equal(await panel.getByRole("button", { name: "复制音色 ID", exact: true }).count(), 0, "voice ID actions stay outside the editor");
   const voiceCompactHeight = (await panel.boundingBox()).height;
   await panel.getByRole("button", { name: "设置音色试听文本", exact: true }).click();
   await page.getByRole("dialog", { name: "音色试听文本", exact: true }).waitFor();
@@ -132,7 +130,7 @@ try {
   assert.equal(await panel.getByRole("tab", { name: "录音", exact: true }).isDisabled(), true, "a pending lyrics operation locks mode switching");
   assert.equal(await page.getByLabel("歌词内容", { exact: true }).isDisabled(), true);
   await page.evaluate(() => window.audioCreatorHarness.lyricReject(new Error("歌词暂不可用")));
-  await page.getByRole("alert").filter({ hasText: "歌词暂不可用" }).waitFor();
+  assert.equal(await page.evaluate(() => window.audioCreatorHarness.notices.some(message => message.includes("歌词暂不可用"))), true, "lyrics failures use the creator notice callback");
   await page.getByRole("button", { name: "AI 生成歌词", exact: true }).click();
   await page.evaluate(() => window.audioCreatorHarness.lyricResolve("[Verse]\n月光洒在琴键上"));
   await page.getByRole("status").filter({ hasText: "歌词已生成" }).waitFor();
@@ -171,28 +169,49 @@ try {
   await page.evaluate(() => window.audioCreatorHarness.previousLyricResolve("离开之前的延迟歌词"));
   await page.waitForTimeout(60);
   assert.equal(await page.getByLabel("歌词内容", { exact: true }).inputValue(), "返回节点的新歌词", "returning to the same node must not reactivate an abandoned response");
+  await page.evaluate(() => { window.audioCreatorHarness.notices = []; });
   await panel.getByRole("button", { name: "添加参考音频", exact: true }).click();
   await page.getByLabel("选择画布中的参考音频", { exact: true }).selectOption("reference-node");
   await page.evaluate(() => window.audioCreatorHarness.setNode({ id: "music-c", text: "安静的钢琴曲" }));
   await page.evaluate(() => window.audioCreatorHarness.referenceReject(new Error("旧参考选择失败")));
   await page.waitForTimeout(60);
-  assert.equal(await panel.getByRole("alert").filter({ hasText: "旧参考选择失败" }).count(), 0);
+  assert.equal(await page.evaluate(() => window.audioCreatorHarness.notices.some(message => message.includes("旧参考选择失败"))), false, "a stale reference failure is not announced for another node");
 
   await panel.getByRole("tab", { name: "录音", exact: true }).click();
+  assert.equal(await panel.locator(".audio-recorder-clock, .audio-recorder-progress").count(), 0, "idle recording hides empty timeline chrome");
   await panel.getByRole("button", { name: "开始录音", exact: true }).click();
+  assert.equal(await panel.getByRole("tab", { name: "音乐生成", exact: true }).isDisabled(), true, "audio modes stay locked while a microphone capture is active");
+  let discardPrompt = "";
+  page.once("dialog", async dialog => { discardPrompt = dialog.message(); await dialog.dismiss(); });
+  await panel.getByRole("button", { name: "关闭录音创作", exact: true }).click();
+  assert.match(discardPrompt, /录音尚未保存/);
+  assert.equal(await page.evaluate(() => window.audioCreatorHarness.closeCalls), 0, "dismissing the discard warning keeps the active recording open");
+  assert.equal(await panel.getByRole("button", { name: "停止录音", exact: true }).count(), 1, "the capture remains available after dismissing close");
   await panel.getByRole("button", { name: "停止录音", exact: true }).click();
   await panel.getByRole("button", { name: "确认使用", exact: true }).waitFor();
   assert.equal(await panel.locator(".audio-recorder-clock, .audio-recorder-progress, .audio-recorder-message").count(), 0, "ready state keeps only one playback timeline and removes recording-only status details");
   assert.equal(await panel.getByRole("heading", { name: "试听录音", exact: true }).count(), 1);
+  if (process.env.CANVAS_AUDIO_CREATOR_SCREENSHOT) await page.screenshot({ path: process.env.CANVAS_AUDIO_CREATOR_SCREENSHOT.replace(/\.png$/i, "-recording-preview.png") });
   await page.evaluate(() => { const button = document.querySelector(".audio-recorder-button.is-primary"); button.click(); button.click(); });
   assert.equal(await page.evaluate(() => window.audioCreatorHarness.saveCalls), 1, "rapid confirmation shares one save");
+  await page.setViewportSize({ width: 360, height: 520 });
   await page.evaluate(() => window.audioCreatorHarness.saveReject(new Error("本机保存失败")));
-  await panel.getByRole("alert").filter({ hasText: "本机保存失败" }).waitFor();
+  await panel.locator(".context-recording-error").waitFor();
+  assert.equal(await panel.locator(".context-recording-error").innerText(), "录音仍保留，可重新确认使用。", "the recording panel keeps only a neutral retry state");
+  assert.equal(await page.evaluate(() => window.audioCreatorHarness.notices.includes("本机保存失败")), true, "the global notice carries the save failure detail");
   assert.equal(await panel.locator(".audio-recorder-preview").count(), 1, "save failure retains the recording for retry");
+  assert.equal(await panel.locator(".context-recording-content").evaluate(element => element.scrollWidth <= element.clientWidth), true, "the save failure and retry remain inside the narrow panel");
+  if (process.env.CANVAS_AUDIO_CREATOR_SCREENSHOT) await page.screenshot({ path: process.env.CANVAS_AUDIO_CREATOR_SCREENSHOT.replace(/\.png$/i, "-recording-error-narrow.png") });
   await panel.getByRole("button", { name: "确认使用", exact: true }).click();
   await page.evaluate(() => window.audioCreatorHarness.saveResolve());
   await panel.getByRole("status").filter({ hasText: "录音已保存到画布" }).waitFor();
-  await panel.getByRole("button", { name: "再录一段", exact: true }).click();
+  assert.equal(await panel.locator(".context-recording-saved").evaluate(element => element.scrollWidth <= element.clientWidth), true, "the saved message and replacement action fit on a narrow screen");
+  if (process.env.CANVAS_AUDIO_CREATOR_SCREENSHOT) await page.screenshot({ path: process.env.CANVAS_AUDIO_CREATOR_SCREENSHOT.replace(/\.png$/i, "-recording-saved-narrow.png") });
+  assert.equal(await panel.locator(".audio-recorder").count(), 0, "the canvas node becomes the sole playback surface after saving");
+  assert.equal(await panel.getByRole("button", { name: "确认使用", exact: true }).count(), 0, "a saved recording no longer shows a stale confirmation action");
+  assert.equal(await panel.getByRole("button", { name: "重新录制并替换当前节点音频", exact: true }).count(), 1, "the saved state has one clear replacement action");
+  await page.setViewportSize({ width: 1100, height: 800 });
+  await panel.getByRole("button", { name: "重新录制并替换当前节点音频", exact: true }).click();
   await panel.getByRole("button", { name: "开始录音", exact: true }).waitFor();
   assert.equal(await panel.locator(".audio-recorder-preview").count(), 0);
   await panel.getByRole("button", { name: "开始录音", exact: true }).click();
@@ -202,12 +221,17 @@ try {
   await panel.getByRole("button", { name: "开始录音", exact: true }).waitFor();
   assert.equal(await page.evaluate(() => window.audioCreatorHarness.stoppedTracks), stoppedBeforeSwitch + 1, "switching recording nodes releases the prior microphone");
   assert.equal(await panel.locator(".audio-recorder-preview").count(), 0, "another node never reuses the prior recording preview");
+  await page.evaluate(() => Object.defineProperty(navigator.mediaDevices, "getUserMedia", { configurable: true, value: async () => { throw Object.assign(new Error("MIC_RAW_FIXTURE"), { name: "NotAllowedError" }); } }));
+  await panel.getByRole("button", { name: "开始录音", exact: true }).click();
+  await panel.getByText("录音暂不可用，请重试。", { exact: true }).waitFor();
+  assert.doesNotMatch(await panel.locator(".audio-recorder-message").innerText(), /MIC_RAW_FIXTURE/, "microphone diagnostics never render inside the recording panel");
+  assert.equal(await page.evaluate(() => window.audioCreatorHarness.notices.some(message => message.includes("麦克风权限"))), true, "microphone failures use the global notice");
   assert.deepEqual(errors, [], "audio interactions must not raise unhandled browser errors");
-  console.log("PASS audio creator covers lyrics retry, stale responses, voice ID copy failure, recording retry, duplicate-save protection and cross-node microphone cleanup");
+  console.log("PASS audio creator keeps generated voice results on the canvas and covers lyrics retry, recording retry, duplicate-save protection and cross-node microphone cleanup");
 } catch (error) {
   if (page) console.log(await page.evaluate(() => {
-    const button = document.querySelector('[aria-label="复制音色 ID"]');
-    const rect = button?.getBoundingClientRect();
+    const panel = document.querySelector('.context-creator');
+    const rect = panel?.getBoundingClientRect();
     return { rect: rect?.toJSON(), body: document.body.outerHTML.slice(0, 500), hit: rect ? document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)?.outerHTML.slice(0, 500) : null };
   }));
   throw error;

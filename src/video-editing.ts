@@ -6,8 +6,13 @@ export type VideoEditOptions = {
   startTime: number;
   endTime: number;
   outputFormat?: VideoOutputFormat;
-  aspectRatio?: "original" | "16:9" | "9:16" | "1:1";
-  maxWidth?: 480 | 720 | 1080;
+  aspectRatio?: "original" | "16:9" | "9:16" | "1:1" | "4:3" | "3:4" | "21:9" | "2:3";
+  cropLeft?: number;
+  cropRight?: number;
+  cropTop?: number;
+  cropBottom?: number;
+  maxWidth?: 360 | 480 | 540 | 720 | 1080;
+  frameRate?: 15 | 24 | 30;
   quality?: "standard" | "high";
   grade?: "natural" | "warm" | "cool" | "cinematic" | "mono";
   rotation?: 0 | 90 | 180 | 270;
@@ -18,7 +23,36 @@ export type VideoEditOptions = {
   watermarkPosition?: "top-left" | "top-right" | "bottom-left" | "bottom-right";
   watermarkOpacity?: number;
 };
-type VideoCaptureElement = HTMLVideoElement & { captureStream: () => MediaStream };
+
+/** Keep a processed result's source and the exact scalar controls needed to identify the edit. */
+export function videoEditOperationParams(
+  sourceNodeId: string,
+  options: VideoEditOptions,
+  mimeType: string,
+  size: number,
+): Record<string, string | number | boolean> {
+  const params: Record<string, string | number | boolean> = {
+    sourceNodeId,
+    startTime: options.startTime,
+    endTime: options.endTime,
+    mimeType,
+    size,
+  };
+  for (const [key, value] of Object.entries(options)) {
+    if (key === "operation" || key in params || !["string", "number", "boolean"].includes(typeof value)) continue;
+    if (typeof value === "number" && !Number.isFinite(value)) continue;
+    params[key] = value as string | number | boolean;
+  }
+  return params;
+}
+
+/** Playback-rate edits alter the encoded clip length; the other operations preserve their selected range. */
+export function videoEditOutputDuration(options: VideoEditOptions): number {
+  const rate = options.operation === "speed" ? options.playbackRate || 1 : 1;
+  return Math.max(0.25, (options.endTime - options.startTime) / rate);
+}
+
+type VideoCaptureElement = HTMLVideoElement & { captureStream: (frameRate?: number) => MediaStream };
 
 const WEBM_TYPES = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
 const MP4_TYPES = ["video/mp4;codecs=avc1.42E01E,mp4a.40.2", "video/mp4;codecs=avc1,mp4a", "video/mp4"];
@@ -138,6 +172,79 @@ export function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Pro
   });
 }
 
+type AudioTrackExtractor = (video: HTMLVideoElement, range: { start: number; end: number }, signal?: AbortSignal, maxOutputBytes?: number, onProgress?: (progress: number) => void) => Promise<Blob>;
+
+/** Extracts encoded audio packets without playing every video frame in real time. */
+export const extractAudioTrack: AudioTrackExtractor = async (video, range, signal, maxOutputBytes = Number.POSITIVE_INFINITY, onProgress = () => {}) => {
+  const { Input, Output, Conversion, BufferTarget, UrlSource, BlobSource, MP4, QTFF, WEBM, MATROSKA, OGG, WebMOutputFormat, Mp4OutputFormat } = await raceWithAbort(import("mediabunny"), signal);
+  const sourceUrl = video.currentSrc || video.src;
+  if (!sourceUrl) throw new Error("视频地址不可用，无法快速提取音轨。");
+
+  let source: InstanceType<typeof UrlSource> | InstanceType<typeof BlobSource>;
+  if (/^https?:/i.test(sourceUrl)) {
+    source = new UrlSource(sourceUrl, {
+      maxCacheSize: 16 * 1024 * 1024,
+      parallelism: 4,
+      requestInit: { credentials: "omit", referrerPolicy: "no-referrer" },
+      // Do not let a stalled signed URL spend minutes retrying before we can fall back to the playing element.
+      getRetryDelay: () => null,
+    });
+  } else {
+    const response = await raceWithAbort(fetch(sourceUrl, { signal, credentials: "omit", referrerPolicy: "no-referrer" }), signal);
+    if (!response.ok) throw new Error(`读取视频失败（HTTP ${response.status}）。`);
+    source = new BlobSource(await raceWithAbort(response.blob(), signal));
+  }
+
+  const input = new Input({ source, formats: [MP4, QTFF, WEBM, MATROSKA, OGG] });
+  let output: InstanceType<typeof Output> | undefined;
+  let conversion: Awaited<ReturnType<typeof Conversion.init>> | undefined;
+  let completed = false;
+  const abort = () => {
+    input.dispose();
+    void conversion?.cancel().catch(() => {});
+    void output?.cancel().catch(() => {});
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    signal?.throwIfAborted();
+    const audioTrack = await raceWithAbort(input.getPrimaryAudioTrack(), signal);
+    if (!audioTrack) throw new Error("此视频没有可提取的音轨。");
+    const codec = await raceWithAbort(audioTrack.getCodec(), signal);
+    const target = new BufferTarget({
+      onFinalize: buffer => {
+        if (buffer.byteLength > maxOutputBytes) throw new Error("提取音频超过本机缓存上限 50 MiB，已停止。请使用其他音频提取工具。");
+      },
+    });
+    // AAC is common in MP4/MOV videos. Keeping it in an MP4 audio container
+    // allows packet copying even on browsers without a WebCodecs AAC decoder.
+    output = new Output({ format: codec === "aac" ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
+    conversion = await raceWithAbort(Conversion.init({
+      input,
+      output,
+      tracks: "primary",
+      audio: {},
+      video: { discard: true },
+      trim: { start: range.start, end: range.end },
+      copy: { mode: "preferred" },
+    }), signal);
+    if (!conversion.isValid) throw new Error("当前视频音频编码无法直接转换，请重试或使用其他音频提取工具。");
+    conversion.onProgress = (progress: number) => onProgress(Math.max(0, Math.min(100, progress * 100)));
+    await raceWithAbort(conversion.execute(), signal);
+    signal?.throwIfAborted();
+    const buffer = target.buffer;
+    if (!buffer?.byteLength) throw new Error("视频处理没有生成音频结果。");
+    if (buffer.byteLength > maxOutputBytes) throw new Error("提取音频超过本机缓存上限 50 MiB，已停止。请使用其他音频提取工具。");
+    onProgress(100);
+    const mimeType = await output.getMimeType();
+    completed = true;
+    return new Blob([buffer], { type: mimeType || "audio/webm" });
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    input.dispose();
+    if (!completed && output && output.state !== "finalized") await output.cancel().catch(() => {});
+  }
+};
+
 function seekVideo(video: HTMLVideoElement, time: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(new DOMException("视频处理已取消。", "AbortError"));
   if (Math.abs(video.currentTime - time) < 0.02 && !video.seeking) return Promise.resolve();
@@ -160,7 +267,20 @@ function seekVideo(video: HTMLVideoElement, time: number, signal?: AbortSignal):
   });
 }
 
-function cropRect(width: number, height: number, ratio?: VideoEditOptions["aspectRatio"]) {
+function cropRect(width: number, height: number, ratio?: VideoEditOptions["aspectRatio"], options?: VideoEditOptions) {
+  const marginValues = [options?.cropLeft, options?.cropRight, options?.cropTop, options?.cropBottom];
+  const hasCustomMargins = marginValues.some(value => typeof value === "number" && Number.isFinite(value));
+  if (hasCustomMargins) {
+    const left = Math.max(0, Math.min(94, Number(options?.cropLeft) || 0));
+    const right = Math.max(0, Math.min(94, Number(options?.cropRight) || 0));
+    const top = Math.max(0, Math.min(94, Number(options?.cropTop) || 0));
+    const bottom = Math.max(0, Math.min(94, Number(options?.cropBottom) || 0));
+    const horizontal = left + right > 94 ? 94 / Math.max(left + right, 1) : 1;
+    const vertical = top + bottom > 94 ? 94 / Math.max(top + bottom, 1) : 1;
+    const safeLeft = left * horizontal, safeRight = right * horizontal;
+    const safeTop = top * vertical, safeBottom = bottom * vertical;
+    return { x: width * safeLeft / 100, y: height * safeTop / 100, width: width * (100 - safeLeft - safeRight) / 100, height: height * (100 - safeTop - safeBottom) / 100 };
+  }
   if (!ratio || ratio === "original") return { x: 0, y: 0, width, height };
   const [rw, rh] = ratio.split(":").map(Number);
   const targetRatio = rw / rh;
@@ -180,20 +300,33 @@ export async function exportVideoEdit(
   onProgress: (progress: number) => void = () => {},
   signal?: AbortSignal,
   maxOutputBytes = Number.POSITIVE_INFINITY,
+  onStatus: (status: string) => void = () => {},
 ): Promise<Blob> {
   if (!video.isConnected || video.readyState < 2 || video.seeking || video.videoWidth <= 0 || video.videoHeight <= 0) throw new Error("请先等待视频加载完成并停止缓冲。");
+  const audioOnly = options.operation === "extract-audio";
+  const range = videoEditRange(video.duration, options.startTime, options.endTime,
+    options.operation === "extract-video" || audioOnly ? Number.POSITIVE_INFINITY : MAX_VIDEO_EDIT_DURATION_SECONDS);
+  if (audioOnly) {
+    onStatus("正在快速提取音轨…");
+    try {
+      return await extractAudioTrack(video, range, signal, maxOutputBytes, onProgress);
+    } catch (error) {
+      if (signal?.aborted || error instanceof DOMException && error.name === "AbortError" || error instanceof Error && /超过本机缓存上限|没有可提取的音轨/.test(error.message)) throw error;
+      onStatus("无法直接拆分此视频，正在切换为实时录制…");
+    }
+  }
   const captureElement = video as VideoCaptureElement;
   if (typeof captureElement.captureStream !== "function") throw new Error("当前浏览器无法录制播放中的视频，请使用 Chrome 或 Edge 桌面版。");
   if (typeof MediaRecorder === "undefined") throw new Error("当前浏览器不支持本地视频导出。");
-  const range = videoEditRange(video.duration, options.startTime, options.endTime,
-    options.operation === "extract-video" || options.operation === "extract-audio" ? Number.POSITIVE_INFINITY : MAX_VIDEO_EDIT_DURATION_SECONDS);
   if (options.operation === "watermark" && !options.watermarkText?.trim()) throw new Error("请输入水印文字。");
   const type = recorderMimeType(options.operation, value => MediaRecorder.isTypeSupported(value), options.outputFormat);
-  const audioOnly = options.operation === "extract-audio";
   const rotation = options.operation === "rotate" ? options.rotation || 90 : 0;
   const transformed = videoTransformDimensions(video.videoWidth, video.videoHeight, rotation);
   const maxWidth = options.operation === "compress" ? options.maxWidth || 720 : transformed.width;
-  const size = videoCanvasSize(transformed.width, transformed.height, maxWidth, options.operation === "crop" ? options.aspectRatio : "original");
+  const cropSource = options.operation === "crop" ? cropRect(video.videoWidth, video.videoHeight, options.aspectRatio, options) : cropRect(video.videoWidth, video.videoHeight, "original");
+  const size = options.operation === "crop"
+    ? videoCanvasSize(cropSource.width, cropSource.height, transformed.width, "original")
+    : videoCanvasSize(transformed.width, transformed.height, maxWidth, "original");
   const previousTime = video.currentTime;
   const previousPaused = video.paused;
   const previousMuted = video.muted;
@@ -231,6 +364,7 @@ export async function exportVideoEdit(
     // policies also allow the recording stream to carry its audio track.
     if (options.operation !== "mute" && options.operation !== "extract-audio") video.muted = false;
     const playing = video.play();
+    const captureFrameRate = options.operation === "compress" ? options.frameRate || 30 : 30;
     const capturedStream = captureElement.captureStream();
     sourceStream = capturedStream;
     let outputCanvas: HTMLCanvasElement | undefined;
@@ -239,7 +373,7 @@ export async function exportVideoEdit(
       outputCanvas.width = size.width; outputCanvas.height = size.height;
       const context = outputCanvas.getContext("2d", { alpha: false });
       if (!context) throw new Error("当前浏览器不支持视频画布处理。");
-      canvasStream = outputCanvas.captureStream(30);
+      canvasStream = outputCanvas.captureStream(captureFrameRate);
     }
     await raceWithAbort(Promise.all([seeking, playing]), signal);
     if (cancelled) throw abortError();
@@ -255,7 +389,9 @@ export async function exportVideoEdit(
       recorder!.ondataavailable = event => {
         if (!event.data.size || processingError) return;
         if (recordedBytes + event.data.size > maxOutputBytes) {
-          processingError = new Error("提取音频超过本机缓存上限 50 MiB，已提前停止。请使用更短的视频或其他音频提取工具。");
+          processingError = audioOnly
+            ? new Error("提取音频超过本机缓存上限 50 MiB，已提前停止。请使用更短的视频或其他音频提取工具。")
+            : new Error(`视频处理结果超过素材库的单文件上限 ${Math.floor(maxOutputBytes / (1024 * 1024))} MiB，已提前停止。请缩短片段或降低分辨率后重试。`);
           video.pause();
           cancelAnimationFrame(animation);
           if (recorder?.state === "recording") recorder.stop();
@@ -271,7 +407,7 @@ export async function exportVideoEdit(
     recorder.start(500);
     if (options.operation === "speed") video.playbackRate = options.playbackRate || 1;
     const context = outputCanvas?.getContext("2d", { alpha: false });
-    const source = cropRect(video.videoWidth, video.videoHeight, options.operation === "crop" ? options.aspectRatio : "original");
+    const source = cropSource;
     if (context) context.filter = options.operation === "grade" ? gradeFilter(options.grade) : "none";
     const ended = new Promise<void>((resolve, reject) => {
       const step = () => {
@@ -287,6 +423,12 @@ export async function exportVideoEdit(
               const drawWidth = rotation === 90 || rotation === 270 ? outputCanvas!.height : outputCanvas!.width;
               const drawHeight = rotation === 90 || rotation === 270 ? outputCanvas!.width : outputCanvas!.height;
               context.drawImage(video, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+              context.restore();
+            } else if (options.operation === "crop" && options.flipHorizontal) {
+              context.save();
+              context.translate(outputCanvas!.width, 0);
+              context.scale(-1, 1);
+              context.drawImage(video, source.x, source.y, source.width, source.height, 0, 0, outputCanvas!.width, outputCanvas!.height);
               context.restore();
             } else {
               context.drawImage(video, source.x, source.y, source.width, source.height, 0, 0, outputCanvas!.width, outputCanvas!.height);

@@ -50,6 +50,10 @@ test("Canvas rejects the Admin server runtime Gateway path", async () => {
 test("Canvas rejects Admin, Portal and legacy bridge/runtime URLs before fetch", () => {
   setCanvasGatewayURL(gateway);
   for (const value of [
+    "/auth/status",
+    "/__platform/auth/status",
+    "https://api.example.test/auth/status",
+    "https://api.example.test/__platform/auth/status",
     "https://api.example.test/api/app-runtime/v1/session",
     "https://api.example.test/bridge",
     "https://www.platform.example/api/portal/user/apps",

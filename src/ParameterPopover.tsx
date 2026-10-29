@@ -1,6 +1,7 @@
 import React from "react";
 import { createPortal } from "react-dom";
 import { isComposingKey } from "./keyboard";
+import { applyPopoverPosition, observePopoverPosition, visiblePopoverBounds } from "./popover-position";
 
 export default function ParameterPopover({ anchor, id, label, onClose, children }: {
   anchor: React.RefObject<HTMLButtonElement>;
@@ -18,60 +19,43 @@ export default function ParameterPopover({ anchor, id, label, onClose, children 
     const button = anchor.current;
     if (!element || !button) return;
     const place = () => {
-      const viewport = window.visualViewport;
-      const left = (viewport?.offsetLeft || 0) + 10;
-      const top = (viewport?.offsetTop || 0) + 10;
-      const width = (viewport?.width || window.innerWidth) - 20;
-      const height = (viewport?.height || window.innerHeight) - 20;
-      element.style.width = `${Math.min(344, width)}px`;
+      const bounds = visiblePopoverBounds();
+      const contentWidth = Math.max(1, bounds.width - 20);
+      const contentHeight = Math.max(1, bounds.height - 20);
+      element.style.removeProperty("max-height");
+      element.style.removeProperty("max-width");
+      element.style.overflowY = "";
       element.classList.remove("is-compact");
-      // A short landscape viewport uses columns, with no internal scroll area.
-      if (element.offsetHeight > height) {
+      element.style.width = `${Math.min(344, contentWidth)}px`;
+      // A short landscape viewport uses columns before the shared geometry
+      // limits the final height and makes any remaining content scrollable.
+      if (element.offsetHeight > contentHeight) {
         element.classList.add("is-compact");
-        element.style.width = `${Math.min(620, width)}px`;
+        element.style.width = `${Math.min(620, contentWidth)}px`;
       }
-      const rect = button.getBoundingClientRect();
-      const x = Math.max(left, Math.min(rect.left, left + width - element.offsetWidth));
-      const above = rect.top - element.offsetHeight - 8;
-      const below = rect.bottom + 8;
-      const y = above >= top ? above
-        : below + element.offsetHeight <= top + height ? below
-        : Math.max(top, top + height - element.offsetHeight);
-      element.style.left = `${x}px`;
-      element.style.top = `${y}px`;
+      applyPopoverPosition({
+        panel: element,
+        anchor: button,
+        bounds,
+        preferredPlacement: "above",
+        align: "start",
+        gap: 8,
+        edgePadding: 10,
+      });
       element.style.visibility = "visible";
     };
     place();
-    const observer = new ResizeObserver(place);
-    observer.observe(element);
-    let frame = 0;
-    let previousRect = "";
-    const track = () => {
-      const rect = button.getBoundingClientRect();
-      const signature = [rect.x, rect.y, rect.width, rect.height].join(":");
-      if (signature !== previousRect) { previousRect = signature; place(); }
-      frame = window.requestAnimationFrame(track);
-    };
-    frame = window.requestAnimationFrame(track);
+    const stopObserving = observePopoverPosition(button, element, null, place);
     const creator = button.closest(".context-creator");
     const movement = new MutationObserver(place);
     if (creator) movement.observe(creator, { attributes: true, attributeFilter: ["style", "class"] });
-    window.addEventListener("resize", place);
-    window.addEventListener("scroll", place, true);
-    window.visualViewport?.addEventListener("resize", place);
-    window.visualViewport?.addEventListener("scroll", place);
     const initialFocus = element.querySelector<HTMLElement>('[data-popover-autofocus]:not(:disabled)')
       || element.querySelector<HTMLElement>('[aria-checked="true"]:not(:disabled)')
       || element.querySelector<HTMLElement>('button:not(:disabled), select:not(:disabled), textarea:not(:disabled), input:not(:disabled):not([hidden])');
     initialFocus?.focus({ preventScroll: true });
     return () => {
-      observer.disconnect();
-      window.cancelAnimationFrame(frame);
+      stopObserving();
       movement.disconnect();
-      window.removeEventListener("resize", place);
-      window.removeEventListener("scroll", place, true);
-      window.visualViewport?.removeEventListener("resize", place);
-      window.visualViewport?.removeEventListener("scroll", place);
     };
   }, [anchor]);
 

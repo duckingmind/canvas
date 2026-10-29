@@ -16,11 +16,26 @@ function storageKey(identity: string): string {
   return `${GATEWAY_SESSION_STORAGE_PREFIX}${encodeURIComponent(identity)}`;
 }
 
+function isCanonicalGatewayURL(value: string): boolean {
+  if (value === "/v1") return true;
+  try {
+    if (!value || value !== value.trim() || value.endsWith("/")) return false;
+    const parsed = new URL(value);
+    const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+    const loopback = hostname === "localhost" || hostname === "::1" || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+    return parsed.pathname === "/v1" && !parsed.username && !parsed.password && !parsed.search && !parsed.hash
+      && !/(?:^|[.-])(?:admin|admin-api|admin-go|codex-admin-api|portal|www)(?:[.-]|$)/i.test(hostname)
+      && (parsed.protocol === "https:" || loopback);
+  } catch {
+    return false;
+  }
+}
+
 function isSession(value: unknown): value is AppSession {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as SessionRecord;
   if (typeof record.access_token !== "string" || !record.access_token.startsWith("ast_")) return false;
-  if (typeof record.gateway_url !== "string" || !record.gateway_url.trim()) return false;
+  if (typeof record.gateway_url !== "string" || !isCanonicalGatewayURL(record.gateway_url)) return false;
   if (typeof record.app_id !== "string" || !record.app_id.trim()) return false;
   if (typeof record.app_version !== "string" || !record.app_version.trim()) return false;
   if (typeof record.expires_in !== "number" || !Number.isFinite(record.expires_in) || record.expires_in <= 0) return false;

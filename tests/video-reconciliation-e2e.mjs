@@ -94,6 +94,13 @@ try {
     }
     return route.continue();
   });
+  await page.route("**/v1/voice-design/models", route => route.fulfill({ json: { data: [{
+    id: "fixture-voice-design", name: "fixture-voice-design", type: "audio",
+    supported_parameters: { prompt: { type: "string" }, preview_text: { type: "string" } },
+  }] } }));
+  await page.route("**/v1/music/models", route => route.fulfill({ json: { data: [{
+    id: "fixture-music", name: "fixture-music", type: "audio", supported_input_modes: ["text"],
+  }] } }));
   await page.route("**/v1/estimates", route => route.fulfill({ json: { known: false, amount: null, currency: "USD" } }));
   await page.route("**/v1/videos/**", async route => {
     const url = new URL(route.request().url());

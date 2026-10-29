@@ -1,6 +1,6 @@
 import React from "react";
 import { createPortal } from "react-dom";
-import { Check, Folder, LoaderCircle, LockKeyhole, Plus, Tag, X } from "lucide-react";
+import { Check, LoaderCircle, LockKeyhole, Plus, Tag, X } from "lucide-react";
 import { AssetKindIcon, type AssetPreview } from "./AssetLibraryPanel";
 import CanvasMediaPlayer from "./CanvasMediaPlayer";
 import { categoryLabels, kindLabels, normalizeAssetTags, type AssetCategory, type CanvasAsset } from "./asset-library";
@@ -14,7 +14,6 @@ export type AssetSaveModalProps = {
   error?: string;
   preview?: AssetPreview;
   knownTags?: string[];
-  knownFolders?: string[];
   onNotice?: (text: string, action?: { label: string; run: () => void }) => void;
   onSave: (asset: CanvasAsset) => void;
   onClose: () => void;
@@ -23,23 +22,25 @@ export type AssetSaveModalProps = {
 const categories: AssetCategory[] = ["person", "scene", "object", "style", "sound", "other", "prompt"];
 
 /** Keep the editable draft mounted until the parent confirms the save. */
-export default function AssetSaveModal({ value, editing = false, busy, error, preview, knownTags = [], knownFolders = [], onNotice, onSave, onClose }: AssetSaveModalProps) {
+export default function AssetSaveModal({ value, editing = false, busy, error, preview, knownTags = [], onNotice, onSave, onClose }: AssetSaveModalProps) {
   const dialog = React.useRef<HTMLDialogElement>(null);
   const nameInput = React.useRef<HTMLInputElement>(null);
   const [name, setName] = React.useState(value.name);
-  const [folder, setFolder] = React.useState(value.folder || "");
   const [category, setCategory] = React.useState<AssetCategory>(value.kind !== "prompt" && value.category === "prompt" ? "other" : value.category);
   const [tags, setTags] = React.useState(value.tags);
   const [tagInput, setTagInput] = React.useState("");
   const [validationError, setValidationError] = React.useState("");
   const [previewFailed, setPreviewFailed] = React.useState(false);
   const id = React.useId();
-  const titleId = `${id}-title`, nameId = `${id}-name`, folderId = `${id}-folder`, tagId = `${id}-tag`, errorId = `${id}-error`;
+  const titleId = `${id}-title`, nameId = `${id}-name`, tagId = `${id}-tag`;
   const tagSuggestions = [...new Set(knownTags)].filter(tag => !tags.some(selected => selected.toLocaleLowerCase() === tag.toLocaleLowerCase()) && Array.from(tag).length <= 40 && !/^(app|type|source):/i.test(tag) && tag.toLocaleLowerCase().includes(tagInput.trim().toLocaleLowerCase())).slice(0, 10);
-  const folderSuggestions = [...new Set(knownFolders)].filter(Boolean).sort();
   const image = value.kind === "image" ? imagePreviewURL(preview?.url, preview?.thumbnailUrl) : value.kind === "video" ? preview?.poster : undefined;
   const promptText = value.source.type === "text" ? value.source.text : value.prompt;
   const isLocal = value.source.type === "local";
+  const reportValidationError = (message: string) => {
+    setValidationError(message);
+    onNotice?.(message);
+  };
 
   React.useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -68,7 +69,7 @@ export default function AssetSaveModal({ value, editing = false, busy, error, pr
   function withTag(input: string, current = tags): string[] | null {
     const tag = input.trim();
     try { return normalizeAssetTags(tag ? [...current, tag] : current); }
-    catch (error) { setValidationError(error instanceof Error ? error.message : "标签格式无效。"); return null; }
+    catch (error) { reportValidationError(error instanceof Error ? error.message : "标签格式无效。"); return null; }
   }
   function addTag(input: string) {
     setValidationError("");
@@ -81,21 +82,19 @@ export default function AssetSaveModal({ value, editing = false, busy, error, pr
     event.preventDefault();
     if (busy) return;
     setValidationError("");
-    if (!name.trim()) { setValidationError("请填写资产名称。"); nameInput.current?.focus(); return; }
-    if (Array.from(name.trim()).length > 100) { setValidationError("资产名称最多 100 个字符。"); nameInput.current?.focus(); return; }
-    if (Array.from(folder.trim()).length > 100) { setValidationError("文件夹名称最多 100 个字符。"); return; }
+    if (!name.trim()) { reportValidationError("请填写资产名称。"); nameInput.current?.focus(); return; }
+    if (Array.from(name.trim()).length > 100) { reportValidationError("资产名称最多 100 个字符。"); nameInput.current?.focus(); return; }
     const next = withTag(tagInput);
     if (!next) return;
     setTags(next);
     setTagInput("");
-    onSave({ ...value, name: name.trim(), folder: folder.trim(), category, tags: next });
+    onSave({ ...value, name: name.trim(), category, tags: next });
   }
 
   return createPortal(<dialog
     ref={dialog}
     className="asset-save-modal"
     aria-labelledby={titleId}
-    aria-describedby={validationError ? errorId : undefined}
     aria-busy={busy || undefined}
     data-canvas-management
     onCancel={event => { event.preventDefault(); if (!busy) onClose(); }}
@@ -118,20 +117,15 @@ export default function AssetSaveModal({ value, editing = false, busy, error, pr
             <span className="asset-save-media-kind"><AssetKindIcon kind={value.kind} size={12} />{kindLabels[value.kind]}</span>
           </div>
           <strong title={name}>{name || "未命名资产"}</strong>
-          {value.kind === "audio" && preview?.url && !previewFailed && <CanvasMediaPlayer kind="audio" src={preview.url} label="资产音频预览" preload="none" onError={() => setPreviewFailed(true)} />}
-          {preview?.availability === "local-missing" ? <p className="asset-save-preview-note">本机素材当前不可用，请在保存它的设备打开。</p>
-            : previewFailed || preview?.availability === "unavailable" ? <p className="asset-save-preview-note">{preview?.message || "预览暂不可用，仍可保存资产信息。"}</p>
+          {value.kind === "audio" && preview?.url && !previewFailed && <CanvasMediaPlayer kind="audio" src={preview.url} label="资产音频预览" preload="none" onNotice={(text, action) => onNotice?.(text, action)} onError={() => setPreviewFailed(true)} />}
+          {preview?.availability === "local-missing" ? <p className="asset-save-preview-note">本机文件，仅保存它的设备可访问。</p>
+            : previewFailed || preview?.availability === "unavailable" ? <p className="asset-save-preview-note">预览暂不可用，仍可保存资产信息。</p>
               : isLocal && <p className="asset-save-preview-note">本机素材，原文件仅保存在当前设备。</p>}
         </aside>
         <fieldset className="asset-save-fields" disabled={busy}>
           <div className="asset-save-field">
             <label htmlFor={nameId}>资产名称 <span aria-hidden="true">*</span></label>
-            <div className="asset-save-input-wrap"><input ref={nameInput} id={nameId} required maxLength={100} value={name} onChange={event => { setName(Array.from(event.target.value).slice(0, 100).join("")); setValidationError(""); }} placeholder="为资产取个名字" aria-invalid={validationError && !name.trim() ? true : undefined} aria-describedby={`${nameId}-count`} /><span id={`${nameId}-count`} aria-live="polite">{Array.from(name).length}/100</span></div>
-          </div>
-          <div className="asset-save-field">
-            <label htmlFor={folderId}>保存位置</label>
-            <div className="asset-save-input-wrap"><Folder size={15} /><input id={folderId} maxLength={100} list={`${id}-folders`} value={folder} onChange={event => { setFolder(Array.from(event.target.value).slice(0, 100).join("")); setValidationError(""); }} placeholder="默认文件夹" aria-describedby={`${folderId}-hint`} /><datalist id={`${id}-folders`}>{folderSuggestions.map(value => <option key={value} value={value} />)}</datalist></div>
-            <p className="asset-save-hint" id={`${folderId}-hint`}>选择已有文件夹，或输入新文件夹名称。</p>
+            <div className="asset-save-input-wrap"><input ref={nameInput} id={nameId} aria-required="true" maxLength={100} value={name} onChange={event => { setName(Array.from(event.target.value).slice(0, 100).join("")); setValidationError(""); }} placeholder="为资产取个名字" aria-invalid={validationError && !name.trim() ? true : undefined} aria-describedby={`${nameId}-count`} /><span id={`${nameId}-count`} aria-live="polite">{Array.from(name).length}/100</span></div>
           </div>
           <div className="asset-save-field">
             <span className="asset-save-label" id={`${id}-category`}>资产分类</span>
@@ -152,7 +146,6 @@ export default function AssetSaveModal({ value, editing = false, busy, error, pr
           </div>
         </fieldset>
       </div>
-      {validationError && <div className="asset-save-error" role="alert" id={errorId}>{validationError}</div>}
       <footer className="asset-save-footer"><span>保存后可在 Canvas 的其他画布中使用</span><div><button type="button" className="asset-save-cancel" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="asset-save-submit" disabled={busy}>{busy ? <><LoaderCircle size={14} className="spin" />保存中…</> : editing ? "保存修改" : "保存资产"}</button></div></footer>
     </form>
   </dialog>, document.body);

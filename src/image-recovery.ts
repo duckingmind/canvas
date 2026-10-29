@@ -27,10 +27,10 @@ const record = (value: unknown): RecordValue =>
 function taskImage(entry: unknown): string | undefined {
   const item = record(entry);
   const url = typeof item.url === "string" ? item.url.trim() : "";
-  if (/^(?:https?:\/\/|\/|data:image\/)/i.test(url)) return url;
-  const base64 =
-    typeof item.b64_json === "string" ? item.b64_json.trim() : "";
-  return base64 ? `data:image/png;base64,${base64}` : undefined;
+  // Recovery must use the durable Gateway/COS delivery URL. A provider's
+  // inline b64_json response is not a persisted media resource and cannot be
+  // used as a fallback after a task has been accepted.
+  return /^(?:https?:\/\/|\/)/i.test(url) ? url : undefined;
 }
 
 /**

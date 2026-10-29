@@ -84,17 +84,17 @@ test("a confirmed missing image submission may replay the frozen request", async
   ]);
 });
 
-test("saved application submissions explicitly request URLs for generation and edits", async () => {
+test("saved application submissions always request URL delivery", async () => {
   for (const responseFormat of ["url", "b64_json"] as const) {
     for (const images of [undefined, ["https://cdn.example/reference.png"]]) {
       await generateImage(async (path, init) => {
         if (images) {
           assert.equal(path, "/images/edits");
           assert.ok(init?.body instanceof FormData);
-          assert.equal(init.body.get("response_format"), responseFormat);
+          assert.equal(init.body.get("response_format"), "url");
         } else {
           assert.equal(path, "/images/generations");
-          assert.equal(JSON.parse(String(init?.body)).response_format, responseFormat);
+          assert.equal(JSON.parse(String(init?.body)).response_format, "url");
         }
         return { data: [{ url: "https://cdn.example/result.png" }] };
       }, { ...input, images, responseFormat }, undefined, {
@@ -121,24 +121,38 @@ test("frozen output formats are forwarded for both generation and edit requests"
   });
 });
 
-test("synchronous images support public URLs and base64 without polling or a hardcoded size", async () => {
-  for (const [data, expected] of [
-    [{ url: "https://cdn.example/image.png" }, "https://cdn.example/image.png"],
-    [{ b64_json: "cG5nLWJ5dGVz" }, "data:image/png;base64,cG5nLWJ5dGVz"],
-  ] as const) {
-    const calls: string[] = [];
-    const result = await generateImage(async (path, init) => {
-      calls.push(path);
-      assert.equal(init?.method, "POST");
-      assert.deepEqual(JSON.parse(String(init?.body || "{}")), {
-        ...input,
-        n: 1,
-      });
-      return { created: 1780000000, data: [data] };
-    }, input);
-    assert.deepEqual(result, { image: expected });
-    assert.deepEqual(calls, ["/images/generations"]);
-  }
+test("synchronous images require a durable URL and never accept inline Base64", async () => {
+  const calls: string[] = [];
+  const result = await generateImage(async (path, init) => {
+    calls.push(path);
+    assert.equal(init?.method, "POST");
+    assert.deepEqual(JSON.parse(String(init?.body || "{}")), {
+      ...input,
+      n: 1,
+      response_format: "url",
+    });
+    return { created: 1780000000, data: [{ url: "https://cdn.example/image.png" }] };
+  }, input);
+  assert.deepEqual(result, { image: "https://cdn.example/image.png" });
+  assert.deepEqual(calls, ["/images/generations"]);
+
+  await assert.rejects(
+    generateImage(async () => ({ created: 1780000000, data: [{ b64_json: "cG5nLWJ5dGVz" }] }), input),
+    { code: "IMAGE_RESPONSE_INVALID", terminalTask: false, pending: false },
+  );
+});
+
+test("synchronous image results reject a temporary URL before any canvas node is created", async () => {
+  await assert.rejects(
+    generateImage(async () => ({ data: [{ url: "https://cdn.example/image.png?signature=temporary" }] }), input),
+    (error) => {
+      assert.ok(error instanceof ImageGenerationError);
+      assert.equal(error.code, "IMAGE_RESULT_IDENTITY_MISSING");
+      assert.equal(error.terminalTask, true);
+      assert.equal(error.pending, false);
+      return true;
+    },
+  );
 });
 
 test("SDK media_task_timeout switches to the existing task without another generation request", async () => {
@@ -196,7 +210,7 @@ test("resume only queries the persisted ID, including the SDK-supported colon ch
       return {
         id: "image:original",
         status: "completed",
-        data: [{ b64_json: "YQ==" }],
+        data: [{ url: "https://cdn.example/original.png" }],
       };
     },
     { model: "", prompt: "", taskId: "image:original" },
@@ -702,8 +716,8 @@ test("an uncertain submission can be recovered with the same persisted idempoten
   const result = await generateImage(request, snapshot);
   assert.equal(result.image, "https://cdn.example/original-task-result.png");
   assert.deepEqual(submissions, [
-    { key: snapshot.idempotencyKey, body: JSON.stringify({ ...input, n: 1 }) },
-    { key: snapshot.idempotencyKey, body: JSON.stringify({ ...input, n: 1 }) },
+    { key: snapshot.idempotencyKey, body: JSON.stringify({ ...input, n: 1, response_format: "url" }) },
+    { key: snapshot.idempotencyKey, body: JSON.stringify({ ...input, n: 1, response_format: "url" }) },
   ]);
 });
 
@@ -713,7 +727,7 @@ test("multipart submissions forward a persisted idempotency key without overridi
       assert.equal(path, "/images/edits");
       assert.deepEqual(init?.headers, { "Idempotency-Key": "edit-submission" });
       assert.ok(init?.body instanceof FormData);
-      return { data: [{ b64_json: "YQ==" }] };
+      return { data: [{ url: "https://cdn.example/edit-result.png" }] };
     },
     {
       ...input,
@@ -822,7 +836,7 @@ test("authorization failures while replaying an image submission preserve its or
 
 test("synchronous app image responses preserve durable task and per-result asset identities", async () => {
   const result = await generateImage(async () => ({ task_id: "sync-task", data: [
-    { b64_json: "QQ==", asset_id: "asset-one" },
+    { url: "https://cdn.example.test/one.png", asset_id: "asset-one" },
     { url: "https://cdn.example.test/two.png", asset_id: "asset-two" },
   ] }), { model: "image", prompt: "test" });
   assert.equal(result.taskId, "sync-task");
@@ -834,10 +848,10 @@ test("synchronous image results keep asset identities aligned after malformed pr
   const result = await generateImage(async () => ({ data: [
     { url: "javascript:invalid", asset_id: "discarded" },
     { url: "https://cdn.example.test/one.png", asset_id: "asset-one" },
-    { b64_json: "Qg==", asset_id: "asset-two" },
+    { url: "https://cdn.example.test/two.png", asset_id: "asset-two" },
   ] }), { model: "image", prompt: "test" });
   assert.deepEqual(result.assetIds, ["asset-one", "asset-two"]);
-  assert.deepEqual(result.images, ["https://cdn.example.test/one.png", "data:image/png;base64,Qg=="]);
+  assert.deepEqual(result.images, ["https://cdn.example.test/one.png", "https://cdn.example.test/two.png"]);
 });
 
 test("an image create accepted during abort preserves its id before observation stops", async () => {
@@ -932,4 +946,16 @@ test("an uncertain image submission with a returned task id can recover without 
     return { status: "completed", data: [{ url: "https://cdn.example/original.png" }] };
   }, { model: "", prompt: "", taskId: "image-uncertain" });
   assert.deepEqual(paths, ["/images/tasks/image-uncertain"]);
+});
+
+test("automatic recovery never recreates an image task after an idempotency lookup miss", async () => {
+  const paths: string[] = [];
+  await assert.rejects(generateImage(async path => {
+    paths.push(path);
+    if (path === "/images/by-idempotency-key/auto-image") throw { status: 404, code: "image_task_not_found" };
+    assert.fail(`automatic recovery must not submit to ${path}`);
+  }, { ...input, idempotencyKey: "auto-image" }, undefined, {
+    recovery: { inputReferencesAvailable: true, allowResubmit: false },
+  }), error => error instanceof ImageGenerationError && error.pending && !error.terminalTask && error.code === "IMAGE_SUBMISSION_NOT_FOUND");
+  assert.deepEqual(paths, ["/images/by-idempotency-key/auto-image"]);
 });

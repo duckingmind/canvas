@@ -1,6 +1,8 @@
 import React from "react";
+import { MAX_APPLICATION_MEDIA_ASSET_BYTES } from "@ducking-mind/proxy-app-sdk";
 import { Camera, LoaderCircle, Pause, Play, RotateCcw, Upload, Volume2, VolumeX, X } from "lucide-react";
 import { createVideoHoverPreview } from "./video-hover-preview";
+import { announceVideoPlayback, coordinateVideoPlayback, videoBufferedAheadSeconds } from "./video-playback-coordinator";
 import { captureVideoFrame, clampVideoTime, formatVideoTime, isVideoPlayerGlobalShortcut, videoPlaybackErrorMessage, type CapturedVideoFrame } from "./video-player";
 import { exportVideoEdit, type VideoEditOptions } from "./video-editing";
 import { LOCAL_AUDIO_MAX_BYTES } from "./audio-cache";
@@ -8,7 +10,13 @@ import type { VideoNodeSourceToken } from "./video-node-media";
 import { diagnosticErrorFields, recordCanvasDiagnostic } from "./client-diagnostics.ts";
 import "./canvas-video.css";
 
-export type VideoProcessRequest = { id: number; options: VideoEditOptions; source: VideoNodeSourceToken };
+export type VideoProcessRequest = {
+  id: number;
+  options: VideoEditOptions;
+  source: VideoNodeSourceToken;
+  /** The result node owns progress for one-click audio extraction. */
+  targetNodeId?: string;
+};
 
 export type CanvasVideoProps = {
   src: string;
@@ -17,6 +25,10 @@ export type CanvasVideoProps = {
   hoverPreview: boolean;
   /** Play the canvas clip while its node is selected. */
   selected?: boolean;
+  /** Another video surface owns playback while the canvas node stays mounted. */
+  playbackSuspended?: boolean;
+  /** Pause playback while a video operation owns this source. */
+  processing?: boolean;
   interactive?: boolean;
   onSelect: () => void;
   onPreview: () => void;
@@ -27,6 +39,7 @@ export type CanvasVideoProps = {
   processRequest?: VideoProcessRequest;
   onProcessRequestHandled?: (id: number) => void;
   onProcessProgress?: (progress: number, request: VideoProcessRequest) => void;
+  onProcessStatus?: (status: string, request: VideoProcessRequest) => void;
   onProcessResult?: (blob: Blob, request: VideoProcessRequest, signal: AbortSignal) => void | Promise<void>;
   onProcessError?: (error: unknown, request: VideoProcessRequest) => void;
   onPlaybackStateChange?: (state: { duration: number; time: number; ready: boolean; processing: boolean }) => void;
@@ -57,13 +70,16 @@ export default function CanvasVideo(props: CanvasVideoProps) {
   return <VideoPlayer key={props.src} {...props} recoverSource={recoverSource} />;
 }
 
-function VideoPlayer({ src, poster, label, hoverPreview, selected = false, interactive = true, onSelect, onPreview, onCaptureFrame, onReplace, onLoadedData, onRetry, onNotice, sourceDiagnostic, recoverSource, captureRequest, onCaptureRequestHandled, onCaptureReadyChange, processRequest, onProcessRequestHandled, onProcessProgress, onProcessResult, onProcessError, onPlaybackStateChange, processCancelRequest }: CanvasVideoProps & { recoverSource?: () => Promise<boolean | void> | undefined }) {
+function VideoPlayer({ src, poster, label, hoverPreview, selected = false, playbackSuspended = false, processing = false, interactive = true, onSelect, onPreview, onCaptureFrame, onReplace, onLoadedData, onRetry, onNotice, sourceDiagnostic, recoverSource, captureRequest, onCaptureRequestHandled, onCaptureReadyChange, processRequest, onProcessRequestHandled, onProcessProgress, onProcessStatus, onProcessResult, onProcessError, onPlaybackStateChange, processCancelRequest }: CanvasVideoProps & { recoverSource?: () => Promise<boolean | void> | undefined }) {
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const playbackId = React.useId();
+  const playbackCoordinatorCleanup = React.useRef<(() => void) | null>(null);
   const controller = React.useRef<ReturnType<typeof createVideoHoverPreview> | null>(null);
   const mounted = React.useRef(true);
   const capturePending = React.useRef(false);
   const [playback, setPlayback] = React.useState({ paused: true, muted: false, volume: 1, time: 0, duration: 0, ready: false, seeking: false, ended: false });
   const [waiting, setWaiting] = React.useState(false);
+  const bufferingEpisode = React.useRef(false);
   const [capturing, setCapturing] = React.useState(false);
   const processingRef = React.useRef(false);
   const processRequestRef = React.useRef(processRequest);
@@ -72,6 +88,8 @@ function VideoPlayer({ src, poster, label, hoverPreview, selected = false, inter
   processHandledRef.current = onProcessRequestHandled;
   const processProgressRef = React.useRef(onProcessProgress);
   processProgressRef.current = onProcessProgress;
+  const processStatusRef = React.useRef(onProcessStatus);
+  processStatusRef.current = onProcessStatus;
   const processResultRef = React.useRef(onProcessResult);
   processResultRef.current = onProcessResult;
   const processErrorRef = React.useRef(onProcessError);
@@ -96,11 +114,34 @@ function VideoPlayer({ src, poster, label, hoverPreview, selected = false, inter
     });
   }, []);
 
+  const markBuffering = (reason: "waiting" | "stalled") => {
+    const video = videoRef.current;
+    setWaiting(true);
+    if (!video || bufferingEpisode.current) return;
+    bufferingEpisode.current = true;
+    let sourceOrigin: string | undefined;
+    try { sourceOrigin = new URL(src).origin; } catch { /* Local media has no network origin. */ }
+    recordCanvasDiagnostic("warn", "video.playback.buffering", {
+      component: "video", operation: "buffering", trigger: reason,
+      buffered_ahead_ms: Math.round(videoBufferedAheadSeconds(video) * 1000),
+      current_time_ms: Math.round(video.currentTime * 1000),
+      ready_state: video.readyState, network_state: video.networkState, source_origin: sourceOrigin,
+    });
+  };
+  const clearBuffering = () => {
+    bufferingEpisode.current = false;
+    setWaiting(false);
+  };
+
   const attachVideo = React.useCallback((video: HTMLVideoElement | null) => {
+    playbackCoordinatorCleanup.current?.();
+    playbackCoordinatorCleanup.current = null;
+    bufferingEpisode.current = false;
     controller.current?.stop();
     videoRef.current = video;
     controller.current = video ? createVideoHoverPreview(video) : null;
-  }, []);
+    if (video) playbackCoordinatorCleanup.current = coordinateVideoPlayback(playbackId, video);
+  }, [playbackId]);
 
   React.useEffect(() => {
     mounted.current = true;
@@ -115,22 +156,30 @@ function VideoPlayer({ src, poster, label, hoverPreview, selected = false, inter
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, []);
+  React.useEffect(() => () => {
+    playbackCoordinatorCleanup.current?.();
+    playbackCoordinatorCleanup.current = null;
+  }, []);
   React.useLayoutEffect(() => {
-    if (!hoverPreview || !interactive) controller.current?.stop();
-  }, [hoverPreview, interactive]);
+    if (!hoverPreview || !interactive || playbackSuspended) controller.current?.stop();
+  }, [hoverPreview, interactive, playbackSuspended]);
+
+  const canvasAutoplay = selected && interactive && !playbackSuspended && !loadFailed && !processing;
 
   // A selected video is the active canvas preview. Keep it looping and start
   // it as soon as the source is mounted. Selection can also happen from the
   // keyboard or a marquee, so retry muted when browser autoplay policy rejects
   // the current volume. Once the user pauses it, no effect dependency changes
   // and the manual pause is respected until the node is selected again.
-  React.useEffect(() => {
+  // Apply ownership changes before the next paint. This prevents the canvas
+  // decoder and the detail decoder from playing together for one frame while
+  // the detail surface is opening or closing.
+  React.useLayoutEffect(() => {
     let cancelled = false;
     const video = videoRef.current;
-    const shouldPlay = selected && interactive && !loadFailed;
     if (!video) return () => { cancelled = true; };
-    video.loop = shouldPlay;
-    if (!shouldPlay) {
+    video.loop = canvasAutoplay;
+    if (!canvasAutoplay) {
       controller.current?.takeManualControl();
       if (!video.paused) video.pause();
       return () => { cancelled = true; };
@@ -152,7 +201,7 @@ function VideoPlayer({ src, poster, label, hoverPreview, selected = false, inter
       syncPlayback();
     });
     return () => { cancelled = true; };
-  }, [interactive, loadFailed, selected, syncPlayback]);
+  }, [canvasAutoplay, syncPlayback]);
 
   const takeControl = () => {
     controller.current?.takeManualControl();
@@ -235,8 +284,10 @@ function VideoPlayer({ src, poster, label, hoverPreview, selected = false, inter
     processAbortRef.current = abort;
     processHandledRef.current?.(request.id);
     processProgressRef.current?.(0, request);
+    if (request.options.operation === "extract-audio") processStatusRef.current?.("正在快速提取音轨…", request);
     void exportVideoEdit(video, request.options, progress => processProgressRef.current?.(progress, request), abort.signal,
-      request.options.operation === "extract-audio" ? LOCAL_AUDIO_MAX_BYTES : Number.POSITIVE_INFINITY)
+      request.options.operation === "extract-audio" ? LOCAL_AUDIO_MAX_BYTES : MAX_APPLICATION_MEDIA_ASSET_BYTES,
+      status => processStatusRef.current?.(status, request))
       .then(result => { abort.signal.throwIfAborted(); return processResultRef.current?.(result, request, abort.signal); })
       .catch(error => processErrorRef.current?.(error, request))
       .finally(() => {
@@ -245,9 +296,24 @@ function VideoPlayer({ src, poster, label, hoverPreview, selected = false, inter
         processProgressRef.current?.(0, request);
       });
   }, [processRequest?.id, captureReady]);
+  const playbackStateChangeRef = React.useRef(onPlaybackStateChange);
+  playbackStateChangeRef.current = onPlaybackStateChange;
+  const latestPlaybackState = React.useRef({ duration: playback.duration, time: playback.time, ready: captureReady, processing: processingRef.current });
+  latestPlaybackState.current = { duration: playback.duration, time: playback.time, ready: captureReady, processing: processingRef.current };
+  const playbackStateTimer = React.useRef<number | null>(null);
+  const lastPlaybackStateAt = React.useRef(0);
   React.useEffect(() => {
-    onPlaybackStateChange?.({ duration: playback.duration, time: playback.time, ready: captureReady, processing: processingRef.current });
-  }, [playback.duration, playback.time, captureReady, onPlaybackStateChange]);
+    if (playbackStateTimer.current !== null) return;
+    const delay = Math.max(0, 500 - (Date.now() - lastPlaybackStateAt.current));
+    playbackStateTimer.current = window.setTimeout(() => {
+      playbackStateTimer.current = null;
+      lastPlaybackStateAt.current = Date.now();
+      playbackStateChangeRef.current?.(latestPlaybackState.current);
+    }, delay);
+  }, [playback.duration, playback.time, captureReady]);
+  React.useEffect(() => () => {
+    if (playbackStateTimer.current !== null) window.clearTimeout(playbackStateTimer.current);
+  }, []);
   React.useEffect(() => { if (processCancelRequest) processAbortRef.current?.abort(); }, [processCancelRequest]);
   const retry = () => {
     if (!interactive) return;
@@ -292,12 +358,12 @@ function VideoPlayer({ src, poster, label, hoverPreview, selected = false, inter
   return <div className={`canvas-video ${playback.paused ? "is-paused" : "is-playing"}`} data-canvas-video-player data-interactive={interactive}
     role="group" aria-label={label}
     onPointerEnter={event => {
-      if (interactive && hoverPreview && !loadFailed && event.pointerType !== "touch" && document.visibilityState !== "hidden") controller.current?.start();
+      if (interactive && hoverPreview && !playbackSuspended && !loadFailed && event.pointerType !== "touch" && document.visibilityState !== "hidden") controller.current?.start();
     }}
     onPointerLeave={() => controller.current?.stop()}
     onPointerDown={event => {
-      if (!interactive) return;
       const target = event.target as Element;
+      if (!interactive) return;
       if (target.closest(".canvas-video-controls,.canvas-video-replace,.canvas-video-error")) {
         event.stopPropagation();
         if (event.button === 0) onSelect();
@@ -325,16 +391,16 @@ function VideoPlayer({ src, poster, label, hoverPreview, selected = false, inter
     }}
   >
     <video key={String(corsFallback)} ref={attachVideo} className="node-video" src={src} poster={poster}
-      autoPlay={selected && interactive && !loadFailed} loop={selected && interactive && !loadFailed}
-      playsInline preload="metadata" controls={false} crossOrigin={corsFallback ? undefined : "anonymous"}
+      autoPlay={canvasAutoplay} loop={canvasAutoplay}
+      playsInline preload={canvasAutoplay ? "auto" : "metadata"} controls={false} crossOrigin={corsFallback ? undefined : "anonymous"}
       tabIndex={interactive ? 0 : -1} aria-label={`${label}，空格播放或暂停，双击进入画廊`}
       onLoadedMetadata={syncPlayback} onDurationChange={syncPlayback} onTimeUpdate={syncPlayback}
-      onLoadedData={() => { syncPlayback(); setWaiting(false); onLoadedData?.(videoRef.current?.videoWidth || 0, videoRef.current?.videoHeight || 0); }}
-      onCanPlay={() => { syncPlayback(); setWaiting(false); }}
-      onPlay={syncPlayback} onPlaying={() => { syncPlayback(); setWaiting(false); }}
-      onPause={() => { syncPlayback(); setWaiting(false); }} onEnded={syncPlayback} onVolumeChange={syncPlayback}
-      onSeeking={() => { syncPlayback(); setWaiting(true); }} onSeeked={() => { syncPlayback(); setWaiting(false); }}
-      onWaiting={() => setWaiting(true)}
+      onLoadedData={() => { syncPlayback(); clearBuffering(); onLoadedData?.(videoRef.current?.videoWidth || 0, videoRef.current?.videoHeight || 0); }}
+      onCanPlay={() => { syncPlayback(); clearBuffering(); }}
+      onPlay={() => { announceVideoPlayback(playbackId); syncPlayback(); }} onPlaying={() => { syncPlayback(); clearBuffering(); }}
+      onPause={() => { syncPlayback(); clearBuffering(); }} onEnded={syncPlayback} onVolumeChange={syncPlayback}
+      onSeeking={() => { syncPlayback(); setWaiting(true); }} onSeeked={() => { syncPlayback(); clearBuffering(); }}
+      onWaiting={() => markBuffering("waiting")} onStalled={() => markBuffering("stalled")}
       onError={() => {
         const media = videoRef.current;
         const mediaErrorCode = media?.error?.code;

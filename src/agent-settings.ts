@@ -1,6 +1,6 @@
 import type { CanvasNode, Model } from './canvas-types.ts'
 import { imageOptions, resolveImageSettings } from './image-models.ts'
-import { videoOptions, resolveVideoSettings } from './video-models.ts'
+import { videoOptions, resolveVideoSettings, canEnterMediaScheduler } from './video-models.ts'
 import { compatibleMusicModels, musicOptions, resolveMusicSettings, type MusicModel, type MusicSettings } from './music-models.ts'
 import { mediaFailure } from './agent-media.ts'
 export type AgentImageSettings = { quality?: string; resolution?: string; aspect_ratio?: string; size?: string; count?: number; output_format?: string }
@@ -38,7 +38,7 @@ export function generationParameters(model: Model) {
 }
 export function configureGeneration(node: CanvasNode, model: Model, input: { image_settings?: AgentImageSettings; video_settings?: AgentVideoSettings; music_settings?: AgentMusicSettings }): CanvasNode {
   const kind = node.mediaType || 'image'
-  if (model.available === false || (model.type || model.model_type) !== kind) mediaFailure('CANVAS_MODEL_UNAVAILABLE', 'Select a model matching the node media type')
+  if (!canEnterMediaScheduler(model) || (model.type || model.model_type) !== kind) mediaFailure('CANVAS_MODEL_UNAVAILABLE', 'Select a model matching the node media type')
   if (kind === 'image') {
     if (input.video_settings || input.music_settings) mediaFailure('CANVAS_INVALID_ARGUMENT', 'Video or music settings cannot be applied to an image prompt')
     const { aspect_ratio, output_format, ...rest } = input.image_settings || {}

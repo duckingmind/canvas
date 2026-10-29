@@ -405,12 +405,6 @@
   font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
-.media-preview-gallery-head .media-preview-locate {
-  width: 28px;
-  height: 28px;
-  min-height: 28px;
-  padding: 0;
-}
 .media-preview-thumbnails-row {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr) 28px;
@@ -446,10 +440,13 @@
   backdrop-filter: blur(18px) saturate(125%);
   transform: translateY(-50%);
 }
+.media-preview-stage > .media-preview-stage-navigation {
+  position: absolute;
+}
 .media-preview-stage-navigation-left { left: 18px; }
 .media-preview-stage-navigation-right { right: 18px; }
 .media-preview-stage-navigation:hover:not(:disabled) { background: rgb(255 255 255 / 16%); }
-.media-preview-stage-navigation:disabled { opacity: .28; cursor: default; }
+.media-preview-stage-navigation:disabled { opacity: .28; pointer-events: none; cursor: default; }
 .media-preview-thumbnails {
   min-width: 0;
   overscroll-behavior-inline: contain;
@@ -646,20 +643,29 @@
   margin-left: 4px;
   color: #fff;
 }
-.media-preview-gallery-head .media-preview-locate {
+.media-preview-zoom-controls .media-preview-locate {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  min-height: 28px;
-  padding: 0 9px;
-  border: 1px solid rgb(255 255 255 / 12%);
-  border-radius: 7px;
-  color: rgb(244 245 247 / 88%);
-  background: rgb(255 255 255 / 7%);
+  gap: 4px;
+  width: auto;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 999px;
   font-size: 11px;
+  white-space: nowrap;
 }
-.media-preview-gallery-head .media-preview-locate:hover { background: rgb(255 255 255 / 14%); }
+.media-preview-zoom-controls > .media-preview-toolbar-divider {
+  display: block;
+  flex: 0 0 1px;
+  width: 1px;
+  min-width: 0;
+  height: 18px;
+  margin: 0 4px;
+  background: rgb(255 255 255 / 20%);
+}
 .media-preview-thumbnails-row {
   grid-template-columns: 36px minmax(0, 1fr) 36px;
   gap: 8px;
@@ -717,4 +723,93 @@
   .media-preview-topbar,
   .media-preview-stage-tools,
   .media-preview-zoom-controls { background: #191a1e; }
+}
+
+/* Media stage refinement: keep the player at its real aspect ratio instead
+   of stretching a landscape shell around portrait video. The poster becomes
+   a soft ambient backdrop, so the unused space still feels intentional. */
+.media-preview-media-wrap.media-preview-video-wrap {
+  position: relative;
+  width: min(100cqw, 960px, calc(100cqh * var(--preview-video-ratio, 16 / 9)));
+  height: min(100cqh, calc(100cqw / var(--preview-video-ratio, 16 / 9)));
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: var(--preview-video-ratio, 16 / 9);
+  overflow: hidden;
+  isolation: isolate;
+  border-radius: 14px;
+  background: #090b10;
+  box-shadow: 0 22px 58px rgb(0 0 0 / 28%);
+}
+.media-preview-stage { container-type: size; }
+.media-preview-video-backdrop {
+  position: absolute !important;
+  z-index: 0 !important;
+  inset: -7% !important;
+  width: 114% !important;
+  height: 114% !important;
+  max-width: none !important;
+  max-height: none !important;
+  object-fit: cover !important;
+  opacity: .42 !important;
+  filter: blur(28px) saturate(.85) brightness(.58);
+  transform: scale(1.04);
+  pointer-events: none;
+}
+.media-preview-video-wrap::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  pointer-events: none;
+  background: rgb(4 6 10 / 26%);
+}
+.media-preview-video-wrap > .media-preview-poster {
+  z-index: 2 !important;
+  object-fit: contain !important;
+}
+.media-preview-video-wrap > .canvas-media-player--video {
+  position: absolute !important;
+  z-index: 3 !important;
+  inset: 0;
+  width: 100% !important;
+  height: 100% !important;
+  background: transparent;
+}
+.media-preview-video-wrap > .canvas-media-player--video > video {
+  background: transparent;
+}
+.media-preview-video-wrap > .canvas-media-player--video .canvas-media-player-controls {
+  padding: 42px 16px 12px;
+  background: linear-gradient(transparent 0%, rgb(4 6 10 / 10%) 42%, rgb(4 6 10 / 78%) 100%);
+  opacity: .9;
+}
+.media-preview-video-wrap > .canvas-media-player--video:hover .canvas-media-player-controls,
+.media-preview-video-wrap > .canvas-media-player--video:focus-within .canvas-media-player-controls { opacity: 1; }
+.media-preview-video-wrap > .media-preview-load-indicator { z-index: 4; }
+.media-preview-gallery-head:empty { display: none; }
+.media-preview-gallery-head > span { color: rgb(238 239 242 / 72%); }
+.media-preview-gallery-head > span::after {
+  content: "";
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  margin: 0 8px 2px;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 30%);
+}
+.media-preview-thumbnail-placeholder {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  color: rgb(241 242 245 / 70%);
+  background: linear-gradient(135deg, rgb(255 255 255 / 11%), rgb(255 255 255 / 3%));
+}
+.media-preview-thumbnail--video .media-preview-thumbnail-placeholder { color: #a9bfff; background: linear-gradient(135deg, rgb(92 120 255 / 24%), rgb(29 37 67 / 34%)); }
+.media-preview-thumbnail--audio .media-preview-thumbnail-placeholder { color: #9de5c8; background: linear-gradient(135deg, rgb(74 190 145 / 22%), rgb(24 53 45 / 34%)); }
+.media-preview-thumbnail-index { font-variant-numeric: tabular-nums; }
+@media (max-width: 700px) {
+  .media-preview-video-wrap { border-radius: 10px; }
+  .media-preview-video-wrap > .canvas-media-player--video .canvas-media-player-controls { padding: 34px 10px 9px; gap: 4px; }
 }

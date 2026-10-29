@@ -71,6 +71,8 @@ export type MusicGenerationOptions = {
   signal?: AbortSignal;
   /** Resolve a previously persisted submission before replaying its frozen POST. */
   recovery?: boolean;
+  /** Background recovery must reconcile the frozen key without creating a replacement. */
+  allowResubmit?: boolean;
   /** Read local Cover bytes only if lookup proves the original task needs a POST. */
   loadReferenceAudio?: () => Promise<string>;
   maxConsecutiveReadFailures?: number;
@@ -84,8 +86,9 @@ export type MusicContentOptions = {
   attempts?: number;
   delay?: (milliseconds: number) => Promise<void>;
   signal?: AbortSignal;
-  /** Authenticated URL returned in the task's `data[0].url`. */
+  /** Signed object-storage URL returned in the task's `data[0].url`. */
   contentUrl?: string;
+  fetchResource?: (url: string, init?: RequestInit) => Promise<Response>;
 };
 
 export class MusicGenerationError extends Error {
@@ -122,6 +125,15 @@ const record = (value: unknown): RecordValue =>
     ? value as RecordValue
     : {};
 const string = (value: unknown) => typeof value === "string" ? value : "";
+const legacyGatewayContentURL = (value: string) => {
+  if (!value) return false;
+  try {
+    const pathname = new URL(value, "https://gateway.invalid").pathname;
+    return /\/(?:v1\/)?(?:music|voice-design|tts)\/tasks\/[^/]+\/content\/?$/i.test(pathname) ||
+      /\/(?:v1\/)?media\/assets\/[^/]+\/content\/?$/i.test(pathname);
+  } catch { return false; }
+};
+const directDeliveryURL = (value: string) => /^https?:\/\//i.test(value) && !legacyGatewayContentURL(value);
 const taskRecord = (value: unknown) => {
   const body = record(value);
   return Object.keys(record(body.task)).length
@@ -180,8 +192,7 @@ function assetsFrom(value: unknown): RecordValue[] {
   const body = record(value), task = taskRecord(value);
   const data = Array.isArray(body.data) ? body.data : [];
   const assets = Array.isArray(body.assets) ? body.assets : Array.isArray(task.assets) ? task.assets : [];
-  // The gateway's data entries carry authenticated task-content routes; assets
-  // may carry temporary object-storage URLs for other delivery clients.
+  // Both task data and asset entries may carry temporary object-storage URLs.
   return [...data, ...assets].map(record).filter(item => Object.keys(item).length > 0);
 }
 
@@ -202,22 +213,11 @@ function contentFrom(value: unknown, taskId: string): MusicGenerationResult {
       return !id || id === selectedAssetId;
     })
     : assets;
-  const contentAsset = matchingAssets.find(item => {
-    const url = string(item.url);
-    if (!url) return false;
-    try { musicContentRequestPath(taskId, url); return true; }
-    catch { return false; }
-  });
-  let authenticatedDirect = "";
-  if (direct) {
-    try { musicContentRequestPath(taskId, direct); authenticatedDirect = direct; }
-    catch { /* Use the durable task route when only a delivery URL is present. */ }
-  }
-  const contentUrl = string(contentAsset?.url) || authenticatedDirect || `/music/tasks/${taskId}/content`;
-  // A signed delivery URL's expiry does not apply to the authenticated route.
-  const expires = contentUrl === direct
-    ? string(body.content_url_expires_at) || string(body.url_expires_at) || string(task.content_url_expires_at) || string(task.url_expires_at)
-    : string(contentAsset?.url_expires_at);
+  const contentAsset = matchingAssets.find(item => directDeliveryURL(string(item.url)) && string(item.url_expires_at)) ||
+    matchingAssets.find(item => directDeliveryURL(string(item.url)));
+  const contentUrl = string(contentAsset?.url) || (directDeliveryURL(direct) ? direct : "");
+  const expires = string(contentAsset?.url_expires_at) || string(body.content_url_expires_at) || string(body.url_expires_at) ||
+    string(task.content_url_expires_at) || string(task.url_expires_at);
   return {
     taskId,
     contentUrl,
@@ -262,6 +262,15 @@ const retryableReadFailure = (value: unknown) => {
   const status = statusCode(value);
   return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
 };
+const retryableMusicContentFailure = (value: unknown) => {
+  const code = codeFrom(value).toLowerCase();
+  const message = messageFrom(value).toLowerCase();
+  if (code === "media_asset_not_ready" || /not.?ready|asset.*pending|content.*pending/.test(`${code} ${message}`)) return true;
+  const status = statusCode(value);
+  // Refresh task metadata for an expired/not-yet-visible signed URL while
+  // surfacing permanent authorization and malformed-body errors immediately.
+  return status === 403 || status === 404 || status === 408 || status === 425 || status === 429 || status >= 500 || value instanceof TypeError;
+};
 const deterministicFailureCodes = new Set([
   "invalid_request", "invalid_model", "no_eligible_provider", "no_eligible_supplier",
   "provider_rejected_request", "unknown_resolution_expired", "media_routing_disabled", "media_task_create_failed",
@@ -304,21 +313,6 @@ function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   });
 }
 
-function musicContentRequestPath(taskId: string, contentUrl?: string): string {
-  const fallback = `/music/tasks/${taskId}/content`;
-  if (!contentUrl) return fallback;
-  let parsed: URL;
-  try { parsed = new URL(contentUrl, "https://canvas.invalid"); }
-  catch { throw new MusicGenerationError("音乐内容地址无效", { taskId, code: "MUSIC_CONTENT_URL_INVALID" }); }
-  const match = /^\/(?:v1\/)?music\/tasks\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/content$/.exec(parsed.pathname);
-  if (parsed.hash || match?.[1] !== taskId) throw new MusicGenerationError("音乐内容地址与任务不匹配", { taskId, code: "MUSIC_CONTENT_URL_INVALID" });
-  const indexes = parsed.searchParams.getAll("index");
-  if ([...parsed.searchParams.keys()].some(key => key !== "index") || indexes.length > 1 || indexes.some(index => !/^\d+$/.test(index))) {
-    throw new MusicGenerationError("音乐内容地址参数无效", { taskId, code: "MUSIC_CONTENT_URL_INVALID" });
-  }
-  return `/music/tasks/${taskId}/content${indexes.length ? `?index=${indexes[0]}` : ""}`;
-}
-
 /** Reject empty/error payloads while allowing encoded audio and raw PCM. */
 export async function validateMusicContentBlob(value: Blob): Promise<Blob> {
   if (typeof Blob === "undefined" || !(value instanceof Blob) || value.size === 0) throw new Error("音乐内容为空或不可用");
@@ -343,7 +337,7 @@ export async function readMusicTask(request: MusicRequest, taskId: string, signa
   return taskSnapshot(value, taskId);
 }
 
-/** Request cancellation. The gateway may return cancel_pending; callers keep polling. */
+/** Request cancellation. The gateway accepts only tasks that are still queued. */
 export async function cancelMusic(request: MusicRequest, taskId: string, idempotencyKey?: string): Promise<MusicTaskSnapshot> {
   if (!validTaskId(taskId)) throw new MusicGenerationError("音乐任务 ID 无效", { code: "MUSIC_TASK_INVALID_ID" });
   const value = await request(`/music/tasks/${taskId}`, {
@@ -355,24 +349,30 @@ export async function cancelMusic(request: MusicRequest, taskId: string, idempot
   return taskSnapshot(value, taskId);
 }
 
-/** Read completed audio bytes through the authenticated task content route. */
+/** Read completed audio bytes directly from the signed object-storage URL. */
 export async function readMusicContent(request: MusicRequest, taskId: string, options: MusicContentOptions = {}): Promise<Blob> {
   if (!validTaskId(taskId)) throw new MusicGenerationError("音乐任务 ID 无效", { code: "MUSIC_TASK_INVALID_ID" });
   const attempts = Math.max(1, Math.min(8, Math.floor(options.attempts ?? 6)));
   const delay = options.delay || ((milliseconds: number) => new Promise<void>(resolve => setTimeout(resolve, milliseconds)));
-  const path = musicContentRequestPath(taskId, options.contentUrl);
+  let deliveryURL = directDeliveryURL(options.contentUrl || "") ? options.contentUrl! : "";
+  const fetchResource = options.fetchResource || fetch;
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (options.signal?.aborted) throw new MusicGenerationError("已停止读取音乐内容", { taskId, pending: true, code: "MUSIC_CONTENT_READ_STOPPED" });
     try {
       if (attempt > 0) await withAbort(delay(Math.min(3000, 400 * attempt)), options.signal);
-      const value = await withAbort(request(path, { responseType: "blob", signal: options.signal }), options.signal);
-      return await withAbort(validateMusicContentBlob(value as Blob), options.signal);
+      if (!deliveryURL || attempt > 0) {
+        const snapshot = await withAbort(request(`/music/tasks/${taskId}`, { signal: options.signal }), options.signal);
+        deliveryURL = contentFrom(snapshot, taskId).contentUrl;
+      }
+      if (!directDeliveryURL(deliveryURL)) throw new MusicGenerationError("音乐任务没有可用的对象存储地址", { taskId, code: "MUSIC_CONTENT_URL_UNAVAILABLE" });
+      const response = await withAbort(fetchResource(deliveryURL, { credentials: "omit", signal: options.signal }), options.signal);
+      if (!response.ok) throw Object.assign(new Error(`music object download failed (${response.status})`), { status: response.status });
+      return await withAbort(validateMusicContentBlob(await response.blob()), options.signal);
     } catch (error) {
       if (options.signal?.aborted) throw new MusicGenerationError("已停止读取音乐内容", { taskId, pending: true, code: "MUSIC_CONTENT_READ_STOPPED", cause: error });
       lastError = error;
-      const code = codeFrom(error).toLowerCase(), message = messageFrom(error).toLowerCase();
-      if (!/not.?ready|asset.*pending|content.*pending|media_asset_not_ready/.test(`${code} ${message}`) || attempt === attempts - 1) throw error;
+      if (attempt === attempts - 1 || !retryableMusicContentFailure(error)) throw error;
     }
   }
   throw lastError instanceof Error ? lastError : new Error("音乐内容为空或不可用");
@@ -462,6 +462,10 @@ export async function generateMusic(
         });
         initialUnknown = true;
       }
+    } else if (options.allowResubmit === false) {
+      throw new MusicGenerationError("原音乐提交暂未查到，已停止自动重提，请稍后重试。", {
+        pending: true, code: "MUSIC_SUBMISSION_NOT_FOUND",
+      });
     }
   }
 

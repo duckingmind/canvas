@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mediaNavigation } from "../src/media-navigation.ts";
+import {
+  createMediaNavigationContext,
+  mediaNavigation,
+  mediaNavigationFromContext,
+  removeMediaNavigationSnapshots,
+} from "../src/media-navigation.ts";
 
 test("result browsing follows the incoming creator, not the next creative step or its references", () => {
   const source = { id: "source", type: "prompt" }, next = { id: "next", type: "prompt" };
@@ -343,4 +348,118 @@ test("canvas gallery fallback does not include an empty or pending prompt", () =
   const pending = { id: "pending", type: "prompt", status: "running", resultBatchId: "pending" };
   const result = mediaNavigation([current, pending], [], current);
   assert.deepEqual(result.items, [current]);
+});
+
+test("an open gallery keeps all result IDs when switching to another result and back", () => {
+  const source = { id: "source", type: "prompt", generationBatchId: "batch-1" };
+  const results = Array.from({ length: 22 }, (_, index) => ({
+    id: `result-${index + 1}`,
+    type: "image",
+    image: `https://media.example/${index + 1}.png`,
+    resultOf: source.id,
+    resultBatchId: "batch-1",
+    resultIndex: index,
+  }));
+  const nodes = [source, ...results];
+  const edges = results.map((node) => ({ from: source.id, to: node.id }));
+  const opened = mediaNavigation(nodes, edges, results[18]);
+  const context = createMediaNavigationContext(opened);
+
+  assert.equal(opened.items.length, 22);
+  assert.equal(opened.index, 18);
+
+  // A refreshed preview snapshot can temporarily lack all generation metadata.
+  const switchedPreview = { ...results[19], image: "https://media.example/refreshed.png", resultOf: undefined, resultBatchId: undefined };
+  const switched = mediaNavigationFromContext(nodes, switchedPreview, context);
+  assert.equal(switched.items.length, 22);
+  assert.equal(switched.index, 19);
+
+  const switchedBack = mediaNavigationFromContext(nodes, results[18], context);
+  assert.equal(switchedBack.items.length, 22);
+  assert.equal(switchedBack.index, 18);
+  assert.equal(switchedBack.items[18].id, "result-19");
+});
+
+test("preview metadata is resolved from the canonical document node", () => {
+  const source = { id: "source", type: "prompt", generationBatchId: "batch-1" };
+  const first = { id: "first", type: "image", image: "first.png", resultOf: source.id, resultBatchId: "batch-1" };
+  const second = { id: "second", type: "image", image: "second.png", resultOf: source.id, resultBatchId: "batch-1" };
+  const stalePreview = { ...second, resultOf: undefined, resultBatchId: undefined };
+
+  const result = mediaNavigation([source, first, second], [], stalePreview);
+
+  assert.deepEqual(result.items, [first, second]);
+  assert.equal(result.index, 1);
+});
+
+test("refreshed URLs do not remove members from an already-open gallery", () => {
+  const source = { id: "source", type: "prompt" };
+  const results = [0, 1, 2].map((index) => ({
+    id: `result-${index}`,
+    type: "image",
+    image: `https://media.example/${index}.png`,
+    resultOf: source.id,
+  }));
+  const initial = mediaNavigation([source, ...results], [], results[1]);
+  const context = createMediaNavigationContext(initial);
+  const refreshedNodes = [source, ...results].map((node) =>
+    node.type === "image" ? { ...node, image: `https://media.example/refreshed/${node.id}.png` } : node,
+  );
+  const refreshed = mediaNavigationFromContext(refreshedNodes, refreshedNodes[3], context);
+
+  assert.equal(refreshed.items.length, 3);
+  assert.deepEqual(refreshed.items.map((node) => node.id), ["result-0", "result-1", "result-2"]);
+  assert.equal(refreshed.index, 2);
+});
+
+test("an open gallery survives a document snapshot that temporarily omits its results", () => {
+  const source = { id: "source", type: "prompt", generationBatchId: "batch-1" };
+  const results = Array.from({ length: 4 }, (_, index) => ({
+    id: `result-${index}`,
+    type: "image",
+    image: `https://media.example/${index}.png`,
+    resultOf: source.id,
+    resultBatchId: "batch-1",
+    resultIndex: index,
+  }));
+  const opened = mediaNavigation([source, ...results], [], results[2]);
+  const context = createMediaNavigationContext(opened);
+
+  // The selected node remains in the live snapshot while peers are briefly
+  // absent during a document refresh. The visible gallery should not collapse.
+  const partial = mediaNavigationFromContext([source, results[2]], results[2], context);
+  assert.deepEqual(partial.items.map((node) => node.id), results.map((node) => node.id));
+  assert.equal(partial.index, 2);
+
+  // The active result itself can be absent from a same-canvas snapshot too;
+  // the preview snapshot remains navigable until an explicit delete closes it.
+  const missingCurrent = mediaNavigationFromContext([source, results[0], results[1], results[3]], results[2], context);
+  assert.deepEqual(missingCurrent.items.map((node) => node.id), results.map((node) => node.id));
+  assert.equal(missingCurrent.index, 2);
+
+  // A later refresh uses canonical nodes and their latest URLs when available.
+  const refreshedNodes = [source, ...results].map((node) => node.type === "image"
+    ? { ...node, image: `https://media.example/refreshed/${node.id}.png` }
+    : node);
+  const refreshed = mediaNavigationFromContext(refreshedNodes, results[2], context);
+  assert.equal(refreshed.items[0].image, "https://media.example/refreshed/result-0.png");
+});
+
+test("explicitly removed gallery nodes do not reappear from their saved snapshots", () => {
+  const source = { id: "source", type: "prompt", generationBatchId: "batch-1" };
+  const results = Array.from({ length: 3 }, (_, index) => ({
+    id: `result-${index}`,
+    type: "image",
+    image: `https://media.example/${index}.png`,
+    resultOf: source.id,
+    resultBatchId: "batch-1",
+    resultIndex: index,
+  }));
+  const opened = mediaNavigation([source, ...results], [], results[1]);
+  const context = createMediaNavigationContext(opened);
+  const afterRemoval = removeMediaNavigationSnapshots(context, [results[0].id]);
+  const remaining = mediaNavigationFromContext([source, results[1], results[2]], results[1], afterRemoval);
+
+  assert.deepEqual(remaining.items.map((node) => node.id), ["result-1", "result-2"]);
+  assert.equal(remaining.index, 0);
 });

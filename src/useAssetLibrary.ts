@@ -2,20 +2,18 @@ import React from "react";
 import { client } from "./platform-client";
 import manifest from "../manifest.json";
 import { createAsset, filterAssets, isDurableAssetUrl, listAssets, normalizeAsset, normalizeAssetTags, readAsset, removeAsset, updateAsset, type AssetFilters, type AssetRow, type AssetStorage, type CanvasAsset } from "./asset-library";
-import { listPlatformAssets, platformAssetToRow, readPlatformAsset, removePlatformAsset, resolvePlatformVoiceIdentity, savePlatformAsset, setPlatformAssetLibraryMembership } from "./platform-asset-library";
+import { listPlatformAssets, platformAssetToRow, readPlatformAsset, removePlatformAsset, resolvePlatformVoiceIdentity, savePlatformAsset, setPlatformAssetLibraryMembership, uploadDurablePlatformAsset } from "./platform-asset-library";
 import { captureDocumentStorageSession } from "./document-storage";
-import { readCachedImage, storeInlineImages } from "./image-cache";
 import { taskImageResults, taskImageThumbnailResults } from "./image-recovery";
 import { matchNodeMediaAsset, reusableNodeKind } from "./asset-nodes";
 import type { CanvasNode, StoredAsset } from "./canvas-types";
 import type { AssetPreview } from "./AssetLibraryPanel";
 import { resolveVideoSource } from "./video-source";
-import { readMusicContent } from "./music-generation";
-import { readVoiceDesignContent } from "./voice-design";
 import { readAudioSourceBlob } from "./audio-source";
 import { fetchCanvasResource } from "./network-boundary";
 import { readLocalAudio } from "./audio-cache";
 import { readLocalVideo } from "./video-cache";
+import { readCachedImage } from "./image-cache";
 
 type Draft = { row: AssetRow; editing: boolean };
 const messageOf = (error: unknown) => error instanceof Error ? error.message : "资产操作失败，请重试。";
@@ -28,6 +26,7 @@ export function useAssetLibrary(options: {
   documentId: string;
   onInsert: (asset: CanvasAsset, preview: AssetPreview) => Promise<void>;
   onNotify: (message: string) => void;
+  onSaved?: (asset: CanvasAsset) => void;
 }) {
   const [platformRows, setPlatformRows] = React.useState<AssetRow[]>([]);
   const [localRows, setLocalRows] = React.useState<AssetRow[]>([]);
@@ -142,9 +141,9 @@ export function useAssetLibrary(options: {
         const previewUrl = URL.createObjectURL(blob);
         return { availability: "ready", url: previewUrl, release: () => URL.revokeObjectURL(previewUrl) };
       }
-      url = source.localImage ? await readCachedImage(source.localImage) || undefined : undefined;
+      if (source.localImage) return { availability: "unavailable", message: "图片必须先上传到 COS 后才能使用。" };
       check();
-      return url ? { availability: "ready", url } : { availability: "local-missing" };
+      return { availability: "local-missing" };
     }
     if (source.type === "url") return { availability: "ready", url: source.url };
     if (asset.kind === "video" && (source.type === "platform" || source.type === "task")) {
@@ -167,19 +166,12 @@ export function useAssetLibrary(options: {
         ? { availability: "ready", url, thumbnailUrl, urlExpiresAt }
         : { availability: "unavailable", message: "素材暂不可用，请刷新后重试。" };
     } else if (source.mediaType === "audio") {
-      // Audio task content is an authenticated gateway route. Read the bytes
-      // through the API instead of exposing the protected route to <audio>.
-      const taskRoute = source.audioTaskType === "voice_design" ? "voice-design" : "music";
-      const contentUrl = source.resultIndex === undefined
-        ? undefined
-        : `/${taskRoute}/tasks/${encodeURIComponent(source.taskId)}/content?index=${source.resultIndex}`;
-      const blob = source.audioTaskType === "voice_design"
-        ? await readVoiceDesignContent(client.api.request.bind(client.api), source.taskId, contentUrl)
-        : source.audioTaskType === "tts"
-          ? await readAudioSourceBlob(client.api, { type: "audio", status: "completed", taskId: source.taskId, audioTaskType: "tts" }, {
-            fetchResource: (url, init) => fetchCanvasResource(url, init, { gatewayURL: client.session()?.gateway_url }),
-          })
-          : await readMusicContent(client.api.request.bind(client.api), source.taskId, { contentUrl });
+      const blob = await readAudioSourceBlob(client.api, {
+        type: "audio", status: "completed", taskId: source.taskId,
+        resultIndex: source.resultIndex, audioTaskType: source.audioTaskType || "music", voiceTrialAudioAvailable: true,
+      }, {
+        fetchResource: (url, init) => fetchCanvasResource(url, init, { gatewayURL: client.session()?.gateway_url }),
+      });
       check();
       const previewUrl = URL.createObjectURL(blob);
       return { availability: "ready", url: previewUrl, release: () => URL.revokeObjectURL(previewUrl) };
@@ -232,10 +224,7 @@ export function useAssetLibrary(options: {
         const mediaURL = node.image || node.video || node.videoContentUrl || node.audio;
         if (kind === "prompt") source = { type: "text", text: node.text };
         else if (kind === "image" && (node.localImage || node.image?.startsWith("data:image/"))) {
-          const cached = await storeInlineImages({ nodes: [node] });
-          const localImage = cached.nodes[0].localImage;
-          if (!localImage || !await readCachedImage(localImage)) throw new Error("本机图片已丢失，请重新上传后保存。");
-          source = { type: "local", localImage };
+          throw new Error("图片必须先上传到 COS 后才能保存为资产，请重新上传图片。");
         } else if (kind === "audio" && node.localAudio) {
           if (!await readLocalAudio(node.localAudio)) throw new Error("本机音频已丢失，请重新录音或上传后保存。");
           source = { type: "local", localAudio: node.localAudio };
@@ -346,6 +335,7 @@ export function useAssetLibrary(options: {
       setDraft(null); replaceDraftPreview(); pendingSave.current = undefined;
       if (platformRow(saved)) setPlatformRows(old => [saved, ...old.filter(item => item.asset.id !== saved.asset.id)]);
       else setLocalRows(old => [saved, ...old.filter(item => item.asset.id !== saved.asset.id)]);
+      live.current.onSaved?.(saved.asset);
       void load(true);
     } catch (failure) { if (currentEpoch === epoch.current) setDraftError(messageOf(failure)); }
     finally { if (currentEpoch === epoch.current) { operationRef.current = false; setSaving(false); } }
@@ -398,11 +388,44 @@ export function useAssetLibrary(options: {
     let preview: AssetPreview | undefined;
     try {
       const check = guard();
-      preview = await resolvePreview(row.asset);
+      // KV-backed local audio/video rows are previewable in this browser, but
+      // their cache keys cannot be committed as the identity of a new node.
+      // Promote the bytes to a platform asset before asking the canvas to
+      // insert anything. This keeps the invariant at the insertion boundary
+      // instead of relying on a later sync to discover the leak.
+      let insertAsset = row.asset;
+      if (row.asset.source.type === "local" && (row.asset.source.localImage || row.asset.source.localAudio || row.asset.source.localVideo)) {
+        const localAudio = row.asset.source.localAudio;
+        const localVideo = row.asset.source.localVideo;
+        const localImage = row.asset.source.localImage;
+        let blob: Blob | null;
+        if (localImage) {
+          const dataUrl = await readCachedImage(localImage);
+          blob = dataUrl ? await fetch(dataUrl).then(response => response.ok ? response.blob() : null) : null;
+        } else blob = localAudio ? await readLocalAudio(localAudio) : await readLocalVideo(localVideo!);
+        check();
+        if (!blob) throw new Error("本机素材已丢失，请重新导入或上传后再添加。");
+        const file = new File([blob], row.asset.name || `canvas-${row.asset.kind}`, {
+          type: blob.type || (localImage ? "image/png" : localAudio ? "audio/mpeg" : "video/mp4"),
+        });
+        const uploaded = await uploadDurablePlatformAsset(client.api, {
+          file,
+          name: row.asset.name,
+          category: row.asset.kind === "audio" ? "sound" : "other",
+          idempotencyKey: `canvas-library-insert-${row.asset.id}`.slice(0, 128),
+        });
+        check();
+        if (!uploaded.id) throw new Error("素材上传后没有返回稳定资产身份，请重试。");
+        insertAsset = {
+          ...row.asset,
+          source: { type: "platform", assetId: uploaded.id, mediaType: localImage ? "image" : localAudio ? "audio" : "video" },
+        };
+      }
+      preview = await resolvePreview(insertAsset);
       check();
       if (documentId !== live.current.documentId) throw new Error("画布已切换，请在当前画布重新选择资产。");
       if (preview.availability !== "ready") throw new Error(preview.message || "素材内容暂不可用。");
-      const asset = { ...row.asset, source: await resolvePlatformVoiceIdentity(client.api, row.asset.source) } as CanvasAsset;
+      const asset = { ...insertAsset, source: await resolvePlatformVoiceIdentity(client.api, insertAsset.source) } as CanvasAsset;
       check();
       await live.current.onInsert(asset, preview);
     } catch (failure) { if (currentEpoch === epoch.current) setError(messageOf(failure)); }

@@ -59,6 +59,12 @@ test("model-level capability fields override nested snapshots, including explici
   assert.deepEqual(options.countOptions, [1, 2, 3, 4, 5, 6, 7, 8]);
 });
 
+test("supplier tier projection narrows explicitly but null retains platform tiers", () => {
+  assert.deepEqual(imageOptions({ ...model, available_resolution_tiers: ["1k"] }).resolutions, ["1k"]);
+  assert.deepEqual(imageOptions({ ...model, available_resolution_tiers: [] }).resolutions, []);
+  assert.deepEqual(imageOptions({ ...model, available_resolution_tiers: null }).resolutions, model.resolution_tiers);
+});
+
 test("output format follows a declared capability and never invents one", () => {
   assert.deepEqual(
     resolveImageSettings({ output_formats: ["png"], default_parameters: { output_format: "png" } }, { outputFormat: "webp" }),

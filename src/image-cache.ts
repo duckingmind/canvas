@@ -1,6 +1,6 @@
 import { captureLocalStorageScope, localDatabaseName, localStorageScope, scopedMemory } from "./local-storage-scope.ts";
 /** Local image assets belong to this browser profile; exported documents remain the backup. */
-import { withBrowserStorage } from "./draft-store";
+import { withBrowserStorage } from "./draft-store.ts";
 import { immutableImageUrlIdentity } from "./media-url-cache.ts";
 import { fetchCanvasResource } from "./network-boundary.ts";
 
@@ -12,7 +12,7 @@ type ImageNode = ImageReference & {
   videoPoster?: string;
   localVideoPoster?: string;
   submission?: { images: ImageReference[] };
-  videoSubmission?: { images?: ImageReference[] };
+  videoSubmission?: { images?: ImageReference[]; references?: Array<ImageReference & { type?: string; url?: string }> };
 };
 type ImageDocument = { nodes: ImageNode[] };
 
@@ -179,6 +179,9 @@ function copyDocument<T extends ImageDocument>(document: T): T {
               ...(node.videoSubmission.images
                 ? { images: node.videoSubmission.images.map((image) => ({ ...image })) }
                 : {}),
+              ...(node.videoSubmission.references
+                ? { references: node.videoSubmission.references.map((reference) => ({ ...reference })) }
+                : {}),
             },
           }
         : {}),
@@ -192,6 +195,7 @@ function imageReferences(document: ImageDocument): ImageReference[] {
     ...(node.embeddedReferences || []),
     ...(node.submission?.images || []),
     ...(node.videoSubmission?.images || []),
+    ...(node.videoSubmission?.references || []),
   ]);
 }
 

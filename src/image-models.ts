@@ -11,6 +11,7 @@ export type ImageSettings = {
 export type ImageModel = {
   quality_modes?: string[];
   resolution_tiers?: string[];
+  available_resolution_tiers?: string[] | null;
   resolution_sizes?: Record<string, string[]>;
   supported_sizes?: string[];
   supported_aspect_ratios?: string[];
@@ -64,7 +65,11 @@ export function imageOptions(model?: ImageModel) {
   const caps = model?.platform_capabilities || {};
   const defaults = record(capability(model, caps, "default_parameters"));
   const qualities = orderedQualities(list(capability(model, caps, "quality_modes")));
-  const resolutions = list(capability(model, caps, "resolution_tiers"));
+  const availableResolutions = capability(model, caps, "available_resolution_tiers");
+  const hasAvailableResolutions = Array.isArray(availableResolutions);
+  const resolutions = hasAvailableResolutions
+    ? list(availableResolutions)
+    : list(capability(model, caps, "resolution_tiers"));
   const ratios = list(capability(model, caps, "supported_aspect_ratios"));
   const declaredSizes = list(capability(model, caps, "supported_sizes"));
   // Keep output formats capability driven. An omitted field means the model

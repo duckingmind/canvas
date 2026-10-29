@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createImageNode } from "./canvas-ui.mjs";
 
 const { chromium } = await import(
   process.env.CANVAS_PLAYWRIGHT_MODULE || "playwright"
@@ -84,7 +85,7 @@ try {
   await page.getByLabel("无限创作画布").waitFor();
   const collapse = button("收起画布列表").first();
   if (await collapse.isVisible()) await collapse.click();
-  await button("创建图片").click();
+  await createImageNode(page);
   const trigger = page.locator(".context-settings-toggle");
   const dialog = page.getByRole("dialog", { name: "图片参数", exact: true });
   const model = page.getByLabel("创作图片模型", { exact: true });

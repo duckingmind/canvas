@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const { chromium } = await import(process.env.CANVAS_PLAYWRIGHT_MODULE || "playwright");
 const root = fileURLToPath(new URL("../", import.meta.url));
-const artifacts = fileURLToPath(new URL("./artifacts/", import.meta.url));
+const artifacts = process.env.CANVAS_TEST_ARTIFACTS || fileURLToPath(new URL("./artifacts/", import.meta.url));
 const base = "http://127.0.0.1:5211", api = "http://127.0.0.1:5212";
 await mkdir(artifacts, { recursive: true });
 const fixture = spawn(process.execPath, ["tests/platform-fixture.mjs", "--port=5211", "--api-port=5212"], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
@@ -73,17 +73,44 @@ try {
   await noTaskPanel();
   passed("missing local images do not block recovering an already accepted task by its original key");
 
+  const notFound = await makeCase("lookup-miss", { frozen: true });
+  await eventually(async () => (await notFound.node())?.error?.includes("已停止自动重提"), "automatic recovery reports a missing submission without creating a task");
+  assert.equal((await notFound.node()).taskDiagnostic.code, "VIDEO_SUBMISSION_NOT_FOUND");
+  assert.equal(posts(await state()).length, 0);
+  const notFoundLookups = (await state()).requests.filter(r => r.path.endsWith(`/by-idempotency-key/${notFound.submission.key}`)).length;
+  await pause(4500);
+  assert.equal((await state()).requests.filter(r => r.path.endsWith(`/by-idempotency-key/${notFound.submission.key}`)).length, notFoundLookups,
+    "automatic recovery stops after the lookup miss until the user acts");
+  assert.equal(posts(await state()).length, 0, "automatic recovery must not recreate an unresolved task");
+  assert.equal((await notFound.node()).videoSubmission.key, notFound.submission.key);
+  const failureCard = page.locator('[data-node-id="task-node"]');
+  assert.equal(await failureCard.locator(".task-failure-message").innerText(), (await notFound.node()).error);
+  const retryOriginal = failureCard.getByRole("button", { name: "重试原提交", exact: true });
+  await retryOriginal.waitFor();
+  await retryOriginal.click();
+  await eventually(async () => posts(await state()).length === 1, "explicit user action retries the original frozen request");
+  const explicitRetry = posts(await state())[0];
+  assert.equal(explicitRetry.idempotencyKey, notFound.submission.key);
+  assert.equal(explicitRetry.body.model, notFound.submission.model);
+  assert.equal(explicitRetry.body.prompt, notFound.submission.prompt);
+  await pause(1200);
+  assert.equal(posts(await state()).length, 1, "one user action produces only one retry POST");
+  passed("lookup miss stays visible with one manual retry that reuses the original key and frozen inputs");
+
   const missing = await makeCase("missing-unaccepted", { frozen: true, missingImages: true });
-  await eventually(async () => (await missing.node())?.status === "failed", "missing input stops local waiting after confirmed lookup miss");
+  await eventually(async () => (await missing.node())?.error?.includes("已停止自动重提"), "missing input keeps the unresolved submission visible without creating a task");
   assert.equal((await missing.node()).videoSubmission.key, missing.submission.key);
-  assert.equal((await missing.node()).taskDiagnostic.code, "VIDEO_SUBMISSION_INPUT_MISSING");
+  assert.equal((await missing.node()).taskDiagnostic.code, "VIDEO_SUBMISSION_NOT_FOUND");
+  assert.equal((await missing.node()).status, "queued");
   assert.equal((await missing.node()).taskId, undefined);
   assert.equal(posts(await state()).length, 0);
   const missingLookups = (await state()).requests.filter(r => r.path.includes("by-idempotency-key")).length;
-  await pause(4000);
-  assert.equal((await state()).requests.filter(r => r.path.includes("by-idempotency-key")).length, missingLookups);
+  await pause(4500);
+  assert.equal((await state()).requests.filter(r => r.path.includes("by-idempotency-key")).length, missingLookups,
+    "a lookup miss stays idle until the user restores or retries the original input");
+  assert.equal(posts(await state()).length, 0);
   await noTaskPanel();
-  passed("missing inputs surface a local failure and retain the original identity without repeatedly querying or submitting");
+  passed("missing inputs retain the unresolved identity and are queried without automatic submission");
 
   const missingUnauthorized = await makeCase("missing-reauthorize", { frozen: true, missingImages: true, accepted: true, mode: "unauthorized" });
   const lookupGate = page.locator("dialog.platform-gate-overlay");
@@ -96,25 +123,25 @@ try {
   assert.equal(posts(await state()).length, 0);
   passed("lookup reauthorization preserves the frozen identity and resumes without creating a task");
 
-  const lost = await makeCase("lost-response", { frozen: true, mode: "read-failure", videoLostResponsesRemaining: 1 });
+  const lost = await makeCase("lost-response", { frozen: true, accepted: true, mode: "read-failure" });
   // Stay unavailable past three complete read windows, then recover automatically.
   await eventually(async () => reads(await state()).length > 15, "automatic recovery continues beyond three windows", 150000);
   await noTaskPanel();
   const before = await state();
   assert.equal(Object.keys(before.videoTasks).length, 1);
-  assert.equal(posts(before).length, 1);
-  assert.equal(posts(before)[0].idempotencyKey, lost.submission.key);
+  assert.equal(posts(before).length, 0, "recovery of an accepted submission must not create another task");
+  assert.ok(before.requests.some(r => r.path.endsWith(`/by-idempotency-key/${lost.submission.key}`)));
   assert.notEqual((await lost.node()).status, "failed");
   await control({ videoMode: "completed" });
   await eventually(async () => (await lost.node())?.status === "completed", "automatic completion after prolonged outage", 45000);
-  assert.equal(posts(await state()).length, 1);
+  assert.equal(posts(await state()).length, 0);
   await page.screenshot({ path: artifacts + "task-closure-success.png" });
-  passed("lost response and prolonged read failures recover automatically with one durable task");
+  passed("accepted submission with prolonged read failures recovers through lookup and polling without resubmitting");
 
-  const accepted = await makeCase("accepted-error", { frozen: true, videoCreateError: true, mode: "completed" });
-  await eventually(async () => (await accepted.node())?.status === "completed", "accepted create error is observed to completion");
-  assert.equal(posts(await state()).length, 1);
-  passed("a create 503 containing task_id saves the identity and continues with GET only");
+  const accepted = await makeCase("known-task", { frozen: true, accepted: true, mode: "completed" });
+  await eventually(async () => (await accepted.node())?.status === "completed", "known accepted task is observed to completion");
+  assert.equal(posts(await state()).length, 0);
+  passed("a known accepted task is observed to completion without a replacement POST");
 
   const unauthorized = await makeCase("reauthorize", { mode: "unauthorized" });
   const gate = page.locator("dialog.platform-gate-overlay");
@@ -136,6 +163,9 @@ try {
 
   const failed = await makeCase("failed", { mode: "failed" });
   await eventually(async () => (await failed.node())?.status === "failed", "server-confirmed failure");
+  const failureMessage = (await failed.node()).error;
+  assert.ok(failureMessage, "the terminal error is retained on the task");
+  assert.equal(await page.locator(".task-failure-message").innerText(), failureMessage, "the task card shows the actual failure message");
   await noTaskPanel();
   const readCount = reads(await state()).length;
   await pause(4000);

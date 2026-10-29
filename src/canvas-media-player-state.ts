@@ -14,6 +14,18 @@ export function finiteMediaDuration(media: { duration: number; seekable: Seekabl
   }
 }
 
+/** Keep the elapsed clock moving when the browser cannot report a total duration yet. */
+export function displayedMediaTime(time: number, duration: number): number {
+  if (!Number.isFinite(time)) return 0;
+  const elapsed = Math.max(0, time);
+  return Number.isFinite(duration) && duration > 0 ? Math.min(duration, elapsed) : elapsed;
+}
+
+export function mediaPlayButtonLabel(paused: boolean, ended: boolean): "播放" | "暂停" | "重新播放" {
+  if (ended) return "重新播放";
+  return paused ? "播放" : "暂停";
+}
+
 export function nextAudioPlaybackRate(current: number): typeof AUDIO_PLAYBACK_RATES[number] {
   const index = AUDIO_PLAYBACK_RATES.findIndex(rate => rate === current);
   return AUDIO_PLAYBACK_RATES[(index + 1) % AUDIO_PLAYBACK_RATES.length];

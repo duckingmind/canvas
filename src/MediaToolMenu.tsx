@@ -2,6 +2,7 @@ import React from "react";
 import { ChevronDown, Wrench } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { createPortal } from "react-dom";
+import { applyPopoverPosition, observePopoverPosition, visiblePopoverBounds } from "./popover-position";
 
 export type MediaToolMenuItem = {
   id: string;
@@ -165,61 +166,28 @@ export default function MediaToolMenu({ label, triggerLabel = "工具", icon: Ic
     const panel = menu.current;
     const anchor = trigger.current;
     const place = () => {
-      const viewport = window.visualViewport;
-      const leftEdge = viewport?.offsetLeft || 0;
-      const topEdge = viewport?.offsetTop || 0;
-      const width = viewport?.width || window.innerWidth;
-      const height = viewport?.height || window.innerHeight;
-      const margin = 8;
-      const gap = 6;
-      const rect = anchor.getBoundingClientRect();
-      panel.style.maxWidth = `${Math.max(1, width - margin * 2)}px`;
-      const panelWidth = Math.min(panel.offsetWidth, width - margin * 2);
-      // Measure content without temporarily expanding the scroll container:
-      // changing its height would clamp scrollTop and hide keyboard targets.
-      const contentHeight = panel.scrollHeight + panel.offsetHeight - panel.clientHeight;
-      const below = rect.bottom + gap;
-      const belowSpace = topEdge + height - margin - below;
-      const aboveSpace = rect.top - gap - topEdge - margin;
-      const placement = contentHeight <= belowSpace || belowSpace >= aboveSpace ? "below" : "above";
-      panel.style.maxHeight = `${Math.max(1, Math.min(560, height - margin * 2, placement === "below" ? belowSpace : aboveSpace))}px`;
-      const panelHeight = panel.offsetHeight;
-      const top = Math.max(topEdge + margin, Math.min(placement === "above" ? rect.top - panelHeight - gap : below, topEdge + height - margin - panelHeight));
-      const canAlignLeft = rect.left + panelWidth <= leftEdge + width - margin;
-      const canAlignRight = rect.right - panelWidth >= leftEdge + margin;
-      const side = canAlignLeft || !canAlignRight ? "left" : "right";
-      const preferredLeft = side === "left" ? rect.left : rect.right - panelWidth;
-      const left = Math.max(leftEdge + margin, Math.min(preferredLeft, leftEdge + width - margin - panelWidth));
-      const arrowCenter = Math.max(9, Math.min(panelWidth - 9, rect.left + rect.width / 2 - left));
-      panel.dataset.placement = placement;
-      panel.dataset.side = side;
-      panel.style.left = `${left}px`;
-      panel.style.top = `${top}px`;
-      panel.style.right = "auto";
-      panel.style.bottom = "auto";
-      panel.style.setProperty("--media-menu-arrow-left", `${arrowCenter}px`);
+      const position = applyPopoverPosition({
+        panel,
+        anchor,
+        bounds: visiblePopoverBounds(),
+        preferredPlacement: "below",
+        align: "start-or-end",
+        gap: 6,
+        edgePadding: 8,
+        arrowInset: 9,
+        maxHeight: 560,
+        clearTransform: false,
+      });
       if (arrow.current) {
-        arrow.current.dataset.placement = placement;
-        arrow.current.style.left = `${left + arrowCenter - 7}px`;
-        arrow.current.style.top = `${placement === "below" ? top - 7 : top + panelHeight}px`;
+        arrow.current.dataset.placement = position.placement;
+        arrow.current.style.left = `${position.left + position.arrowOffset - 7}px`;
+        arrow.current.style.top = `${position.placement === "below" ? position.top - 7 : position.top + panel.getBoundingClientRect().height - 7}px`;
       }
       panel.style.visibility = "visible";
       if (arrow.current) arrow.current.style.visibility = "visible";
     };
     place();
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(place);
-    observer?.observe(panel);
-    window.addEventListener("resize", place);
-    window.addEventListener("scroll", place, true);
-    window.visualViewport?.addEventListener("resize", place);
-    window.visualViewport?.addEventListener("scroll", place);
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener("resize", place);
-      window.removeEventListener("scroll", place, true);
-      window.visualViewport?.removeEventListener("resize", place);
-      window.visualViewport?.removeEventListener("scroll", place);
-    };
+    return observePopoverPosition(anchor, panel, null, place);
   }, [open, trigger]);
   const items = groups.flatMap(group => group.items);
   return <div className={`media-tool-menu ${className || ""}`} onPointerDown={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()}>

@@ -3,13 +3,16 @@ import test from "node:test";
 import { canLoadAudioContent, readAudioSourceBlob } from "../src/audio-source.ts";
 import { storeLocalAudio } from "../src/audio-cache.ts";
 
-test("protected music content is read through the authenticated task route", async () => {
+test("music results resolve a signed URL from task details and download directly", async () => {
   const calls: string[] = [];
+  const urls: string[] = [];
   const audio = new Blob([new Uint8Array([0x49, 0x44, 0x33, 0x04])], { type: "audio/mpeg" });
+  const signedUrl = "https://objects.example/music.mp3?signature=temporary";
   const result = await readAudioSourceBlob({
     request: async (path) => {
       calls.push(path);
-      return audio;
+      assert.equal(path, "/music/tasks/music-task-1");
+      return { id: "music-task-1", status: "completed", assets: [{ id: "music-asset-1", type: "audio", url: signedUrl }] };
     },
   }, {
     type: "audio",
@@ -17,17 +20,24 @@ test("protected music content is read through the authenticated task route", asy
     status: "completed",
     audio: "/music/tasks/music-task-1/content",
   }, {
-    fetchResource: async () => { throw new Error("protected content must not be fetched directly"); },
+    fetchResource: async (url, init) => {
+      urls.push(url);
+      assert.equal(init?.credentials, "omit");
+      return new Response(audio);
+    },
   });
-  assert.equal(result, audio);
-  assert.deepEqual(calls, ["/music/tasks/music-task-1/content"]);
+  assert.equal(result.size, audio.size);
+  assert.deepEqual(calls, ["/music/tasks/music-task-1"]);
+  assert.deepEqual(urls, [signedUrl]);
 });
 
 test("a completed music result without an asset ID remains recoverable by task identity", async () => {
   const calls: string[] = [];
+  const urls: string[] = [];
   const audio = new Blob([new Uint8Array([0x49, 0x44, 0x33, 0x05])], { type: "audio/mpeg" });
+  const signedUrl = "https://objects.example/music-2.mp3?signature=temporary";
   await readAudioSourceBlob({
-    request: async (path) => { calls.push(path); return audio; },
+    request: async (path) => { calls.push(path); return { id: "music-task-2", status: "completed", data: [{ type: "audio/mpeg", url: signedUrl }] }; },
   }, {
     type: "prompt",
     mediaType: "audio",
@@ -35,19 +45,23 @@ test("a completed music result without an asset ID remains recoverable by task i
     status: "completed",
     audio: "/v1/music/tasks/music-task-2/content",
   }, {
-    fetchResource: async () => { throw new Error("protected content must not be fetched directly"); },
+    fetchResource: async url => { urls.push(url); return new Response(audio); },
   });
-  assert.deepEqual(calls, ["/music/tasks/music-task-2/content"]);
+  assert.deepEqual(calls, ["/music/tasks/music-task-2"]);
+  assert.deepEqual(urls, [signedUrl]);
 });
 
-test("protected voice preview content uses the authenticated task route even with an absolute URL", async () => {
+test("legacy voice content URLs are refreshed from task details before direct download", async () => {
   const calls: string[] = [];
+  const urls: string[] = [];
   const audio = new Blob([new Uint8Array([0x49, 0x44, 0x33, 0x04])], { type: "audio/mpeg" });
+  const signedUrl = "https://objects.example/voice-preview.mp3?signature=temporary";
   const result = await readAudioSourceBlob({
     request: async (path, init) => {
       calls.push(path);
-      assert.equal(init?.responseType, "blob");
-      return audio;
+      assert.equal(path, "/voice-design/tasks/voice-task-1");
+      assert.equal(init?.responseType, undefined);
+      return { id: "voice-task-1", status: "completed", content_url: signedUrl, trial_audio: { available: true, url: signedUrl } };
     },
   }, {
     type: "audio",
@@ -56,10 +70,11 @@ test("protected voice preview content uses the authenticated task route even wit
     audioTaskType: "voice_design",
     audio: "https://gateway.example/v1/voice-design/tasks/voice-task-1/content?index=1",
   }, {
-    fetchResource: async () => { throw new Error("protected voice content must not be fetched directly"); },
+    fetchResource: async url => { urls.push(url); return new Response(audio); },
   });
-  assert.equal(result, audio);
-  assert.deepEqual(calls, ["/voice-design/tasks/voice-task-1/content?index=1"]);
+  assert.equal(result.size, audio.size);
+  assert.deepEqual(calls, ["/voice-design/tasks/voice-task-1"]);
+  assert.deepEqual(urls, [signedUrl]);
 });
 
 test("historical TTS audio resolves through media assets without invoking synthesis APIs", async () => {
@@ -109,9 +124,10 @@ test("missing historical audio never falls back to TTS or music task APIs", asyn
 
 test("a completed voice result remains recoverable by its voice task identity", async () => {
   const calls: string[] = [];
+  const urls: string[] = [];
   const audio = new Blob([new Uint8Array([0x49, 0x44, 0x33, 0x05])], { type: "audio/mpeg" });
   await readAudioSourceBlob({
-    request: async (path) => { calls.push(path); return audio; },
+    request: async (path) => { calls.push(path); return { id: "voice-task-2", status: "completed", trial_audio: { available: true, url: "https://objects.example/voice-2.mp3?signature=temporary" } }; },
   }, {
     type: "prompt",
     mediaType: "audio",
@@ -119,9 +135,10 @@ test("a completed voice result remains recoverable by its voice task identity", 
     status: "completed",
     audioTaskType: "voice_design",
   }, {
-    fetchResource: async () => { throw new Error("protected voice content must not be fetched directly"); },
+    fetchResource: async url => { urls.push(url); return new Response(audio); },
   });
-  assert.deepEqual(calls, ["/voice-design/tasks/voice-task-2/content"]);
+  assert.deepEqual(calls, ["/voice-design/tasks/voice-task-2"]);
+  assert.deepEqual(urls, ["https://objects.example/voice-2.mp3?signature=temporary"]);
 });
 
 test("local recordings remain playable from cache without any gateway or remote request", async () => {

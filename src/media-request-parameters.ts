@@ -1,10 +1,12 @@
 import type { ImageGenerationInput } from "./generation.ts";
 import type { VideoSettings } from "./video-models.ts";
 
-/** Shared by submission and estimation so API field names cannot drift. */
-export function imageGenerationParameters(input: Pick<ImageGenerationInput,
-  "count" | "size" | "resolutionTier" | "qualityMode" | "aspectRatio" | "outputFormat" | "responseFormat"
->) {
+type ImageParameterInput = Pick<ImageGenerationInput,
+  "count" | "size" | "resolutionTier" | "qualityMode" | "aspectRatio" | "outputFormat"
+>;
+
+/** Pricing dimensions shared by generation and estimate requests. */
+export function imageEstimateParameters(input: ImageParameterInput) {
   return {
     n: input.count || 1,
     ...(input.size ? { size: input.size } : {}),
@@ -12,7 +14,16 @@ export function imageGenerationParameters(input: Pick<ImageGenerationInput,
     ...(input.qualityMode ? { quality_mode: input.qualityMode } : {}),
     ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio } : {}),
     ...(input.outputFormat ? { output_format: input.outputFormat } : {}),
-    ...(input.responseFormat ? { response_format: input.responseFormat } : {}),
+  };
+}
+
+/** Generation additionally chooses the response delivery format. */
+export function imageGenerationParameters(input: ImageParameterInput) {
+  return {
+    ...imageEstimateParameters(input),
+    // Canvas persists and renders media by its platform/COS URL. Never allow
+    // a legacy b64_json preference to select an inline response.
+    response_format: "url" as const,
   };
 }
 

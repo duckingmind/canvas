@@ -3,7 +3,6 @@ import { client } from "./platform-client";
 import { captureDocumentStorageSession } from "./document-storage";
 import { listAssets, type AssetRow, type AssetStorage } from "./asset-library";
 import { listPlatformAssets, readPlatformAsset, type PlatformAssetApi, type PlatformAssetPage } from "./platform-asset-library";
-import { readCachedImage } from "./image-cache";
 import { taskImageResults, taskImageThumbnailResults } from "./image-recovery";
 
 /** A lightweight candidate consumed by the creator's @ menu. */
@@ -86,10 +85,8 @@ function candidateFor(row: AssetRow, platformPreviews: Map<string, { image?: str
     // intentionally resolved only after the user selects this candidate.
     return { ...base, image: preview?.imageThumbnail, imageThumbnail: preview?.imageThumbnail, assetId: asset.source.assetId, taskId: asset.source.taskId };
   }
-  if (asset.source.type === "local" && asset.source.localImage) {
-    const preview = platformPreviews.get(asset.id);
-    return { ...base, ...(preview?.image ? { image: preview.image } : {}), localImage: asset.source.localImage };
-  }
+  // Browser-local image assets are legacy cache entries. They cannot be
+  // submitted as references; only a platform/COS asset may enter the picker.
   if (asset.source.type === "task") return { ...base, taskId: asset.source.taskId };
   if (asset.source.type === "url") return base;
   return undefined;
@@ -196,20 +193,8 @@ export function usePromptMentionAssets(options: UsePromptMentionAssetsOptions): 
         for (const [id, preview] of pagePreviews) previews.current.set(id, preview);
       }
       if (local) {
-        const localImageRows = local.items.filter(item => item.asset.kind === "image");
-        // KV rows hold content-addressed local keys rather than URLs. Reading
-        // these browser-local previews is bounded to the current page and
-        // never downloads remote media or calls one detail endpoint per row.
-        const localPreviews = await Promise.allSettled(localImageRows.map(async row => {
-          if (row.asset.source.type !== "local" || !row.asset.source.localImage) return [row.asset.id, undefined] as const;
-          const image = await readCachedImage(row.asset.source.localImage);
-          return [row.asset.id, image || undefined] as const;
-        }));
-        check();
-        for (const result of localPreviews) {
-          if (result.status === "fulfilled" && result.value[1]) previews.current.set(result.value[0], { image: result.value[1] });
-        }
-        nextRows.push(...localImageRows);
+        // Local KV image rows intentionally stay out of the reference picker;
+        // they have no COS URL and cannot be sent to an upstream model.
       }
       const merge = (old: AssetRow[], incoming: AssetRow[]) => [...new Map([...old, ...incoming].map(item => [item.asset.id, item])).values()];
       setRows(old => merge(reset ? [] : old, nextRows));
@@ -264,12 +249,7 @@ export function usePromptMentionAssets(options: UsePromptMentionAssetsOptions): 
         ...(source.resultIndex !== undefined ? { resultIndex: source.resultIndex } : {}),
       };
     }
-    if (source.type === "local" && source.localImage) {
-      const image = await readCachedImage(source.localImage);
-      check();
-      if (!image) throw new Error("本机图片已丢失，请重新上传后引用。");
-      return { id: row.asset.id, title: row.asset.name, image, localImage: source.localImage };
-    }
+    if (source.type === "local") throw new Error("本地图片没有 COS 地址，请重新上传后引用。");
     if (source.type === "task") {
       const response = await api.request(`/images/tasks/${encodeURIComponent(source.taskId)}`);
       const index = source.resultIndex || 0;

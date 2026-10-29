@@ -1,5 +1,5 @@
 import React from "react";
-import { ArrowLeft, FileText, Film, Folder, Image, Library, LoaderCircle, Music2, Pencil, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
+import { ArrowLeft, ChevronDown, FileText, Film, Folder, Image, Library, LoaderCircle, LockKeyhole, Music2, Pencil, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
 import { categoryLabels, filterAssets, kindLabels, type AssetCategory, type AssetFilters, type AssetKind, type AssetRow, type CanvasAsset } from "./asset-library";
 import CanvasMediaPlayer from "./CanvasMediaPlayer";
 import "./asset-library.css";
@@ -33,6 +33,8 @@ export type AssetLibraryPanelProps = {
   onRemove: (row: AssetRow) => void;
   resolvePreview: (asset: CanvasAsset) => Promise<AssetPreview>;
   onBackToCreator?: () => void;
+  onOpenCanvasAssets?: () => void;
+  available?: boolean;
   /** A creator can open the library specifically to choose a Cover source. */
   audioReferenceSelection?: boolean;
 };
@@ -42,7 +44,7 @@ export function AssetKindIcon({ kind, size = 22 }: { kind: AssetKind; size?: num
   return <Icon size={size} aria-hidden="true" />;
 }
 
-function AssetCard({ row, busy, onInsert, onEdit, onSave, onRemove, resolvePreview, audioReferenceSelection }: {
+function AssetCard({ row, busy, onInsert, onEdit, onSave, onRemove, resolvePreview, onNotice, audioReferenceSelection }: {
   row: AssetRow;
   busy: boolean;
   onInsert: () => void;
@@ -50,6 +52,7 @@ function AssetCard({ row, busy, onInsert, onEdit, onSave, onRemove, resolvePrevi
   onSave?: () => void;
   onRemove: () => void;
   resolvePreview: AssetLibraryPanelProps["resolvePreview"];
+  onNotice?: AssetLibraryPanelProps["onNotice"];
   audioReferenceSelection?: boolean;
 }) {
   const { asset } = row;
@@ -60,6 +63,7 @@ function AssetCard({ row, busy, onInsert, onEdit, onSave, onRemove, resolvePrevi
   const [attempt, setAttempt] = React.useState(0);
   const [confirmRemove, setConfirmRemove] = React.useState(false);
   const titleId = React.useId();
+  const lastPreviewErrorNotice = React.useRef("");
 
   React.useEffect(() => {
     if (!card.current || typeof IntersectionObserver === "undefined") {
@@ -95,6 +99,17 @@ function AssetCard({ row, busy, onInsert, onEdit, onSave, onRemove, resolvePrevi
     return () => { active = false; resolvedPreview?.release?.(); };
   }, [asset, resolvePreview, visible, attempt]);
 
+  React.useEffect(() => {
+    if (!preview || preview.availability !== "unavailable" || !preview.message) {
+      lastPreviewErrorNotice.current = "";
+      return;
+    }
+    const key = `${asset.id}:${attempt}:${preview.message}`;
+    if (!onNotice || lastPreviewErrorNotice.current === key) return;
+    lastPreviewErrorNotice.current = key;
+    onNotice(preview.message, { label: "重新加载", run: () => setAttempt(value => value + 1) });
+  }, [asset.id, attempt, onNotice, preview]);
+
   const missing = preview?.availability === "local-missing";
   const unavailable = preview?.availability === "unavailable";
   // Platform images are backed by COS. Their canonical URL is for opening or
@@ -125,9 +140,9 @@ function AssetCard({ row, busy, onInsert, onEdit, onSave, onRemove, resolvePrevi
       <p className="asset-library-card-category">{asset.category === "person" ? "角色" : categoryLabels[asset.category]}{asset.source.type === "local" && <span> · 本机文件</span>}</p>
       <p className="asset-library-card-folder" title={asset.folder || "默认文件夹"}><Folder size={11} />{asset.folder || "默认文件夹"}</p>
       {!!asset.tags.length && <p className="asset-library-tags" title={asset.tags.join("、")}>{asset.tags.slice(0, 3).map(tag => <span key={tag}>{tag}</span>)}{asset.tags.length > 3 && <span>+{asset.tags.length - 3}</span>}</p>}
-      {asset.kind === "audio" && ready && preview.url && !failed && <div className="asset-library-audio-preview"><CanvasMediaPlayer kind="audio" src={preview.url} label={`试听 ${asset.name}`} preload="none" onError={() => setFailed(true)} /></div>}
+      {asset.kind === "audio" && ready && preview.url && !failed && <div className="asset-library-audio-preview"><CanvasMediaPlayer kind="audio" src={preview.url} label={`试听 ${asset.name}`} preload="none" onNotice={(text, action) => onNotice?.(text, action)} onError={() => setFailed(true)} /></div>}
       {(missing || unavailable || failed) && <div className="asset-library-availability">
-        <p>{missing ? "此素材保存在原设备，请在原设备打开" : unavailable ? preview?.message || "素材暂不可用" : "预览暂不可用"}</p>
+        <p>{missing ? "此素材保存在原设备，请在原设备打开" : "素材暂不可用"}</p>
         <button type="button" disabled={busy} onClick={() => setAttempt(value => value + 1)}><RefreshCw size={12} />重新加载</button>
       </div>}
     </div>
@@ -142,7 +157,7 @@ function AssetCard({ row, busy, onInsert, onEdit, onSave, onRemove, resolvePrevi
   </article>;
 }
 
-export default function AssetLibraryPanel({ rows, loading, error, busyId, hasMore, knownTags, knownFolders, onFiltersChange, onLoadMore, onRefresh, onNotice, onInsert, onEdit, onSave, onRemove, resolvePreview, onBackToCreator, audioReferenceSelection }: AssetLibraryPanelProps) {
+export default function AssetLibraryPanel({ rows, loading, error, busyId, hasMore, knownTags, knownFolders, onFiltersChange, onLoadMore, onRefresh, onNotice, onInsert, onEdit, onSave, onRemove, resolvePreview, onBackToCreator, onOpenCanvasAssets, available = true, audioReferenceSelection }: AssetLibraryPanelProps) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const loadMoreSentinelRef = React.useRef<HTMLDivElement>(null);
   const onLoadMoreRef = React.useRef(onLoadMore);
@@ -211,7 +226,7 @@ export default function AssetLibraryPanel({ rows, loading, error, busyId, hasMor
 
   return <section className="asset-library" data-canvas-management aria-label="Canvas 资产库" aria-busy={loading || undefined}>
     <div className="asset-library-heading">
-      <span><Library size={16} />{audioReferenceSelection ? "选择参考音频" : "Canvas 资产"}</span>
+      <span><Library size={16} />{audioReferenceSelection ? "选择参考音频" : "资产库"}</span>
       <span className="asset-library-heading-actions">
         <span className="asset-library-scope">当前应用</span>
         {onBackToCreator && <button type="button" className="asset-library-back" onClick={onBackToCreator}><ArrowLeft size={13} />返回创作</button>}
@@ -221,6 +236,7 @@ export default function AssetLibraryPanel({ rows, loading, error, busyId, hasMor
       <label className="asset-library-search"><Search size={15} aria-hidden="true" /><input aria-label="搜索资产库" placeholder="搜索名称、标签或文件夹" value={query} onChange={event => setQuery(event.target.value)} />{query && <button type="button" aria-label="清空资产搜索" onClick={() => { setQuery(""); setSearch(""); }}><X size={14} /></button>}</label>
       <button type="button" className="asset-library-icon-button" aria-label="刷新资产库" title="刷新资产库" disabled={loading} onClick={onRefresh}><RefreshCw size={15} className={loading ? "spin" : ""} /></button>
     </div>
+    {!audioReferenceSelection && <p className="asset-library-intro">保存到这里的媒体可在其他画布添加复用。</p>}
     {!audioReferenceSelection && <div className="asset-library-kind-filters" role="group" aria-label="素材类型">
       <button type="button" aria-pressed={kind === "all"} onClick={() => setKind("all")}>全部</button>
       {(Object.keys(kindLabels) as AssetKind[]).map(value => <button type="button" key={value} aria-pressed={kind === value} onClick={() => setKind(value)}>{kindLabels[value]}</button>)}
@@ -230,14 +246,19 @@ export default function AssetLibraryPanel({ rows, loading, error, busyId, hasMor
       {(Object.keys(categoryLabels) as AssetCategory[]).map(value => <button type="button" key={value} aria-pressed={category === value} onClick={() => setCategory(value)}>{value === "person" ? "角色" : categoryLabels[value]}</button>)}
     </div>
     <div className="asset-library-organize-filters">
-      <label><Folder size={13} /><select aria-label="按文件夹筛选资产" value={folder === undefined ? "" : `folder:${folder}`} onChange={event => setFolder(event.target.value === "" ? undefined : event.target.value.slice(7))}><option value="">全部文件夹</option>{[...new Set(["", ...discoveredFolders])].map(value => <option key={value} value={`folder:${value}`}>{value || "默认文件夹"}</option>)}</select></label>
-      <label><Tag size={13} /><select aria-label="按标签筛选资产" value={tag} onChange={event => setTag(event.target.value)}><option value="">全部标签</option>{discoveredTags.map(value => <option key={value} value={value}>{value}</option>)}</select></label>
+      <label className="asset-library-filter-select"><Folder size={13} aria-hidden="true" /><select aria-label="按文件夹筛选资产" value={folder === undefined ? "" : `folder:${folder}`} onChange={event => setFolder(event.target.value === "" ? undefined : event.target.value.slice(7))}><option value="">全部文件夹</option>{[...new Set(["", ...discoveredFolders])].map(value => <option key={value} value={`folder:${value}`}>{value || "默认文件夹"}</option>)}</select><ChevronDown className="asset-library-filter-chevron" size={13} aria-hidden="true" /></label>
+      <label className="asset-library-filter-select"><Tag size={13} aria-hidden="true" /><select aria-label="按标签筛选资产" value={tag} onChange={event => setTag(event.target.value)}><option value="">全部标签</option>{discoveredTags.map(value => <option key={value} value={value}>{value}</option>)}</select><ChevronDown className="asset-library-filter-chevron" size={13} aria-hidden="true" /></label>
       {hasFilters && <button type="button" className="asset-library-clear" onClick={clearFilters}>重置</button>}
     </div>
     <div ref={scrollRef} className="asset-library-scroll">
-      {filtered.length > 0 ? <div className="asset-library-grid">{filtered.map(row => <AssetCard key={row.asset.id} row={row} busy={busyId === row.asset.id} onInsert={() => onInsert(row)} onEdit={() => onEdit(row)} onSave={onSave ? () => onSave(row) : undefined} onRemove={() => onRemove(row)} resolvePreview={resolvePreview} audioReferenceSelection={audioReferenceSelection} />)}</div>
+      {filtered.length > 0 ? <div className="asset-library-grid">{filtered.map(row => <AssetCard key={row.asset.id} row={row} busy={busyId === row.asset.id} onInsert={() => onInsert(row)} onEdit={() => onEdit(row)} onSave={onSave ? () => onSave(row) : undefined} onRemove={() => onRemove(row)} resolvePreview={resolvePreview} onNotice={onNotice} audioReferenceSelection={audioReferenceSelection} />)}</div>
         : loading ? <div className="asset-library-empty" role="status"><LoaderCircle size={24} className="spin" /><p>正在加载资产…</p></div>
-          : <div className="asset-library-empty"><Library size={26} aria-hidden="true" /><strong>{hasFilters ? "没有找到符合条件的资产" : "还没有云端媒体资产"}</strong><p>{hasFilters ? hasMore ? "可继续加载更多资产，或调整筛选条件。" : "试试其他名称、标签或文件夹。" : "生成完成的图片、视频和音频会先出现在这里；保存为资产后，可在其他 Canvas 画布中长期使用。"}</p>{hasFilters && <button type="button" onClick={clearFilters}>清除筛选</button>}</div>}
+          : <div className="asset-library-empty">
+            {!available ? <LockKeyhole size={26} aria-hidden="true" /> : <Library size={26} aria-hidden="true" />}
+            <strong>{hasFilters ? "没有找到符合条件的资产" : available ? "资产库还没有内容" : "登录后使用资产库"}</strong>
+            <p>{hasFilters ? hasMore ? "可继续加载更多资产，或调整筛选条件。" : "试试其他名称、标签或文件夹。" : available ? "选中画布中的图片、视频、音频或提示词，在节点快捷栏点击保存为资产。保存后可在这里添加到当前或其他画布。" : "登录后即可跨画布保存和复用资产；当前画布内容仍可继续编辑。"}</p>
+            {hasFilters ? <button type="button" onClick={clearFilters}>清除筛选</button> : available && onOpenCanvasAssets && !audioReferenceSelection ? <button type="button" className="asset-library-onboarding-action" onClick={onOpenCanvasAssets}>查看画布素材</button> : null}
+          </div>}
       {hasMore && onLoadMore && <>
         <div ref={loadMoreSentinelRef} className="asset-library-load-sentinel" aria-hidden="true" />
         <button type="button" className="asset-library-load-more" disabled={loading} onClick={onLoadMore}>{loading ? <><LoaderCircle size={14} className="spin" />正在加载…</> : "加载更多资产"}</button>

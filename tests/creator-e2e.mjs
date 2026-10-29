@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createImageNode } from "./canvas-ui.mjs";
 
 const { chromium } = await import(
   process.env.CANVAS_PLAYWRIGHT_MODULE || "playwright"
@@ -129,7 +130,7 @@ try {
   await page.getByLabel("无限创作画布").waitFor();
   const collapse = button("收起画布列表").first();
   if (await collapse.isVisible()) await collapse.click();
-  await button("创建图片").click();
+  await createImageNode(page);
   await creator().waitFor();
   const promptId = await selectedId();
   assert.ok(promptId);
@@ -270,6 +271,19 @@ try {
   await eventually(
     () => creatorResultImage.evaluate((image) => image.complete && image.naturalWidth > 0),
     "creator result image loaded",
+  );
+  await eventually(async () => {
+    const [bounds, dimensions] = await Promise.all([
+      prompt.boundingBox(),
+      creatorResultImage.evaluate((image) => ({ width: image.naturalWidth, height: image.naturalHeight })),
+    ]);
+    return Boolean(bounds && Math.abs(bounds.width / bounds.height - dimensions.width / dimensions.height) < 0.02);
+  }, "generated image node frame matches its decoded image ratio");
+  const aspectDocument = await snapshot();
+  assert.equal(
+    aspectDocument.nodes.find((node) => node.id === promptId)?.imageAspectRatio,
+    "4:2",
+    "decoded image ratio is retained for reopening the canvas",
   );
   const imageRequestsBeforeCopy = displayedImageRequests.length;
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: base });
@@ -456,6 +470,14 @@ try {
     ).length,
     1,
   );
+  const slowPost = (await state()).requests.find(
+    (request) => request.method === "POST" && request.model === "fixture-slow",
+  );
+  assert.equal(
+    slowPost?.prompt,
+    "保留参考构图，将背景改为冬季雪景。",
+    "editing the next prompt during generation does not mutate the frozen request",
+  );
   passed("asynchronous completion preserves other selection and viewport with one POST");
 
   await prompt.click();
@@ -556,6 +578,7 @@ try {
       thumbnail_url: `${base}/v1/fixture-image.png?mention-scene-thumbnail=${index}`,
     })),
     { id: "mention-person", name: "引用测试人物", category: "person", saved_to_library: true, thumbnail_url: `${base}/v1/fixture-image.png?mention-person-thumbnail=1` },
+    { id: "mention-generic-image", name: "image.png", category: "object", saved_to_library: true, thumbnail_url: `${base}/v1/fixture-image.png?mention-generic-thumbnail=1` },
   ] });
   await draft.fill("复用已有素材 @");
   const mentionMenu = page.getByRole("dialog", { name: "引用素材", exact: true });
@@ -594,7 +617,17 @@ try {
   const repeatedReferences = mentionDocument.nodes.find((node) => node.id === promptId).promptSegments.filter((segment) => segment.type === "reference");
   assert.deepEqual(repeatedReferences.map((segment) => segment.referenceId), [libraryNode.id, libraryNode.id], "repeated mentions preserve the original node identity");
   assert.equal(mentionDocument.edges.filter((edge) => edge.from === libraryNode.id && edge.to === promptId).length, 1, "repeated mentions do not duplicate the reference connection");
-  passed("the mention menu filters category panels, previews images, and permits current-reference reuse without duplicate nodes or connections");
+  await draft.press("End");
+  await page.keyboard.type(" 再加入 @image");
+  await mentionMenu.waitFor();
+  await mentionMenu.getByRole("option", { name: "image.png", exact: true }).click();
+  const imageOnlyMention = draft.locator(".context-prompt-mention.is-image-only");
+  await imageOnlyMention.waitFor();
+  assert.equal(await imageOnlyMention.locator("img").count(), 1, "generic image filenames leave the thumbnail as the visible reference token");
+  assert.equal(await imageOnlyMention.locator(".context-prompt-mention-label").count(), 0, "generic image filenames are not repeated beside the thumbnail");
+  assert.match(await imageOnlyMention.getAttribute("aria-label"), /image\.png/, "the image filename remains accessible");
+  assert.equal(await imageOnlyMention.getAttribute("title"), "image.png", "the filename remains available on hover");
+  passed("the mention menu filters and previews assets, reuses existing references, and renders generic image files as accessible thumbnails");
 
   await button("关闭图片创作").click();
   const board = page.getByLabel("无限创作画布");
@@ -629,7 +662,10 @@ try {
 
   // A single-output generation is persisted on its prompt node. It remains a
   // valid image source for a different prompt in the same canvas.
-  if (await creator().isVisible()) await button("关闭图片创作").click();
+  const closeBeforeFinalPicker = button("关闭图片创作");
+  if (await closeBeforeFinalPicker.count() && await closeBeforeFinalPicker.isVisible().catch(() => false)) {
+    await closeBeforeFinalPicker.click({ timeout: 1000 }).catch(() => {});
+  }
   await button("添加节点").click();
   const finalNodePicker = page.getByRole("dialog", { name: "添加节点", exact: true });
   await finalNodePicker.getByRole("button", { name: /图片生成/ }).click();

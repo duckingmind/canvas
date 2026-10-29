@@ -7,7 +7,12 @@ export type VideoSourceApi = { request: VideoRequest };
 export type VideoSourceNode = Partial<Pick<CanvasNode, "video" | "localVideo" | "videoContentUrl" | "videoContentUrlExpiresAt" | "taskId" | "assetId" | "status" | "type" | "mediaType">>;
 export type ResolvedVideoSource = { url: string; assetId?: string; urlExpiresAt?: string; release?: () => void };
 export type VideoSourceOptions = { forceRefresh?: boolean; now?: number; minValidityMs?: number; signal?: AbortSignal };
-export type VideoSourceBlobOptions = VideoSourceOptions & { fetchResource?: typeof fetch; maxBytes?: number };
+export type VideoSourceReadProgress = { loadedBytes: number; totalBytes?: number };
+export type VideoSourceBlobOptions = VideoSourceOptions & {
+  fetchResource?: typeof fetch;
+  maxBytes?: number;
+  onProgress?: (progress: VideoSourceReadProgress) => void;
+};
 
 export class VideoSourceError extends Error {
   readonly code: string;
@@ -216,8 +221,10 @@ export async function resolveVideoSource(api: VideoSourceApi, node: VideoSourceN
   return source;
 }
 
-async function readBoundedResponse(response: Response, maxBytes: number, signal?: AbortSignal): Promise<Blob> {
+async function readBoundedResponse(response: Response, maxBytes: number, signal?: AbortSignal, onProgress?: VideoSourceBlobOptions["onProgress"]): Promise<Blob> {
   const length = Number(response.headers.get("content-length"));
+  const encoding = response.headers.get("content-encoding");
+  const totalBytes = (!encoding || encoding === "identity") && Number.isSafeInteger(length) && length > 0 ? length : undefined;
   if (Number.isFinite(length) && length > maxBytes) {
     await response.body?.cancel().catch(() => {});
     throw new VideoSourceError("视频大小超过本次操作的限制。", "VIDEO_CONTENT_TOO_LARGE");
@@ -226,6 +233,13 @@ async function readBoundedResponse(response: Response, maxBytes: number, signal?
   if (!reader) throw new VideoSourceError("视频内容为空或不可用。", "VIDEO_CONTENT_EMPTY");
   const chunks: ArrayBuffer[] = [];
   let size = 0;
+  let lastProgressAt = 0;
+  const reportProgress = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastProgressAt < 100) return;
+    lastProgressAt = now;
+    try { onProgress?.({ loadedBytes: size, ...(totalBytes ? { totalBytes } : {}) }); } catch { /* Progress observers must not interrupt media reads. */ }
+  };
   const onAbort = () => { void reader.cancel().catch(() => {}); };
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
@@ -237,6 +251,7 @@ async function readBoundedResponse(response: Response, maxBytes: number, signal?
       size += value.byteLength;
       if (size > maxBytes) throw new VideoSourceError("视频大小超过本次操作的限制。", "VIDEO_CONTENT_TOO_LARGE");
       chunks.push(new Uint8Array(value).buffer);
+      reportProgress();
     }
   } catch (error) {
     await reader.cancel().catch(() => {});
@@ -245,7 +260,7 @@ async function readBoundedResponse(response: Response, maxBytes: number, signal?
     signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
-  const encoding = response.headers.get("content-encoding");
+  reportProgress(true);
   if ((!encoding || encoding === "identity") && length > 0 && size !== length) throw new VideoSourceError("视频下载不完整，请重试。", "VIDEO_CONTENT_TRUNCATED");
   return validateVideoContentBlob(new Blob(chunks, { type: response.headers.get("content-type") || "" }));
 }
@@ -260,6 +275,7 @@ export async function readVideoSourceBlob(api: VideoSourceApi, node: VideoSource
     aborted(options.signal);
     if (blob) {
       if (blob.size > maxBytes) throw new VideoSourceError("视频大小超过本次操作的限制。", "VIDEO_CONTENT_TOO_LARGE");
+      try { options.onProgress?.({ loadedBytes: blob.size, totalBytes: blob.size }); } catch { /* Progress observers must not interrupt media reads. */ }
       return validateVideoContentBlob(blob);
     }
     if (!node.assetId && !stableTask(node))
@@ -280,7 +296,7 @@ export async function readVideoSourceBlob(api: VideoSourceApi, node: VideoSource
         await response.body?.cancel().catch(() => {});
         throw new VideoSourceError(`视频下载失败（HTTP ${response.status}）。`, "VIDEO_CONTENT_HTTP_ERROR", { status: response.status });
       }
-      return await readBoundedResponse(response, maxBytes, options.signal);
+      return await readBoundedResponse(response, maxBytes, options.signal, options.onProgress);
     } catch (error) {
       aborted(options.signal);
       if (attempt > 0 || !canRefresh || (error instanceof VideoSourceError && error.code === "VIDEO_CONTENT_TOO_LARGE")) throw error;

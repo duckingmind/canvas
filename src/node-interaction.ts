@@ -10,6 +10,7 @@
 import { mediaTaskState } from "./shared/media-task-state.ts";
 import { hasRecoverableVideoIdentity } from "./video-node-media.ts";
 import { hasRecoverableAudioIdentity } from "./audio-source.ts";
+import { isCompletedMediaValue } from "./canvas-connections.ts";
 
 export type NodeKind = "note" | "prompt" | "image" | "video" | "audio";
 export type VisualNodeType = NodeKind;
@@ -48,6 +49,8 @@ export type InteractionNode = {
 export type NodeInteractionContext = {
   /** Set when the node itself contains an image/video result. */
   hasMediaContent?: boolean;
+  /** Keep a completed media value's input port visible for references. */
+  allowCompletedMediaInput?: boolean;
   /** Set when generated result nodes exist for a prompt. */
   hasGeneratedResult?: boolean;
   /** A task is currently running or resumable for this node. */
@@ -138,6 +141,9 @@ export function hasPendingNodeTask(node: InteractionNode): boolean {
 
 export function nodeHasMediaContent(node: InteractionNode): boolean {
   return Boolean(
+    // Platform asset IDs remain authoritative while signed delivery URLs are
+    // being refreshed (or are intentionally omitted from the cloud document).
+    (node.type === "image" || node.type === "video" || node.type === "audio" || node.type === "prompt") && node.assetId ||
     (node.type === "image" || node.type === "prompt") && node.image ||
     (node.type === "video" || node.type === "prompt") &&
         (node.video || node.localVideo || node.videoContentUrl) || hasRecoverableVideoIdentity(node) ||
@@ -187,7 +193,10 @@ export function getNodeInteraction(
   const canPreview = hasMedia;
   const canUpload = (node.type === "image" || node.type === "audio") && !hasOwnMedia;
   const canReceiveConnection = node.type === "note" ||
-    (node.type === "prompt" && !completedMedia);
+    (node.type === "prompt" && !completedMedia) ||
+    Boolean(context.allowCompletedMediaInput &&
+      (node.type === "prompt" && completedMedia || node.type === "image" || node.type === "video" || node.type === "audio") &&
+      (hasOwnMedia || isCompletedMediaValue(node)));
   // Workflow nodes can emit a request even before they have any media. An
   // image/video value cannot be a useful source until it has an actual value;
   // exposing its output port while empty creates edges that later fail during
@@ -195,7 +204,11 @@ export function getNodeInteraction(
   // rendering, hit testing and persistence all agree.
   const canStartConnection = node.type === "note" ||
     node.type === "prompt" ||
-    hasMedia;
+    hasMedia ||
+    // A cloud projection may temporarily remove a completed value's delivery
+    // URL. Keep its output port available so an explicit reference can be
+    // completed in either direction while recovery runs.
+    isCompletedMediaValue(node);
   const primaryAction: PrimaryAction = pending
     ? "task"
     : node.type === "note"
@@ -216,8 +229,9 @@ export function getNodeInteraction(
     canPreview,
     canUpload,
     canReceiveConnection,
-    // Source and target rules are deliberately separate: a media value can
-    // feed a workflow node, while an empty media placeholder cannot.
+    // Source and target rules are deliberately separate. Media values can feed
+    // workflow nodes, and an explicitly-enabled value target can receive a
+    // reference input; empty media placeholders remain disconnected.
     canStartConnection,
     // Keep the basic toolbar available for every node; its primary action is
     // selected by the policy above rather than by ad-hoc type checks.

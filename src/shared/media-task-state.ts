@@ -57,6 +57,16 @@ export const MEDIA_TASK_RECONCILIATION_CODES = [
 ] as const
 
 const reconciliationCodes = new Set<string>(MEDIA_TASK_RECONCILIATION_CODES.map((value) => value.toLowerCase()))
+const automaticFailoverCodes = new Set([
+  'creation_result_unknown_failover',
+  'provider_lookup_unsupported',
+  'provider_status_lookup_unsupported',
+  'provider_reconciliation_manual_required',
+  'provider_reconciliation_identity_mismatch',
+  'provider_reconciliation_attempts_exhausted',
+  'asset_collection_reconciliation_required',
+  'upstream_poll_result_unknown_failover',
+])
 const failureStatuses = new Set(['failed', 'cancelled', 'canceled', 'expired', 'refunded', 'unknown_resolution_expired'])
 const unavailableAssetStatuses = new Set(['failed', 'expired', 'unavailable'])
 // The retry endpoint only accepts failed/cancelled durable tasks. Expiry and
@@ -97,12 +107,18 @@ export function mediaTaskReconciliationClosed(input: MediaTaskStateInput) {
 }
 
 export function mediaTaskNeedsManualReconciliation(input: MediaTaskStateInput) {
-  if (!requiresMediaTaskReconciliation(input)) return false
-  return normalized(input.reconciliationState) === 'manual_required' ||
-    normalized(input.currentStage) === 'reconciliation_manual' ||
-    [input.code, input.attentionReason].some(value => [
-      'provider_lookup_unsupported', 'provider_status_lookup_unsupported', 'provider_reconciliation_manual_required',
-    ].includes(normalized(value)))
+  // Backwards-compatible API. Unknown outcomes are routed automatically;
+  // they must never stop polling in a human-owned queue.
+  return false
+}
+
+export function mediaTaskAwaitingAutomaticFailover(input: MediaTaskStateInput) {
+  const code = normalized(input.code)
+  const stage = normalized(input.currentStage)
+  const reason = normalized(input.attentionReason)
+  return automaticFailoverCodes.has(code) || automaticFailoverCodes.has(reason) ||
+    ['reconciliation_failover', 'reconciliation_manual', 'reconciliation_manual_required'].includes(stage) ||
+    reason === 'automatic_provider_failover' || normalized(input.reconciliationState) === 'manual_required'
 }
 
 export function mediaTaskState(input: MediaTaskStateInput): MediaTaskState {
@@ -219,11 +235,12 @@ export function canRetryMediaTask(input: MediaTaskStateInput) {
 /** Precise UI labels without changing the compatible four-state filter contract. */
 export function mediaTaskDisplayLabel(input: MediaTaskStateInput, locale: 'zh' | 'en' = 'zh') {
   const en = locale === 'en'
-  if (mediaTaskReconciliationClosed(input)) return en ? 'Closed · result unconfirmed' : '已关闭 · 结果待核查'
+  if (mediaTaskReconciliationClosed(input)) return en ? 'Automatic fallback ended · result unconfirmed' : '自动兜底已结束 · 结果未确认'
+  if (mediaTaskAwaitingAutomaticFailover(input)) return en ? 'Switching to a fallback provider' : '正在切换备用渠道'
   if (requiresMediaTaskReconciliation(input)) {
-    return mediaTaskNeedsManualReconciliation(input)
-      ? en ? 'Awaiting manual verification' : '待人工核查'
-      : en ? 'Awaiting verification' : '待核验'
+    return mediaTaskAwaitingAutomaticFailover(input)
+      ? en ? 'Switching to a fallback provider' : '正在切换备用渠道'
+      : en ? 'Recovering provider result' : '系统恢复中'
   }
   const state = mediaTaskPublicState(input)
   if (state === 'succeeded' && normalized(input.code) === 'unknown_recovered_after_release') return en ? 'Result recovered' : '已追回结果'

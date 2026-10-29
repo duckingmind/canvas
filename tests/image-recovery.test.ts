@@ -125,7 +125,7 @@ test("stored asset matching rejects malformed and ambiguous ownership", () => {
   );
 });
 
-test("task image results preserve slots and accept URL and base64 outputs", () => {
+test("task image results preserve slots and reject inline Base64 outputs", () => {
   assert.deepEqual(
     taskImageResults({
       data: [
@@ -139,7 +139,7 @@ test("task image results preserve slots and accept URL and base64 outputs", () =
     [
       "https://cdn.example/first.png",
       undefined,
-      "data:image/png;base64,dGhpcmQ=",
+      undefined,
       undefined,
       "/api/media/fifth",
     ],
@@ -196,11 +196,6 @@ test("multi-output recovery uses resultIndex instead of document order", () => {
   );
   assert.deepEqual(updates, [
     {
-      id: "third-card",
-      taskId: "task-1",
-      image: "data:image/png;base64,dGhpcmQ=",
-    },
-    {
       id: "first-card",
       taskId: "task-1",
       image: "https://cdn.example/first.png",
@@ -244,11 +239,7 @@ test("single-output recovery honors an explicit index and rejects a missing slot
       [{ id: "only", resultIndex: 1 }],
       { data: [{ url: "https://cdn/zero.png" }, { b64_json: "b25l" }] },
     ),
-    [{
-      id: "only",
-      taskId: "task-single",
-      image: "data:image/png;base64,b25l",
-    }],
+    [],
   );
   assert.deepEqual(
     mapTaskImageResults(

@@ -14,11 +14,11 @@ import type { MusicRequest } from "../src/music-generation.ts";
 test("Gateway succeeded status maps to a completed voice result", async () => {
   const snapshot = voiceDesignSnapshot({
     id: "voice-task-1", status: "completed", task_status: "succeeded", voice_id: "voice-1",
-    content_url: "/v1/voice-design/tasks/voice-task-1/content", trial_audio: { available: true },
+    content_url: "https://objects.example/voice.mp3?signature=temporary", trial_audio: { available: true, url: "https://objects.example/voice.mp3?signature=temporary" },
   });
   assert.deepEqual(snapshot, {
     taskId: "voice-task-1", status: "succeeded", voiceId: "voice-1",
-    contentUrl: "/v1/voice-design/tasks/voice-task-1/content", trialAudioAvailable: true,
+    contentUrl: "https://objects.example/voice.mp3?signature=temporary", trialAudioAvailable: true,
   });
   const result = await generateVoiceDesign(async path => {
     assert.equal(path, "/voice-design/generations");
@@ -89,15 +89,33 @@ test("late task identity is saved before a local pause", async () => {
   assert.deepEqual(saved, ["accepted-task"]);
 });
 
-test("task content stays on the authenticated task route and supports its index", async () => {
+test("voice preview downloads directly from the signed URL without a Gateway content request", async () => {
   const audio = new Blob([new Uint8Array([0x49, 0x44, 0x33, 0x04])], { type: "audio/mpeg" });
-  const result = await readVoiceDesignContent(async (path, init) => {
-    assert.equal(path, "/voice-design/tasks/voice-task-2/content?index=1");
-    assert.equal(init?.responseType, "blob");
-    return audio;
-  }, "voice-task-2", "/v1/voice-design/tasks/voice-task-2/content?index=1");
-  assert.equal(result, audio);
-  await assert.rejects(readVoiceDesignContent(async () => audio, "voice-task-2", "https://example.test/other"), error => error instanceof VoiceDesignError && error.code === "VOICE_DESIGN_CONTENT_URL_INVALID");
+  const signedUrl = "https://objects.example/voice.mp3?signature=temporary";
+  let fetched = "";
+  const result = await readVoiceDesignContent(async () => assert.fail("A valid signed URL must not require a Gateway request"), "voice-task-2", signedUrl, undefined, async (url, init) => {
+    fetched = url;
+    assert.equal(init?.credentials, "omit");
+    return new Response(audio);
+  });
+  assert.equal(result.size, audio.size);
+  assert.equal(fetched, signedUrl);
+});
+
+test("a legacy voice content URL is refreshed from task details", async () => {
+  const paths: string[] = [], fetched: string[] = [];
+  const audio = new Blob([new Uint8Array([0x49, 0x44, 0x33, 0x04])], { type: "audio/mpeg" });
+  const signedUrl = "https://objects.example/voice-refreshed.mp3?signature=temporary";
+  const result = await readVoiceDesignContent(async path => {
+    paths.push(path);
+    return { id: "voice-task-2", status: "completed", trial_audio: { available: true, url: signedUrl } };
+  }, "voice-task-2", "https://gateway.example/v1/voice-design/tasks/voice-task-2/content?index=1", undefined, async url => {
+    fetched.push(url);
+    return new Response(audio);
+  });
+  assert.equal(result.size, audio.size);
+  assert.deepEqual(paths, ["/voice-design/tasks/voice-task-2"]);
+  assert.deepEqual(fetched, [signedUrl]);
 });
 
 test("cancellation targets the durable Gateway task", async () => {
@@ -115,4 +133,16 @@ test("voice design freezes the selected catalog model instead of hard-coding its
     assert.equal(JSON.parse(String(init?.body)).model, "supplier-voice-design-v2");
     return { id: "catalog-task", status: "succeeded", voice_id: "voice-2", trial_audio: { available: false } };
   }, { model: "supplier-voice-design-v2", prompt: "warm", previewText: "hello" });
+});
+
+test("automatic recovery never recreates a voice task after an idempotency lookup miss", async () => {
+  const paths: string[] = [];
+  await assert.rejects(generateVoiceDesign(async path => {
+    paths.push(path);
+    if (path === "/voice-design/by-idempotency-key/auto-voice") throw { status: 404, code: "voice_design_task_not_found" };
+    assert.fail(`automatic recovery must not submit to ${path}`);
+  }, { prompt: "p", previewText: "v", idempotencyKey: "auto-voice" }, undefined, {
+    recovery: true, allowResubmit: false,
+  }), error => error instanceof VoiceDesignError && error.pending && !error.terminalTask && error.code === "VOICE_DESIGN_SUBMISSION_NOT_FOUND");
+  assert.deepEqual(paths, ["/voice-design/by-idempotency-key/auto-voice"]);
 });

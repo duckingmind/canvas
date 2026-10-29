@@ -1,15 +1,145 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  copiedMediaIdentity,
+  copiedMediaFields,
+  createEditableCanvasTaskCopy,
   creationInputSignature,
   placeCreatorPanel,
 } from "../src/creation-state.ts";
+import type { CanvasNode } from "../src/canvas-types.ts";
 
 const input = {
   prompt: "柔和的午后光线",
   model: "image-model",
   references: [{ nodeId: "source", image: "https://example.test/image.png" }],
 };
+
+test("duplicating completed video preserves the stable task identity after its signed URL expires", () => {
+  const source: CanvasNode = {
+    id: "video-source", type: "video", mediaType: "video", title: "生成视频", text: "",
+    x: 0, y: 0, width: 360, height: 240, color: "#ccc", video: "https://cdn.test/video.mp4?signature=short-lived",
+    taskId: "video-task", status: "completed",
+  };
+  assert.deepEqual(copiedMediaIdentity(source), { taskId: "video-task", status: "completed" });
+});
+
+test("duplicating an existing platform image reuses its asset identity without an upload state", () => {
+  const source: CanvasNode = {
+    id: "image-source", type: "image", mediaType: "image", title: "平台图片", text: "",
+    x: 0, y: 0, width: 360, height: 240, color: "#ccc",
+    image: "https://cdn.test/signed-image.png?signature=expired",
+    imageThumbnail: "https://cdn.test/signed-thumb.png?signature=expired",
+    assetId: "image-asset", status: "completed",
+    localImage: "proxy-canvas:image:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  };
+  assert.deepEqual(copiedMediaIdentity(source), { assetId: "image-asset", status: "completed" });
+  const fields = copiedMediaFields(source);
+  assert.equal(fields.assetId, "image-asset");
+  assert.equal(fields.image, undefined);
+  assert.equal(fields.imageThumbnail, undefined);
+  assert.equal(fields.localImage, undefined);
+  assert.equal(fields.uploadState, undefined);
+});
+
+test("duplicating a durable URL keeps the URL without creating a new asset", () => {
+  const source: CanvasNode = {
+    id: "image-source", type: "image", mediaType: "image", title: "长期图片", text: "",
+    x: 0, y: 0, width: 360, height: 240, color: "#ccc",
+    image: "https://cdn.example/image.png", status: "completed",
+  };
+  assert.deepEqual(copiedMediaIdentity(source), { status: "completed" });
+  assert.equal(copiedMediaFields(source).image, source.image);
+});
+
+test("duplicating media never treats a temporary URL or local cache as a stable identity", () => {
+  const source: CanvasNode = {
+    id: "video-source", type: "video", mediaType: "video", title: "本地视频", text: "",
+    x: 0, y: 0, width: 360, height: 240, color: "#ccc", localVideo: "proxy-canvas:video:v1:12345678-1234-1234-1234-123456789abc",
+    video: "blob:temporary", status: "completed",
+  };
+  assert.deepEqual(copiedMediaIdentity(source), {});
+  const localImage: CanvasNode = {
+    ...source,
+    id: "local-image", type: "image", mediaType: "image",
+    image: "data:image/png;base64,AAAA", localImage: "proxy-canvas:image:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    localVideo: undefined, video: undefined,
+  };
+  assert.deepEqual(copiedMediaIdentity(localImage), {});
+  assert.equal(copiedMediaFields(localImage).image, undefined);
+});
+
+test("uploading media cannot be duplicated until the platform confirms its identity", () => {
+  const source: CanvasNode = {
+    id: "uploading-image", type: "image", mediaType: "image", title: "上传中", text: "",
+    x: 0, y: 0, width: 360, height: 240, color: "#ccc",
+    image: "https://cdn.example/image.png", assetId: "pending-asset", uploadState: "uploading",
+  };
+  assert.deepEqual(copiedMediaIdentity(source), {});
+});
+
+test("copied embedded references keep stable IDs and clear transient deliveries and cache keys", () => {
+  const source: CanvasNode = {
+    id: "prompt-source", type: "prompt", mediaType: "image", title: "提示词", text: "@人物",
+    x: 0, y: 0, width: 480, height: 270, color: "#ccc",
+    embeddedReferences: [{
+      id: "reference", title: "人物", assetId: "reference-asset",
+      image: "https://cdn.example/image.png?signature=expired",
+      localImage: "proxy-canvas:image:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }],
+  };
+  const reference = copiedMediaFields(source).embeddedReferences?.[0];
+  assert.equal(reference?.assetId, "reference-asset");
+  assert.equal(reference?.image, undefined);
+  assert.equal(reference?.localImage, undefined);
+});
+
+test("copying a creator keeps inputs but clears every old task and result identity", () => {
+  const source: CanvasNode = {
+    id: "creator-old",
+    type: "prompt",
+    mediaType: "image",
+    title: "图片创作",
+    text: "保留这段提示词",
+    promptSegments: [{ type: "text", text: "保留这段提示词" }],
+    embeddedReferences: [{ id: "reference-old", title: "参考图", image: "https://cdn.test/reference.png" }],
+    modelId: "image-model",
+    modelSelection: "user",
+    imageSettings: { resolution: "2k", aspectRatio: "3:4" },
+    x: 10,
+    y: 20,
+    width: 480,
+    height: 270,
+    color: "#ccc",
+    image: "https://cdn.test/old-result.png",
+    imageThumbnail: "https://cdn.test/old-thumb.png",
+    assetId: "old-asset",
+    taskId: "old-task",
+    status: "queued",
+    error: "old error",
+    taskPrompt: "old frozen prompt",
+    taskDiagnostic: { code: "image_submission_not_found" },
+    inputSignature: "old-signature",
+    submission: { key: "old-key", model: "image-model", prompt: "old frozen prompt", images: [] },
+    resultOf: "old-source",
+    resultIndex: 0,
+  };
+
+  const copy = createEditableCanvasTaskCopy(source, "creator-new");
+  assert.equal(copy.id, "creator-new");
+  assert.equal(copy.title, "图片创作 · 新任务");
+  assert.equal(copy.text, source.text);
+  assert.equal(copy.modelId, source.modelId);
+  assert.deepEqual(copy.imageSettings, source.imageSettings);
+  assert.deepEqual(copy.embeddedReferences, source.embeddedReferences);
+  assert.notStrictEqual(copy.embeddedReferences, source.embeddedReferences);
+  for (const field of [
+    "image", "imageThumbnail", "assetId", "taskId", "status", "error", "taskPrompt",
+    "taskDiagnostic", "inputSignature", "submission", "resultOf", "resultIndex",
+  ] as const) {
+    assert.equal(copy[field], undefined, field);
+  }
+});
 
 test("input fingerprints track text, model, replacement images and ordered references", () => {
   const initial = creationInputSignature(input);
@@ -70,7 +200,7 @@ test("ignored images, layout changes and cached copies do not mark inputs change
     references: [{ ...input.references[0], localImage: "cache", x: 999 }],
   };
   assert.equal(creationInputSignature(moved), creationInputSignature(input));
-  assert.notEqual(
+  assert.equal(
     creationInputSignature({ ...input, references: [{ nodeId: "source", localImage: "a" }] }),
     creationInputSignature({ ...input, references: [{ nodeId: "source", localImage: "b" }] }),
   );

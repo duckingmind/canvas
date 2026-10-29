@@ -92,6 +92,10 @@ export function isDurableAssetUrl(value: unknown): value is string {
   try {
     const url = new URL(value);
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return false;
+    // Authenticated task-content routes are delivery APIs, not durable media
+    // locations. The task ID is a stable output identity, but the route itself
+    // cannot be replayed as an external generation input.
+    if (/(?:^|\/)(?:videos\/[^/]+|(?:music|voice-design|tts)\/tasks\/[^/]+)\/content\/?$/i.test(url.pathname)) return false;
     for (const key of url.searchParams.keys()) {
       if (/^(?:x-amz-|x-goog-|x-cos-|x-oss-|q-sign)/i.test(key)
         || /^(?:signature|sig|sign|signkey|token|access_token|auth|authorization|expires|expiry|policy|key-pair-id|ossaccesskeyid)$/i.test(key)) return false;

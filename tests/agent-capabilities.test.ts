@@ -1,9 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createCanvasAgent } from '../src/agent-capabilities.ts'
-import { agentMetadata, capabilities, capability } from '../src/agent-tools.mjs'
+import { agentMetadata, getAgentCapabilities, capability, registerAgentTools } from '../src/agent-tools.mjs'
 import type { Document } from '../src/canvas-types.ts'
 import { configureGeneration, generationParameters } from '../src/agent-settings.ts'
+import { bytesBase64 } from '../src/agent-media.ts'
 
 const manifest = JSON.parse(await (await import('node:fs/promises')).readFile(new URL('../manifest.json', import.meta.url), 'utf8'))
 const validateValue = (schema: any, value: any, path = '$'): void => {
@@ -56,6 +57,64 @@ test('agent writes share editor undo and persistence; stale revisions never over
   assert.equal(doc.name, 'Human edit')
   doc = undo.pop()!; assert.equal(doc.nodes.length, 0)
 })
+
+test('agent persistence includes editor edits queued during asynchronous side effects', async () => {
+  let doc: Document = { id: 'doc-queued', name: 'Original', nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 }, createdAt: 'now', updatedAt: 'now' }
+  let locked = false
+  let saved: Document | undefined
+  const events: string[] = []
+  const agent = createCanvasAgent({
+    getDocument: () => doc,
+    canWrite: () => true,
+    beforeWrite() {},
+    commit: change => { events.push('commit'); doc = change(doc) },
+    setAgentWriteLock: value => {
+      locked = value
+      events.push(value ? 'lock' : 'unlock')
+      if (!value) doc = { ...doc, name: 'Human edit' }
+    },
+    persist: async value => { assert.equal(locked, false); events.push('persist'); saved = structuredClone(value) },
+  })
+  const state = agent.read_state()
+  const result = await agent.rename_document({
+    document_id: doc.id,
+    expected_revision: state.revision,
+    idempotency_key: 'queued-edit',
+    name: 'Agent edit',
+  }, { signal: new AbortController().signal })
+  assert.deepEqual(events, ['commit', 'lock', 'unlock', 'persist'])
+  assert.equal(saved?.name, 'Human edit')
+  assert.equal(result.appliedRevision === result.revision, false)
+  assert.equal(result.revision, agent.read_state().revision)
+})
+
+test('editor reads and writes report draft restoration as retryable without side effects', async () => {
+  let beforeWriteCalls = 0, commitCalls = 0
+  const agent = createCanvasAgent({
+    getDocument: () => { throw Object.assign(new Error('正在恢复画布草稿，请稍后重试'), { code: 'CANVAS_NOT_READY', executionStarted: false, reason: 'draft_recovery', retryable: true, nextAction: { type: 'wait' } }) },
+    canWrite: () => false,
+    beforeWrite: () => { beforeWriteCalls++ },
+    commit: () => { commitCalls++ },
+    persist: async () => {},
+  })
+  const notReady = {
+    code: 'CANVAS_NOT_READY',
+    executionStarted: false,
+    reason: 'draft_recovery',
+    retryable: true,
+    nextAction: { type: 'wait' },
+  }
+  assert.throws(() => agent.read_state(), notReady)
+  await assert.rejects(agent.rename_document({
+    document_id: 'recovering-doc',
+    expected_revision: 'draft-recovery:0',
+    idempotency_key: 'draft-recovery',
+    name: 'Must not apply',
+  }, { signal: new AbortController().signal }), notReady)
+  assert.equal(beforeWriteCalls, 0)
+  assert.equal(commitCalls, 0)
+})
+
 test('document switch and cancellation block writes, media bytes never leave read_state', async () => {
   let doc: Document = { id: 'one', name: 'Original', nodes: [{ id: 'n', type: 'image', title: 'Image', text: '', x: 0, y: 0, width: 1, height: 1, color: '', image: 'secret-media-url' }], edges: [], viewport: { x: 0, y: 0, zoom: 1 }, createdAt: '', updatedAt: '' }
   const agent = createCanvasAgent({ getDocument: () => doc, canWrite: () => true, beforeWrite() {}, commit: () => { throw new Error('must not write') }, persist: async () => {} })
@@ -64,6 +123,44 @@ test('document switch and cancellation block writes, media bytes never leave rea
   await assert.rejects(agent.rename_document(args, { signal: AbortSignal.abort() }))
   doc = { ...doc, id: 'two' }
   await assert.rejects(agent.rename_document(args, { signal: new AbortController().signal }), { code: 'CANVAS_DOCUMENT_CHANGED' })
+})
+
+test('agent image import uploads staged bytes to COS and never persists Base64', async () => {
+  let doc: Document = { id: 'agent-image', name: 'Images', nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 }, createdAt: '', updatedAt: '' }
+  const pngSignature = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  let uploaded = false
+  const agent = createCanvasAgent({
+    getDocument: () => doc,
+    canWrite: () => true,
+    beforeWrite() {},
+    commit: change => { doc = change(doc) },
+    persist: async () => {},
+    imageSize: async source => {
+      assert.match(source, /^blob:/)
+      return { width: 120, height: 80 }
+    },
+    uploadImage: async (file, idempotencyKey) => {
+      uploaded = true
+      assert.equal(file.type, 'image/png')
+      assert.equal(file.size, pngSignature.length)
+      assert.match(idempotencyKey, /^canvas-agent-/)
+      return {
+        id: 'cos-image-1', type: 'image', task_id: '', size_bytes: file.size,
+        content_type: 'image/png', url: 'https://cos.example/media/image/cos-image-1.png',
+        created_at: '', saved_to_library: false, metadata_revision: 0,
+      }
+    },
+  })
+  const context = { signal: new AbortController().signal }
+  const state = agent.read_state()
+  const args = { document_id: doc.id, expected_revision: state.revision, idempotency_key: 'agent-image-import' }
+  await agent.upload_image_chunk({ ...args, upload_id: 'upload-1', mime_type: 'image/png', byte_offset: 0, data_base64: bytesBase64(pngSignature) }, context)
+  const imported = await agent.import_image({ ...args, upload_id: 'upload-1', title: 'COS image' }, context)
+  assert.equal(uploaded, true)
+  assert.equal(imported.nodeId, doc.nodes[0].id)
+  assert.equal(doc.nodes[0].image, 'https://cos.example/media/image/cos-image-1.png')
+  assert.equal(doc.nodes[0].assetId, 'cos-image-1')
+  assert.equal(JSON.stringify(doc).includes('data:image'), false)
 })
 
 test('agent cancellation keeps an unconfirmed provider result in reconciliation', async () => {
@@ -143,7 +240,7 @@ test('agent configures, submits, observes, resumes and cancels music tasks', asy
   const agent = createCanvasAgent({
     getDocument: () => doc, canWrite: () => true, beforeWrite() {},
     commit: change => { doc = change(doc) }, persist: async () => {}, getModels: () => [musicModel],
-    startGeneration: node => { startCalls++; doc = { ...doc, nodes: doc.nodes.map(value => value.id === node.id ? { ...value, status: 'running', taskId: 'music-task', musicSubmission: { key: 'music-submit', model: musicModel.id, prompt: value.text, lyrics: value.musicLyrics } } : value) } },
+    startGeneration: node => { startCalls++; doc = { ...doc, nodes: doc.nodes.map(value => value.id === node.id ? { ...value, status: 'queued', taskId: 'music-task', musicSubmission: { key: 'music-submit', model: musicModel.id, prompt: value.text, lyrics: value.musicLyrics } } : value) } },
     resumeGeneration: () => { resumeCalls++ },
     cancelGeneration: async () => { cancelCalls++; return { status: 'cancel_pending', cancelled: false } },
   })
@@ -174,6 +271,27 @@ test('agent configures, submits, observes, resumes and cancels music tasks', asy
   assert.equal(resumed.accepted, true); assert.equal(resumeCalls, 1)
   const cancelled = await agent.cancel_generation({ ...args(), node_id: node.id }, context)
   assert.equal(cancelled.cancelled, false); assert.equal(cancelCalls, 1)
+  assert.equal(capability('cancel_generation').completion, 'accepted')
+})
+
+test('agent cancellation accepts every pre-dispatch queued status', async () => {
+  for (const status of ['created', 'quoted', 'funds_reserved', 'pending', 'queued']) {
+    let doc: Document = {
+      id: `cancel-${status}`, name: 'Cancel',
+      nodes: [{ id: 'music-node', type: 'prompt', mediaType: 'audio', title: 'Song', text: 'Prompt', x: 0, y: 0, width: 320, height: 240, color: '', status, taskId: `task-${status}` }],
+      edges: [], viewport: { x: 0, y: 0, zoom: 1 }, createdAt: '', updatedAt: '',
+    }
+    let calls = 0
+    const agent = createCanvasAgent({
+      getDocument: () => doc, canWrite: () => true, beforeWrite() {},
+      commit: change => { doc = change(doc) }, persist: async () => {},
+      cancelGeneration: async () => { calls += 1; return { status: 'cancelled', cancelled: true } },
+    })
+    const context = { signal: new AbortController().signal }
+    const result = await agent.cancel_generation({ document_id: doc.id, expected_revision: agent.read_state().revision, idempotency_key: `cancel-key-${status}`, node_id: 'music-node' }, context)
+    assert.equal(result.cancelled, true)
+    assert.equal(calls, 1)
+  }
 })
 
 test('music settings validate optimizer support and parameter constraints from the current model catalog', () => {
@@ -248,8 +366,8 @@ test('voice-design task snapshots and recovery retain the original submission id
   assert.equal(resumedKey, 'original-voice-key')
   await assert.rejects(agent.cancel_generation(args(), context), { code: 'CANVAS_TASK_NOT_CANCELLABLE' })
   doc = { ...doc, nodes: doc.nodes.map(node => ({ ...node, taskId: 'voice-task', taskDiagnostic: { status: 'running' } })) }
-  const cancelled = await agent.cancel_generation(args(), context); validateResult('cancel_generation', cancelled)
-  assert.equal(cancellations, 1)
+  await assert.rejects(agent.cancel_generation(args(), context), { code: 'CANVAS_TASK_NOT_CANCELLABLE' })
+  assert.equal(cancellations, 0)
   doc = { ...doc, nodes: doc.nodes.map(node => ({ ...node, status: 'completed', audioTaskType: 'voice_design', voiceId: 'voice-output', voiceDesignSubmission: undefined })) }
   const after = agent.read_tasks(); validateResult('read_tasks', after)
   assert.equal(after.tasks[0].voiceId, 'voice-output')
@@ -308,6 +426,19 @@ test('agent model catalog and writes exclude speech and unsupported audio workfl
   assert.equal(doc.nodes[0].modelId, 'text-music')
 })
 
+test('configure_generation accepts recovering image supply for scheduler-controlled trial', () => {
+  const node = {
+    id: 'recovering-image-node', type: 'prompt' as const, mediaType: 'image' as const,
+    title: 'Recovering image', text: 'A landscape', x: 0, y: 0, width: 320, height: 180,
+    color: '', status: 'idle' as const,
+  }
+  const configured = configureGeneration(node as any, {
+    id: 'recovering-image', type: 'image', available: false, supply_status: 'recovering',
+    supported_operations: ['generation'], supported_input_modes: ['text'],
+  }, {})
+  assert.equal(configured.modelId, 'recovering-image')
+})
+
 test('batch editing is atomic; graph operations reject cycles and clean deleted group members', async () => {
   let doc: Document = { id: 'one', name: 'Graph', nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 }, createdAt: '', updatedAt: '' }
   const context = { signal: new AbortController().signal }
@@ -321,11 +452,39 @@ test('batch editing is atomic; graph operations reject cycles and clean deleted 
   await assert.rejects(agent.connect_nodes({ ...args(), from_node_id: b, to_node_id: a }, context), { code: 'CANVAS_INVALID_CONNECTION' })
   await agent.disconnect_nodes({ ...args(), edge_ids: [connection.edgeId] }, context); assert.equal(doc.edges.length, 0)
   await agent.connect_nodes({ ...args(), from_node_id: a, to_node_id: b }, context)
-  doc = { ...doc, nodes: doc.nodes.map(node => ({ ...node, groupId: 'g' })) }
+  doc = { ...doc, nodes: doc.nodes.map((node, index) => ({ ...node, x: index * 260, y: index * 80, groupId: 'g' })) }
+  const untouchedMember = { x: doc.nodes[1].x, y: doc.nodes[1].y }
+  await agent.arrange_nodes({ ...args(), node_ids: [a] }, context)
+  assert.deepEqual({ x: doc.nodes[1].x, y: doc.nodes[1].y }, untouchedMember, 'partial selection leaves unselected group members in place')
+  assert.equal(doc.nodes[0].groupId, 'g', 'member-level layout retains group membership')
+  const groupOffset = { x: doc.nodes[1].x - doc.nodes[0].x, y: doc.nodes[1].y - doc.nodes[0].y }
   await agent.arrange_nodes({ ...args(), node_ids: [a, b] }, context)
+  assert.deepEqual(
+    { x: doc.nodes[1].x - doc.nodes[0].x, y: doc.nodes[1].y - doc.nodes[0].y },
+    groupOffset,
+  )
   assert.equal(doc.groups?.length, 1)
   await agent.delete_nodes({ ...args(), node_ids: [a] }, context)
   assert.equal(doc.edges.length, 0); assert.equal(doc.groups?.length, 0); assert.equal(doc.nodes[0].groupId, undefined)
+})
+
+test('workflow connections use one edge relation for duplicate and cycle checks', async () => {
+  let doc: Document = { id: 'connection-graph', name: 'Graph', nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 }, createdAt: '', updatedAt: '' }
+  const context = { signal: new AbortController().signal }
+  const agent = createCanvasAgent({ getDocument: () => doc, canWrite: () => true, beforeWrite() {}, commit: change => { doc = change(doc) }, persist: async () => {} })
+  const args = () => ({ document_id: doc.id, expected_revision: agent.read_state().revision, idempotency_key: crypto.randomUUID() })
+  const { nodeIds: [source, target] } = await agent.create_nodes({
+    ...args(),
+    nodes: [
+      { type: 'note', title: 'Source', text: 'Source text' },
+      { type: 'prompt', title: 'Target', text: 'Target prompt' },
+    ],
+  }, context)
+
+  doc = { ...doc, edges: [{ id: 'existing', from: source, to: target }] }
+  await assert.rejects(agent.connect_nodes({ ...args(), from_node_id: source, to_node_id: target }, context), { code: 'CANVAS_INVALID_CONNECTION' })
+  await assert.rejects(agent.connect_nodes({ ...args(), from_node_id: target, to_node_id: source }, context), { code: 'CANVAS_INVALID_CONNECTION' })
+  assert.deepEqual(doc.edges, [{ id: 'existing', from: source, to: target }])
 })
 
 test('model and task APIs keep media private and reject writes to running jobs', async () => {
@@ -377,6 +536,7 @@ test('delete_nodes keeps validation and revision guards while allowing active no
 test('all Canvas editor handlers return the published output contract before serialization', async () => {
   assert.equal(Object.hasOwn(manifest, 'agent'), false)
   assert.equal(agentMetadata.namespace, 'canvas')
+  const capabilities = getAgentCapabilities()
   assert.equal(new Set(capabilities.map(entry => entry.name)).size, capabilities.length)
   for (const entry of capabilities) {
     assert.equal(entry.input_schema.type, 'object')
@@ -456,6 +616,7 @@ test('Canvas guide examples use declared tools and validate against input and ou
   const root = new URL('../', import.meta.url)
   const examples = JSON.parse(await fs.readFile(new URL(agentMetadata.examples, root), 'utf8'))
   assert.equal(agentMetadata.contract_version, '1.3.0')
+  const capabilities = getAgentCapabilities()
   assert.equal(new Set(capabilities.map(item => item.name)).size, 24)
   for (const example of examples) {
     const declaration = capability(example.capability)
@@ -467,4 +628,25 @@ test('Canvas guide examples use declared tools and validate against input and ou
   assert.equal(generate.completion, 'accepted'); assert.equal(generate.billable, true); assert.equal(generate.open_world, true)
   assert.equal(capability('create_note').destructive, false)
   assert.equal(capability('delete_nodes').destructive, true)
+})
+
+test('Canvas package catalog is collected from the same registration implementation and rejects unknown handlers', () => {
+  const capabilities = getAgentCapabilities()
+  const runtimeBindings: Array<{ name: string; handler: unknown }> = []
+  const handlers = Object.fromEntries(capabilities.map(({ name }) => [name, () => undefined]))
+  const disposers = registerAgentTools({
+    register(declaration, handler) {
+      runtimeBindings.push({ name: declaration.name, handler })
+      return () => {}
+    },
+  }, handlers)
+
+  assert.deepEqual(runtimeBindings.map(item => item.name), capabilities.map(item => item.name))
+  assert.ok(runtimeBindings.every(item => typeof item.handler === 'function'))
+  assert.equal(disposers.length, capabilities.length)
+  assert.throws(() => registerAgentTools({ register: () => () => {} }, {}), /Missing canvas agent capability handler: read_metadata/)
+  const rolledBack: string[] = []
+  assert.throws(() => registerAgentTools({ register(declaration) { rolledBack.push(declaration.name); return () => { rolledBack.push(`removed:${declaration.name}`) } } }, { read_metadata: () => ({}) }), /Missing canvas agent capability handler: list_documents/)
+  assert.deepEqual(rolledBack, ['read_metadata', 'removed:read_metadata'])
+  assert.throws(() => registerAgentTools({ register: () => () => {} }, { ...handlers, unknown_capability: () => undefined }), /Unknown canvas agent capability handler/)
 })

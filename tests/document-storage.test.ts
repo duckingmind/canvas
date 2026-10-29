@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canvasStorageKey, captureDocumentStorageSession, listCanvasDocuments, readCanvasDocument, resetDocumentStorage, resumeDocumentStorage, saveCanvasDocument } from "../src/document-storage.ts";
+import { acceptCanvasDocumentState, CANVAS_CHUNK_GC_GRACE_MS, canvasStorageKey, captureDocumentStorageSession, listCanvasDocuments, peekCanvasDocument, readCanvasDocument, resetDocumentStorage, resumeDocumentStorage, saveCanvasDocument, watchCanvasDocumentChanges } from "../src/document-storage.ts";
+import { DOCUMENT_SYNC_PREFIX, canvasSyncMarkerKey } from "../src/document-kv.ts";
 import type { CloudStorage, KVOperation } from "../src/document-kv.ts";
 import { ensureDocumentMigration, MIGRATION_KEY } from "../src/document-kv-migration.ts";
 
@@ -23,7 +24,7 @@ function storage(initial: Record<string, unknown> = {}, migrated = true) {
     for (const [k, v] of rev) revisions.set(k, v);
     return results;
   }
-  const confirmed = new Map<string, { request: string; result: { success: boolean; revision?: number } }>();
+  const confirmed = new Map<string, { request: string; result: unknown }>();
   const api: CloudStorage = {
     get: async <T>(key: string) => structuredClone(values.get(key) ?? null) as T | null,
     getMany: async <T>(keys: string[]) => Object.fromEntries(keys.map(key => [key, structuredClone(values.get(key) ?? null)])) as Record<string, T | null>,
@@ -37,7 +38,14 @@ function storage(initial: Record<string, unknown> = {}, migrated = true) {
       if (options?.idempotencyKey) confirmed.set(options.idempotencyKey, { request, result });
       return result;
     },
-    batch: async ops => commit(ops),
+    batch: async (ops, options) => {
+      const request = JSON.stringify(ops);
+      const prior = options?.idempotencyKey ? confirmed.get(options.idempotencyKey) : undefined;
+      if (prior) { assert.equal(prior.request, request); return structuredClone(prior.result) as Awaited<ReturnType<CloudStorage["batch"]>>; }
+      const result = commit(ops);
+      if (options?.idempotencyKey) confirmed.set(options.idempotencyKey, { request, result });
+      return result;
+    },
     list: async ({ prefix = "", cursor, limit = 100 } = {}) => {
       const keys = [...values.keys()].filter(key => key.startsWith(prefix) && (!cursor || key > cursor)).sort();
       return { keys: keys.slice(0, limit), ...(keys.length > limit ? { nextCursor: keys[limit - 1] } : {}) };
@@ -62,6 +70,171 @@ test("saving captures a snapshot and uses the loaded baseline across successive 
   assert.equal((s.values.get(canvasStorageKey("a")) as any).name, "Changed");
 });
 
+test("large canvases use immutable chunks and reconstruct through the manifest", async () => {
+  const s = storage(), api = s.device();
+  const chunkBatches: KVOperation[][] = [];
+  const batch = api.batch;
+  api.batch = async (operations, options) => {
+    if (operations.every(operation => operation.key.startsWith("canvas:chunk:v1:"))) {
+      chunkBatches.push(structuredClone(operations));
+      assert(operations.length <= 4);
+      assert(new TextEncoder().encode(JSON.stringify({ operations })).byteLength < 1 << 20);
+      for (const operation of operations) {
+        if (operation.op === "put")
+          assert(new TextEncoder().encode(JSON.stringify(operation.value)).byteLength <= 180 * 1024);
+      }
+    }
+    return batch(operations, options);
+  };
+  const large = { id: "large", name: "Large", updatedAt: "1", text: "画布内容".repeat(100_000) };
+  await saveCanvasDocument(api, large);
+
+  const manifest = s.values.get(canvasStorageKey("large")) as any;
+  assert.equal(manifest.kind, "canvas-document-chunks");
+  assert.equal(manifest.version, 1);
+  assert(manifest.chunks.length > 1);
+  assert(chunkBatches.length > 1);
+  assert(manifest.chunks.every((key: string) => s.values.has(key)));
+
+  const loaded = await readCanvasDocument(api, "large");
+  assert.equal(loaded?.id, "large");
+  assert.equal((loaded as any).text, large.text);
+});
+
+test("large canvas reads fetch chunk batches concurrently without reordering content", async () => {
+  const s = storage(), api = s.device();
+  const large = { id: "parallel-large", name: "Large", text: "内容".repeat(250_000) };
+  await saveCanvasDocument(api, large);
+  const getMany = api.getMany;
+  let active = 0;
+  let maximum = 0;
+  api.getMany = async (keys) => {
+    const isChunkRead = keys.some((key) => key.startsWith("canvas:chunk:v1:"));
+    if (!isChunkRead) return getMany(keys);
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    try { return await getMany(keys); }
+    finally { active -= 1; }
+  };
+  const loaded = await readCanvasDocument(api, large.id);
+  assert.equal((loaded as any).text, large.text);
+  assert(maximum > 1);
+});
+
+test("large canvas saves reuse unchanged content-addressed chunks", async () => {
+  const s = storage(), api = s.device();
+  await saveCanvasDocument(api, { id: "large", name: "First", text: "x".repeat(500_000) });
+  const firstManifest = s.values.get(canvasStorageKey("large")) as any;
+  const firstChunks = new Set<string>(firstManifest.chunks);
+  const requests: KVOperation[][] = [];
+  const batch = api.batch;
+  api.batch = async (operations, options) => {
+    if (operations.some(operation => operation.key.startsWith("canvas:chunk:v1:"))) requests.push(structuredClone(operations));
+    return batch(operations, options);
+  };
+  await saveCanvasDocument(api, { id: "large", name: "Renamed", text: "x".repeat(500_000) });
+  const secondManifest = s.values.get(canvasStorageKey("large")) as any;
+  assert(secondManifest.chunks.some((key: string) => firstChunks.has(key)));
+  assert(requests.reduce((count, operations) => count + operations.length, 0) < firstChunks.size);
+});
+
+test("missing chunks fail as explicit corruption instead of returning a partial document", async () => {
+  const s = storage();
+  await saveCanvasDocument(s.api, { id: "large", text: "x".repeat(500_000) });
+  const manifest = s.values.get(canvasStorageKey("large")) as any;
+  s.values.delete(manifest.chunks[1]);
+  await assert.rejects(readCanvasDocument(s.api, "large"), { code: "CANVAS_STORAGE_CHUNK_MISSING" });
+});
+
+test("retired chunk generations stay readable during the grace period and are collected later", async () => {
+  const s = storage();
+  const first = { id: "large", name: "First", updatedAt: "1", text: "a".repeat(500_000) };
+  await saveCanvasDocument(s.api, first);
+  const firstManifest = s.values.get(canvasStorageKey("large")) as any;
+  const firstChunks = [...firstManifest.chunks];
+
+  await saveCanvasDocument(s.api, { ...first, updatedAt: "2", text: "b".repeat(500_000) });
+  const secondManifest = s.values.get(canvasStorageKey("large")) as any;
+  const retirementKey = [...s.values.keys()].find(key => key.startsWith("canvas:chunk-retired:v1:"));
+  assert(retirementKey);
+  assert.deepEqual((s.values.get(retirementKey) as any).chunks, firstChunks);
+  assert(firstChunks.every(key => s.values.has(key)));
+
+  // A normal listing must not delete chunks that another tab could still be
+  // reading from the previous, already published manifest.
+  await listCanvasDocuments(s.api);
+  assert(firstChunks.every(key => s.values.has(key)));
+  assert(secondManifest.chunks.every((key: string) => s.values.has(key)));
+
+  const retired = s.values.get(retirementKey) as any;
+  await s.api.set(retirementKey, { ...retired, retiredAt: Date.now() - CANVAS_CHUNK_GC_GRACE_MS - 1 });
+
+  // A successful large save performs the same bounded cleanup, so normal
+  // autosaves do not need to wait for the library list to be opened.
+  await saveCanvasDocument(s.api, { ...first, updatedAt: "3", text: "c".repeat(500_000) });
+  assert(firstChunks.every(key => !s.values.has(key)));
+  assert(secondManifest.chunks.every((key: string) => s.values.has(key)));
+  assert.equal(s.values.has(retirementKey), false);
+});
+
+test("expired chunks are reclaimed before staging a new generation when quota is tight", async () => {
+  const s = storage(), api = s.device();
+  const first = { id: "quota-large", updatedAt: "1", text: "a".repeat(500_000) };
+  await saveCanvasDocument(api, first);
+  const firstManifest = s.values.get(canvasStorageKey(first.id)) as any;
+  const firstChunks = [...firstManifest.chunks];
+  await saveCanvasDocument(api, { ...first, updatedAt: "2", text: "b".repeat(500_000) });
+  const retirementKey = [...s.values.keys()].find((key) => key.startsWith("canvas:chunk-retired:v1:"));
+  assert(retirementKey);
+  const retired = s.values.get(retirementKey) as any;
+  await s.api.set(retirementKey, { ...retired, retiredAt: Date.now() - CANVAS_CHUNK_GC_GRACE_MS - 1 });
+
+  const batch = api.batch;
+  api.batch = async (operations, options) => {
+    if (operations.some((operation) => operation.op === "put" && operation.key.startsWith("canvas:chunk:v1:")) &&
+      firstChunks.some((key) => s.values.has(key))) {
+      throw Object.assign(new Error("quota"), { code: "APP_STORAGE_QUOTA_EXCEEDED", status: 403 });
+    }
+    return batch(operations, options);
+  };
+  await saveCanvasDocument(api, { ...first, updatedAt: "3", text: "c".repeat(500_000) });
+  assert(firstChunks.every((key) => !s.values.has(key)));
+});
+
+test("a failed chunk manifest commit leaves the previous document readable", async () => {
+  const s = storage();
+  await saveCanvasDocument(s.api, { id: "large", name: "Initial", text: "initial" });
+  const originalBatch = s.api.batch;
+  let failManifest = true;
+  s.api.batch = async (operations, options) => {
+    if (failManifest && operations.some((operation) => operation.key === canvasStorageKey("large"))) {
+      failManifest = false;
+      throw Object.assign(new Error("temporary network failure"), { status: 503 });
+    }
+    return originalBatch(operations, options);
+  };
+  await assert.rejects(saveCanvasDocument(s.api, { id: "large", name: "Updated", text: "x".repeat(500_000) }), /temporary network failure/);
+  const loaded = await readCanvasDocument(s.api, "large");
+  assert.equal((loaded as any)?.name, "Initial");
+});
+
+test("each cloud save atomically updates one stable sync marker instead of appending revisions", async () => {
+  const s = storage(), api = s.device(), requests: Array<{ operations: KVOperation[]; idempotencyKey?: string }> = [];
+  const batch = api.batch;
+  api.batch = async (operations, options) => {
+    requests.push({ operations: structuredClone(operations), idempotencyKey: options?.idempotencyKey });
+    return batch(operations, options);
+  };
+  await saveCanvasDocument(api, { id: "a", name: "First", updatedAt: "1" });
+  await saveCanvasDocument(api, { id: "a", name: "Second", updatedAt: "2" });
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every(request => request.operations.length === 2 && request.idempotencyKey));
+  assert.deepEqual(requests[0].operations.map(operation => operation.key), [canvasStorageKey("a"), canvasSyncMarkerKey("a")]);
+  assert.equal([...s.values.keys()].filter(key => key.startsWith(DOCUMENT_SYNC_PREFIX)).length, 1);
+  assert.equal((s.values.get(canvasSyncMarkerKey("a")) as any).documentUpdatedAt, "2");
+});
+
 test("a stale device cannot overwrite a remote save, including after listing or retry", async () => {
   const key = canvasStorageKey("a"), s = storage({ [key]: { id: "a", name: "Initial" } });
   const a = s.device(), b = s.device();
@@ -74,6 +247,65 @@ test("a stale device cannot overwrite a remote save, including after listing or 
   await saveCanvasDocument(a, { id: "a", name: "Resolved" });
 });
 
+test("a remote candidate read does not advance the local save baseline until accepted", async () => {
+  const key = canvasStorageKey("a"), s = storage({ [key]: { id: "a", name: "Initial" } });
+  const local = s.device(), remote = s.device();
+  await readCanvasDocument(local, "a");
+  await readCanvasDocument(remote, "a");
+  await saveCanvasDocument(remote, { id: "a", name: "Remote" });
+  const candidate = await peekCanvasDocument(local, "a");
+  assert.equal(candidate.document?.name, "Remote");
+  await assert.rejects(saveCanvasDocument(local, { id: "a", name: "Local draft" }), { code: "APP_STORAGE_CONFLICT" });
+  acceptCanvasDocumentState(local, "a", candidate);
+  await saveCanvasDocument(local, { id: "a", name: "Accepted remote plus local edit" });
+  assert.equal((s.values.get(key) as any).name, "Accepted remote plus local edit");
+});
+
+test("a marker CAS conflict aborts the document put in the same batch", async () => {
+  const key = canvasStorageKey("a"), markerKey = canvasSyncMarkerKey("a");
+  const s = storage({ [key]: { id: "a", name: "Initial" } });
+  await readCanvasDocument(s.api, "a");
+  await s.api.set(markerKey, { version: 1, documentUpdatedAt: "other", syncId: "other" });
+  await assert.rejects(saveCanvasDocument(s.api, { id: "a", name: "Must not commit" }), { code: "APP_STORAGE_CONFLICT" });
+  assert.equal((s.values.get(key) as any).name, "Initial");
+});
+
+test("foreground polling discovers a changed marker and leaves its writer baseline untouched", async () => {
+  const key = canvasStorageKey("a"), s = storage({ [key]: { id: "a", name: "Initial" } });
+  const local = s.device(), remote = s.device();
+  await readCanvasDocument(local, "a");
+  await readCanvasDocument(remote, "a");
+  let poll: (() => void) | undefined;
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { setInterval: (callback: () => void) => { poll = callback; return 1; }, clearInterval: () => {} },
+  });
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: { visibilityState: "visible", addEventListener: () => {}, removeEventListener: () => {} },
+  });
+  const tick = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+  try {
+    let observed: Awaited<ReturnType<typeof peekCanvasDocument>> | undefined;
+    const stop = watchCanvasDocumentChanges(local, "a", state => { observed = state; }, { pollIntervalMs: 5000 });
+    await tick();
+    await saveCanvasDocument(remote, { id: "a", name: "Remote" });
+    poll?.();
+    await tick();
+    await tick();
+    assert.equal(observed?.document?.name, "Remote");
+    await assert.rejects(saveCanvasDocument(local, { id: "a", name: "Stale local" }), { code: "APP_STORAGE_CONFLICT" });
+    stop();
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+    if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument);
+    else Reflect.deleteProperty(globalThis, "document");
+  }
+});
+
 test("saving without loading is create-only, never an implicit overwrite", async () => {
   const key = canvasStorageKey("a"), s = storage({ [key]: { id: "a" } });
   await assert.rejects(saveCanvasDocument(s.api, { id: "a", name: "Unseen" }), { code: "APP_STORAGE_CONFLICT" });
@@ -82,9 +314,9 @@ test("saving without loading is create-only, never an implicit overwrite", async
 test("management validation and write share a revision and close the read/write race", async () => {
   const key = canvasStorageKey("a"), s = storage({ [key]: { id: "a", name: "Initial" } });
   const a = s.device();
-  a.set = async (k, value, options) => {
-    await s.api.set(k, { id: "a", name: "Remote" });
-    return s.api.set(k, value, options);
+  a.batch = async (operations, options) => {
+    await s.api.set(key, { id: "a", name: "Remote" });
+    return s.api.batch(operations, options);
   };
   await assert.rejects(saveCanvasDocument(a, { id: "a", name: "Renamed" }, {
     validateCurrent: doc => assert.equal(doc?.name, "Initial"),
@@ -168,9 +400,9 @@ test("completed migrations never read obsolete document paths again", async () =
 
 test("a lost save acknowledgement replays the same mutation without creating another revision", async () => {
   const s = storage(), api = s.device(), requests: unknown[] = [];
-  api.set = async (key, value, options) => {
-    requests.push(structuredClone({ key, value, options }));
-    const result = await s.api.set(key, value, options);
+  api.batch = async (operations, options) => {
+    requests.push(structuredClone({ operations, options }));
+    const result = await s.api.batch(operations, options);
     if (requests.length === 1) throw new TypeError("Network connection lost");
     return result;
   };
@@ -185,9 +417,9 @@ test("a lost save acknowledgement replays the same mutation without creating ano
 
 test("a newer draft waits for the unconfirmed snapshot to replay before using its revision", async () => {
   const s = storage(), api = s.device(), requests: any[] = [];
-  api.set = async (key, value, options) => {
-    requests.push(structuredClone({ key, value, options }));
-    const result = await s.api.set(key, value, options);
+  api.batch = async (operations, options) => {
+    requests.push(structuredClone({ operations, options }));
+    const result = await s.api.batch(operations, options);
     if (requests.length === 1) throw new TypeError("Lost response");
     return result;
   };
@@ -197,8 +429,8 @@ test("a newer draft waits for the unconfirmed snapshot to replay before using it
   draft.name = "Second";
   await saveCanvasDocument(api, draft);
   assert.deepEqual(requests[1], requests[0]);
-  assert.equal(requests[2].value.name, "Second");
-  assert.equal(requests[2].options.expectedRevision, committedRevision);
+  assert.equal(requests[2].operations[0].value.name, "Second");
+  assert.equal(requests[2].operations[0].expectedRevision, committedRevision);
   assert.notEqual(requests[2].options.idempotencyKey, requests[0].options.idempotencyKey);
   assert.equal((s.values.get(canvasStorageKey("a")) as any).name, "Second");
 });
@@ -206,8 +438,8 @@ test("a newer draft waits for the unconfirmed snapshot to replay before using it
 test("replaying an acknowledged old revision cannot overwrite a subsequent remote edit", async () => {
   const key = canvasStorageKey("a"), s = storage(), api = s.device();
   let loseResponse = true;
-  api.set = async (k, value, options) => {
-    const result = await s.api.set(k, value, options);
+  api.batch = async (operations, options) => {
+    const result = await s.api.batch(operations, options);
     if (loseResponse) { loseResponse = false; throw new TypeError("Lost response"); }
     return result;
   };
@@ -223,18 +455,18 @@ test("replaying an acknowledged old revision cannot overwrite a subsequent remot
 
 test("an uncommitted failed request is replayed unchanged and a definite rejection allows corrected content", async () => {
   const s = storage(), api = s.device(), requests: any[] = [];
-  api.set = async (key, value, options) => {
-    requests.push(structuredClone({ key, value, options }));
+  api.batch = async (operations, options) => {
+    requests.push(structuredClone({ operations, options }));
     if (requests.length === 1) throw new TypeError("Offline before dispatch");
-    return s.api.set(key, value, options);
+    return s.api.batch(operations, options);
   };
   await assert.rejects(saveCanvasDocument(api, { id: "a", name: "First" }));
   await saveCanvasDocument(api, { id: "a", name: "Second" });
   assert.deepEqual(requests[1], requests[0]);
   assert.equal((s.values.get(canvasStorageKey("a")) as any).name, "Second");
-  api.set = async () => { throw Object.assign(new Error("Too large"), { code: "APP_STORAGE_VALUE_TOO_LARGE", status: 413 }); };
+  api.batch = async () => { throw Object.assign(new Error("Too large"), { code: "APP_STORAGE_VALUE_TOO_LARGE", status: 413 }); };
   await assert.rejects(saveCanvasDocument(api, { id: "a", name: "Too large" }));
-  api.set = s.api.set;
+  api.batch = s.api.batch;
   await saveCanvasDocument(api, { id: "a", name: "Smaller" });
   assert.equal((s.values.get(canvasStorageKey("a")) as any).name, "Smaller");
 });
@@ -281,23 +513,23 @@ function switchingStorage(first: CloudStorage) {
 test("an explicit document load never replays a save whose acknowledgement was lost", async () => {
   const key = canvasStorageKey("a"), s = storage(), api = s.device();
   let writes = 0;
-  api.set = async (...args) => {
+  api.batch = async (...args) => {
     writes++;
-    await s.api.set(...args);
+    await s.api.batch(...args);
     throw new TypeError("Lost response");
   };
   await assert.rejects(saveCanvasDocument(api, { id: "a", name: "Committed" }));
   await s.api.set(key, { id: "a", name: "Remote change" });
   assert.equal((await readCanvasDocument(api, "a"))?.name, "Remote change");
   assert.equal(writes, 1);
-  api.set = s.api.set;
+  api.batch = s.api.batch;
   await saveCanvasDocument(api, { id: "a", name: "After explicit load" });
 });
 
 test("changing account discards unconfirmed snapshots and loaded revision baselines", async () => {
   const key = canvasStorageKey("a"), a = storage(), b = storage(), scope = switchingStorage(a.api);
-  const set = a.api.set;
-  a.api.set = async (...args) => { await set(...args); throw new TypeError("Lost response"); };
+  const batch = a.api.batch;
+  a.api.batch = async (...args) => { await batch(...args); throw new TypeError("Lost response"); };
   await assert.rejects(saveCanvasDocument(scope.api, { id: "a", name: "Account A only" }));
   scope.switchTo(b.api);
   assert.equal(await readCanvasDocument(scope.api, "a"), null);
@@ -309,9 +541,9 @@ test("changing account discards unconfirmed snapshots and loaded revision baseli
 
 test("queued old writes and their late acknowledgements cannot enter a new account generation", async () => {
   const key = canvasStorageKey("a"), a = storage(), b = storage(), scope = switchingStorage(a.api);
-  const started = deferred<void>(), acknowledge = deferred<void>(), set = a.api.set;
-  a.api.set = async (...args) => {
-    const result = await set(...args);
+  const started = deferred<void>(), acknowledge = deferred<void>(), batch = a.api.batch;
+  a.api.batch = async (...args) => {
+    const result = await batch(...args);
     started.resolve();
     await acknowledge.promise;
     return result;

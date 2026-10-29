@@ -1,5 +1,5 @@
 import React from "react";
-import { ChevronLeft, ChevronRight, Film, Info, LoaderCircle, LocateFixed, RefreshCw, Music2, Minus, Plus, Scan } from "lucide-react";
+import { ChevronLeft, ChevronRight, Film, Image as ImageIcon, Info, LoaderCircle, LocateFixed, RefreshCw, Music2, Minus, Plus, Scan } from "lucide-react";
 import { videoPlaybackErrorMessage } from "./video-player";
 import { videoSourceNeedsRefresh } from "./video-source";
 import { videoAspectRatio } from "./video-layout";
@@ -10,7 +10,7 @@ import "./media-preview.css";
 
 type Media = { id: string; title: string; type?: string; mediaType?: string; assetId?: string; taskId?: string; text?: string; image?: string; imageThumbnail?: string; video?: string; videoContentUrl?: string; videoContentUrlExpiresAt?: string; videoAspectRatio?: string; audio?: string; videoPoster?: string };
 
-export default function MediaPreview<T extends Media>({ node, items, index, sources, error, videoContentLoading, videoContentError, audioContentLoading, audioContentError, onAudioRetry, shouldRefreshImageOriginal = false, onSelect, onLocate, onVideoRetry, onImageRetry, onImageOriginalRequest, onImageLoaded, resolveImageSource, resolveImageThumbnail }: {
+export default function MediaPreview<T extends Media>({ node, items, index, sources, error, videoContentLoading, videoContentError, audioContentLoading, audioContentError, onAudioRetry, shouldRefreshImageOriginal = false, onSelect, onLocate, onVideoRetry, onImageRetry, onImageOriginalRequest, onImageLoaded, onNotice, resolveImageSource, resolveImageThumbnail }: {
   node: T;
   items: T[];
   index: number;
@@ -29,6 +29,8 @@ export default function MediaPreview<T extends Media>({ node, items, index, sour
   onLocate: (id: string) => void;
   onVideoRetry?: () => boolean | void | Promise<boolean | void>;
   onImageRetry?: () => void | Promise<void>;
+  /** Surface preview failures through the workbench notice. */
+  onNotice?: (text: string, action?: { label: string; run: () => void }) => void;
   /** Resolve a fresh, full-resolution source for the selected detail view. */
   onImageOriginalRequest?: () => string | undefined | Promise<string | undefined>;
   onImageLoaded?: (source: string) => void;
@@ -92,6 +94,7 @@ export default function MediaPreview<T extends Media>({ node, items, index, sour
   const [imageInfoOpen, setImageInfoOpen] = React.useState(false);
   const [videoReady, setVideoReady] = React.useState(false);
   const [videoBuffering, setVideoBuffering] = React.useState(false);
+  const [videoCorsFallback, setVideoCorsFallback] = React.useState(false);
   const [videoRatio, setVideoRatio] = React.useState(() => videoAspectRatio(node.videoAspectRatio));
   const videoRecoveryUsed = React.useRef(false);
   const videoRecoveryRequest = React.useRef<object | null>(null);
@@ -183,6 +186,28 @@ export default function MediaPreview<T extends Media>({ node, items, index, sour
     setVideoReady(false);
     setVideoBuffering(false);
     setVideoRatio(videoAspectRatio(node.videoAspectRatio));
+    const media = event.currentTarget;
+    let crossOriginHttpSource = false;
+    try {
+      const source = new URL(videoSource || "");
+      crossOriginHttpSource =
+        (source.protocol === "http:" || source.protocol === "https:") &&
+        source.origin !== window.location.origin;
+    } catch { /* Local blob/data media has no cross-origin playback mode. */ }
+    if (
+      media.error?.code === 4 &&
+      media.crossOrigin === "anonymous" &&
+      crossOriginHttpSource &&
+      !videoCorsFallback
+    ) {
+      // Cross-origin playback itself does not require CORS. Drop CORS mode
+      // before refreshing the signed URL, which also supports buckets without
+      // Access-Control-Allow-Origin when the browser can still stream media.
+      setVideoCorsFallback(true);
+      setVideoBuffering(true);
+      setVideoErrorMessage("");
+      return;
+    }
     if (!videoRecoveryRequest.current && event.currentTarget.error?.code !== 3 && !videoRecoveryUsed.current && onVideoRetry && (node.assetId || node.taskId) && /^https?:/i.test(videoSource || "")) {
       void retryVideo();
       return;
@@ -217,6 +242,7 @@ export default function MediaPreview<T extends Media>({ node, items, index, sour
       }, 120);
       setVideoFailed(false);
       setVideoErrorMessage("");
+      setVideoCorsFallback(false);
       setAudioFailed(false);
       setAudioAttempt(0);
       setVideoAttempt(0);
@@ -509,6 +535,21 @@ export default function MediaPreview<T extends Media>({ node, items, index, sour
     setImageOriginalNeedsAutoRecovery(false);
     requestFullResolution(true);
   }, [hasImage, isAudio, isVideo, requestFullResolution, onAudioRetry]);
+  const lastNotifiedError = React.useRef("");
+  React.useEffect(() => {
+    const message = error || videoContentError || audioContentError ||
+      (videoFailed ? videoErrorMessage || "视频预览暂时不可用。" : "") ||
+      (audioFailed ? "音频预览暂时不可用。" : "") ||
+      (imageOriginalError ? imageThumbnailSource ? "原图暂时无法获取，当前保留缩略图。" : "原图暂时无法获取。" : "") ||
+      (imageFailed ? "图片预览暂时不可用。" : "");
+    if (!message) {
+      lastNotifiedError.current = "";
+      return;
+    }
+    if (message === lastNotifiedError.current) return;
+    lastNotifiedError.current = message;
+    onNotice?.(message, { label: "重试", run: () => void refreshPreview() });
+  }, [audioContentError, audioFailed, error, imageFailed, imageOriginalError, imageThumbnailSource, onNotice, refreshPreview, videoContentError, videoErrorMessage, videoFailed]);
   React.useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as Element | null;
@@ -586,49 +627,54 @@ export default function MediaPreview<T extends Media>({ node, items, index, sour
           {node.taskId && <span>任务 {node.taskId}</span>}
         </div>}
       </div>
-      {isAudio && node.audio && !audioFailed ? <CanvasMediaPlayer key={`${node.id}:${node.audio}:${audioAttempt}`} kind="audio" className="preview-audio" shellClassName={mediaSwitching ? "is-switching" : undefined} src={node.audio} label={node.title} autoPlay onError={() => setAudioFailed(true)} /> : isAudio ? <div className="media-preview-loading" role="status"><Music2 size={22} />{audioContentLoading ? "正在加载音频…" : audioContentError || "音频暂不可用，请刷新预览。"}</div> : videoSourceAvailable && !videoFailed ? <div key={node.id} className={`media-preview-media-wrap${mediaSwitching ? " is-switching" : ""}`} style={{ "--preview-video-ratio": String(videoRatio) } as React.CSSProperties}>{node.videoPoster && <img className={`media-preview-poster ${videoReady ? "is-hidden" : "is-visible"}`} src={node.videoPoster} alt={`${node.title} · 首帧`} />}<CanvasMediaPlayer key={`${node.id}:${videoSource || ""}:${videoAttempt}`} kind="video" className={`preview-video ${videoLoading ? "is-loading" : "is-ready"}`} src={videoSource!} poster={node.videoPoster} label={node.title} crossOrigin={node.assetId || node.taskId ? "anonymous" : undefined} autoPlay playsInline preload="metadata" onLoadedMetadata={event => { const video = event.currentTarget as HTMLVideoElement; if (video.videoWidth > 0 && video.videoHeight > 0) setVideoRatio(video.videoWidth / video.videoHeight); }} onLoadedData={() => { setVideoReady(true); setVideoBuffering(false); }} onCanPlay={() => { setVideoReady(true); setVideoBuffering(false); }} onPlaying={() => { setVideoReady(true); setVideoBuffering(false); }} onWaiting={() => { if (videoReady) setVideoBuffering(true); }} onStalled={() => { if (videoReady) setVideoBuffering(true); }} onError={event => handleVideoError(event as React.SyntheticEvent<HTMLVideoElement>)} /><span className={`media-preview-load-indicator ${videoLoading ? "is-visible" : ""}`} role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />正在加载</span></div>
+      {isAudio && node.audio && !audioFailed ? <CanvasMediaPlayer key={`${node.id}:${node.audio}:${audioAttempt}`} kind="audio" className="preview-audio" shellClassName={mediaSwitching ? "is-switching" : undefined} src={node.audio} label={node.title} autoPlay onNotice={onNotice} onError={() => setAudioFailed(true)} /> : isAudio ? <div className="media-preview-loading" role="status"><Music2 size={22} /><span>{audioContentLoading ? "正在加载音频…" : "音频预览暂不可用"}</span></div> : videoSourceAvailable && !videoFailed ? <div key={node.id} className={`media-preview-media-wrap media-preview-video-wrap${mediaSwitching ? " is-switching" : ""}`} style={{ "--preview-video-ratio": String(videoRatio) } as React.CSSProperties}>{node.videoPoster && <img className="media-preview-video-backdrop" src={node.videoPoster} alt="" aria-hidden="true" />}{node.videoPoster && <img className={`media-preview-poster ${videoReady ? "is-hidden" : "is-visible"}`} src={node.videoPoster} alt={`${node.title} · 首帧`} />}<CanvasMediaPlayer key={`${node.id}:${videoSource || ""}:${videoAttempt}:${videoCorsFallback ? "no-cors" : "cors"}`} kind="video" className={`preview-video ${videoLoading ? "is-loading" : "is-ready"}`} src={videoSource!} poster={node.videoPoster} label={node.title} crossOrigin={node.assetId || node.taskId ? videoCorsFallback ? undefined : "anonymous" : undefined} autoPlay playsInline preload="auto" onNotice={onNotice} onLoadedMetadata={event => { const video = event.currentTarget as HTMLVideoElement; if (video.videoWidth > 0 && video.videoHeight > 0) setVideoRatio(video.videoWidth / video.videoHeight); }} onLoadedData={() => { setVideoReady(true); setVideoBuffering(false); }} onCanPlay={() => { setVideoReady(true); setVideoBuffering(false); }} onPlaying={() => { setVideoReady(true); setVideoBuffering(false); }} onWaiting={() => { if (videoReady) setVideoBuffering(true); }} onStalled={() => { if (videoReady) setVideoBuffering(true); }} onError={event => handleVideoError(event as React.SyntheticEvent<HTMLVideoElement>)} /><span className={`media-preview-load-indicator ${videoLoading ? "is-visible" : ""}`} role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />正在加载</span></div>
         : imagePreviewAvailable && !imageFailed ? <div key={node.id} ref={imageViewport} className={`media-preview-media-wrap media-preview-image-viewport${mediaSwitching ? " is-switching" : ""} ${imageZoom > 1 ? "is-zoomed" : ""}`} onWheel={handleImageWheel} onPointerDown={handleImagePointerDown} onPointerMove={handleImagePointerMove} onPointerUp={stopImageDrag} onPointerCancel={stopImageDrag} onLostPointerCapture={stopImageDrag}>
           {imageSource && <img key={`${node.id}:${imageSource}:${imageAttempt}`} className={`media-preview-image ${imageLoading ? "is-loading" : "is-ready"}`} style={imageFitSize.width ? { width: imageFitSize.width, height: imageFitSize.height, transform: `translate3d(${imagePan.x}px, ${imagePan.y}px, 0) scale(${imageZoom})` } : undefined} src={imageSource} alt={node.title} draggable={false} onLoad={handleImageLoad} onError={handleImageError} />}
           {imageOriginalPreloadSource && imageOriginalPreloadSource !== imageSource && (imageOriginalPending || imageFullResolution) && <img key={`${node.id}:original:${imageOriginalPreloadSource}:${imageAttempt}`} className={`media-preview-image media-preview-image-detail ${imageFullResolution ? "is-ready" : "is-pending"}`} style={{ ...(imageFitSize.width ? { width: imageFitSize.width, height: imageFitSize.height } : {}), transform: `translate3d(-50%, -50%, 0) translate3d(${imagePan.x}px, ${imagePan.y}px, 0) scale(${imageZoom})` }} src={imageOriginalPreloadSource} alt={imageSource ? "" : node.title} aria-hidden={imageSource ? true : undefined} draggable={false} onLoad={handleOriginalPreloadLoad} onError={handleOriginalPreloadError} />}
           <span className={`media-preview-load-indicator ${imageLoading || imageOriginalPending ? "is-visible" : ""}`} role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{imageOriginalPending ? "正在获取原图" : "正在加载"}</span>
-          {imageOriginalError && <div className="media-preview-original-error" role="status" onPointerDown={event => event.stopPropagation()}><span>{imageThumbnailSource ? "原图暂时无法获取，当前显示缩略图" : "原图暂时无法获取"}</span><button type="button" className="button" onClick={() => requestFullResolution(true)}><RefreshCw size={14} />重试原图</button></div>}
+          {imageOriginalError && imageThumbnailSource && <div className="media-preview-original-state" role="status" aria-live="polite" onPointerDown={event => event.stopPropagation()}><span>当前显示缩略图</span><button type="button" className="icon-button" aria-label="重试加载原图" title="重试加载原图" onClick={() => requestFullResolution(true)}><RefreshCw size={14} /></button></div>}
         </div>
-          : hasImage && !imageThumbnailSource ? <div className="media-preview-loading" role="status">{imageOriginalError ? <RefreshCw size={22} /> : <LoaderCircle className="spin" size={22} />}{imageOriginalError ? "原图暂时无法获取" : "正在获取原图"}{imageOriginalError && <button type="button" className="button" onClick={() => requestFullResolution(true)}><RefreshCw size={14} />重试原图</button>}</div>
-          : hasImage && imageFailed ? <div className="media-preview-loading" role="status"><RefreshCw size={22} />图片暂不可用<button type="button" className="button" onClick={() => { setImageFailed(false); setImageLoading(true); setImageAttempt((attempt) => attempt + 1); onImageRetry?.(); }}><RefreshCw size={14} />重新加载</button></div>
-          : node.videoPoster && videoFailed ? <div className="media-preview-failed" role="alert"><img src={node.videoPoster} alt={`${node.title} · 首帧`} /><span>{videoErrorMessage || "视频播放失败"}</span><button type="button" className="button" onClick={() => { void retryVideo(); }}><RefreshCw size={14} />重新加载</button></div>
-          : isVideo && videoContentMessage ? <div className="media-preview-failed" role="alert">{node.videoPoster && <img src={node.videoPoster} alt={`${node.title} · 首帧`} />}<span>{videoContentMessage}</span><button type="button" className="button" onClick={() => { void retryVideo(); }}><RefreshCw size={14} />重新加载</button></div>
-          : node.videoPoster && isVideo ? <div key={node.id} className={`media-preview-media-wrap${mediaSwitching ? " is-switching" : ""}`}><img className="media-preview-poster is-visible" src={node.videoPoster} alt={`${node.title} · 首帧`} /><span className={`media-preview-load-indicator ${remoteVideoLoading ? "is-visible" : ""}`} role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />正在加载视频…</span></div>
+          : hasImage && !imageThumbnailSource ? <div className="media-preview-loading" role="status">{imageOriginalError ? <ImageIcon size={22} /> : <LoaderCircle className="spin" size={22} />}<span>{imageOriginalError ? "预览暂不可用" : "正在获取原图"}</span></div>
+          : hasImage && imageFailed ? <div className="media-preview-loading" role="status"><ImageIcon size={22} /><span>预览暂不可用</span><button type="button" className="button" onClick={() => { setImageFailed(false); setImageLoading(true); setImageAttempt(attempt => attempt + 1); onImageRetry?.(); }}><RefreshCw size={14} />重试</button></div>
+          : node.videoPoster && videoFailed ? <div className="media-preview-failed" role="status"><img src={node.videoPoster} alt={`${node.title} · 首帧`} /><span>预览暂不可用</span><button type="button" className="button" onClick={() => { void retryVideo(); }}><RefreshCw size={14} />重试</button></div>
+          : isVideo && videoContentMessage ? <div className="media-preview-failed" role="status">{node.videoPoster && <img src={node.videoPoster} alt={`${node.title} · 首帧`} />}<span>预览暂不可用</span><button type="button" className="button" onClick={() => { void retryVideo(); }}><RefreshCw size={14} />重试</button></div>
+          : node.videoPoster && isVideo ? <div key={node.id} className={`media-preview-media-wrap media-preview-video-wrap${mediaSwitching ? " is-switching" : ""}`} style={{ "--preview-video-ratio": String(videoRatio) } as React.CSSProperties}><img className="media-preview-video-backdrop" src={node.videoPoster} alt="" aria-hidden="true" /><img className="media-preview-poster is-visible" src={node.videoPoster} alt={`${node.title} · 首帧`} /><span className={`media-preview-load-indicator ${remoteVideoLoading ? "is-visible" : ""}`} role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />正在加载视频…</span></div>
           : node.videoPoster ? <img className="media-preview-poster" src={node.videoPoster} alt={`${node.title} · 首帧`} />
-          : <div className="media-preview-loading" role="status">{videoContentMessage || videoFailed ? <Film size={22} /> : <LoaderCircle className="spin" size={22} />}{videoContentMessage || (videoFailed ? videoErrorMessage : "") || "正在加载视频…"}{(videoContentMessage || videoFailed) && <button type="button" className="button" onClick={() => { void retryVideo(); }}><RefreshCw size={14} />重新加载</button>}</div>}
+          : <div className="media-preview-loading" role="status">{videoContentMessage || videoFailed ? <Film size={22} /> : <LoaderCircle className="spin" size={22} />}<span>{videoContentMessage || videoFailed ? "预览暂不可用" : "正在加载视频…"}</span>{(videoContentMessage || videoFailed) && <button type="button" className="button" onClick={() => { void retryVideo(); }}><RefreshCw size={14} />重试</button>}</div>}
       {items.length > 0 && <>
         <button type="button" className="icon-button media-preview-stage-navigation media-preview-stage-navigation-left" aria-label="上一个结果（主图）" title="上一个结果" disabled={index === 0} onPointerDown={event => event.stopPropagation()} onClick={() => selectRelative(-1)}><ChevronLeft size={22} /></button>
         <button type="button" className="icon-button media-preview-stage-navigation media-preview-stage-navigation-right" aria-label="下一个结果（主图）" title="下一个结果" disabled={index === items.length - 1} onPointerDown={event => event.stopPropagation()} onClick={() => selectRelative(1)}><ChevronRight size={22} /></button>
       </>}
-      {!isVideo && !isAudio && imagePreviewAvailable && !imageFailed && <div className={`media-preview-zoom-controls${zoomReadoutVisible ? " is-zoom-readout-visible" : ""}`} aria-label="图片缩放" onPointerDown={event => event.stopPropagation()} onWheel={event => event.stopPropagation()}>
-        <button type="button" className="icon-button" aria-label="放大图片" title="放大" onClick={() => changeZoom(.25)} disabled={imageZoom >= 4}><Plus size={15} /></button>
-        <button type="button" className="icon-button" aria-label="缩小图片" title="缩小" onClick={() => changeZoom(-.25)} disabled={imageZoom <= 1}><Minus size={15} /></button>
-        <div className="media-preview-zoom-readout">
-          <span aria-live="polite" title="以适配窗口为 100%">{Math.round(imageZoom * 100)}%</span>
-          <input type="range" aria-label="图片缩放比例" min="100" max="400" step="5" value={Math.round(imageZoom * 100)}
-            onPointerDown={event => {
-              zoomSliderPointerActive.current = true;
-              zoomSliderKeyboardActive.current = false;
-              event.currentTarget.setPointerCapture(event.pointerId);
-              revealZoomReadout();
-            }}
-            onPointerUp={stopZoomSliderPointer} onPointerCancel={stopZoomSliderPointer} onLostPointerCapture={stopZoomSliderPointer}
-            onFocus={() => { zoomSliderKeyboardActive.current = !zoomSliderPointerActive.current; revealZoomReadout(); }}
-            onBlur={() => { zoomSliderKeyboardActive.current = false; zoomSliderPointerActive.current = false; revealZoomReadout(); }}
-            onKeyDown={() => { zoomSliderKeyboardActive.current = true; revealZoomReadout(); }}
-            onChange={event => setZoom(Number(event.currentTarget.value) / 100)} />
-        </div>
-        <button type="button" className="icon-button" aria-label="适配图片" title="适配窗口（100%）" onClick={() => setZoom(1)} disabled={imageZoom === 1}><Scan size={15} /></button>
+      {((!isVideo && !isAudio && imagePreviewAvailable && !imageFailed) || sources.length > 0) && <div className={`media-preview-zoom-controls${zoomReadoutVisible ? " is-zoom-readout-visible" : ""}`} role="toolbar" aria-label="媒体工具" onPointerDown={event => event.stopPropagation()} onWheel={event => event.stopPropagation()}>
+        {!isVideo && !isAudio && imagePreviewAvailable && !imageFailed && <>
+          <button type="button" className="icon-button" aria-label="放大图片" title="放大" onClick={() => changeZoom(.25)} disabled={imageZoom >= 4}><Plus size={15} /></button>
+          <button type="button" className="icon-button" aria-label="缩小图片" title="缩小" onClick={() => changeZoom(-.25)} disabled={imageZoom <= 1}><Minus size={15} /></button>
+          <div className="media-preview-zoom-readout">
+            <span aria-live="polite" title="以适配窗口为 100%">{Math.round(imageZoom * 100)}%</span>
+            <input type="range" aria-label="图片缩放比例" min="100" max="400" step="5" value={Math.round(imageZoom * 100)}
+              onPointerDown={event => {
+                zoomSliderPointerActive.current = true;
+                zoomSliderKeyboardActive.current = false;
+                event.currentTarget.setPointerCapture(event.pointerId);
+                revealZoomReadout();
+              }}
+              onPointerUp={stopZoomSliderPointer} onPointerCancel={stopZoomSliderPointer} onLostPointerCapture={stopZoomSliderPointer}
+              onFocus={() => { zoomSliderKeyboardActive.current = !zoomSliderPointerActive.current; revealZoomReadout(); }}
+              onBlur={() => { zoomSliderKeyboardActive.current = false; zoomSliderPointerActive.current = false; revealZoomReadout(); }}
+              onKeyDown={() => { zoomSliderKeyboardActive.current = true; revealZoomReadout(); }}
+              onChange={event => setZoom(Number(event.currentTarget.value) / 100)} />
+          </div>
+          <button type="button" className="icon-button" aria-label="适配图片" title="适配窗口（100%）" onClick={() => setZoom(1)} disabled={imageZoom === 1}><Scan size={15} /></button>
+        </>}
+        {sources.length > 0 && <>
+          {!isVideo && !isAudio && imagePreviewAvailable && !imageFailed && <span className="media-preview-toolbar-divider" aria-hidden="true" />}
+          <button type="button" className="icon-button media-preview-locate" aria-label="定位到来源节点" title="定位到来源节点" onClick={() => onLocate(sources[0].id)}><LocateFixed size={15} /><span>定位到节点</span></button>
+        </>}
       </div>}
     </div>
-    {items.length > 0 && <div className="media-preview-gallery" role="group" aria-label="画廊结果">
+    {items.length > 0 && <div className="media-preview-gallery" role="group" aria-label={`画廊结果，第 ${index + 1} 个，共 ${items.length} 个`}>
       <div className="media-preview-gallery-head">
-        <span>结果 <strong aria-live="polite">{index + 1} / {items.length}</strong></span>
-        {sources.length > 0 && <button type="button" className="media-preview-locate" title="定位到来源节点" aria-label="定位到来源节点" onClick={() => onLocate(sources[0].id)}><LocateFixed size={14} />定位到节点</button>}
+        <span>画廊 <strong aria-live="polite">{index + 1} / {items.length}</strong></span>
       </div>
       <div className="media-preview-thumbnails-row" onPointerDown={event => event.stopPropagation()}>
         <button type="button" className="icon-button media-preview-result-nav" aria-label="上一个结果" title="上一个结果" disabled={index === 0} onClick={() => selectRelative(-1)}><ChevronLeft size={17} /></button>
@@ -649,7 +695,13 @@ export default function MediaPreview<T extends Media>({ node, items, index, sour
             const posterSource = item.videoPoster
               ? adjacentImagePreloadSource(item.videoPoster)
               : undefined;
-            return <button key={item.id} type="button" role="option" aria-label={`查看第 ${itemIndex + 1} 个结果`} aria-current={node.id === item.id ? "true" : undefined} aria-selected={node.id === item.id} onClick={() => onSelect(item)}>
+            const isThumbnailVideo = Boolean(item.type === "video" || item.mediaType === "video" || item.video || item.videoContentUrl || item.videoPoster);
+            const thumbnailPlaceholder = isThumbnailVideo
+              ? <Film size={18} aria-hidden="true" />
+              : item.audio
+                ? <Music2 size={18} aria-hidden="true" />
+                : <ImageIcon size={18} aria-hidden="true" />;
+            return <button key={item.id} type="button" className={isThumbnailVideo ? "media-preview-thumbnail--video" : item.audio ? "media-preview-thumbnail--audio" : "media-preview-thumbnail--image"} role="option" aria-label={`查看第 ${itemIndex + 1} 个结果`} aria-current={node.id === item.id ? "true" : undefined} aria-selected={node.id === item.id} onClick={() => onSelect(item)}>
               {displayThumbnailSource ? <img src={displayThumbnailSource} alt="" loading="lazy" decoding="async" onError={(event) => {
                 const fallback = resolveImageSource?.(thumbnailInput) || thumbnailInput;
                 if (displayThumbnailSource !== fallback) {
@@ -657,16 +709,15 @@ export default function MediaPreview<T extends Media>({ node, items, index, sour
                   return;
                 }
                 event.currentTarget.hidden = true;
-              }} /> : thumbnailInput ? <div className="media-preview-thumbnail-placeholder" aria-hidden="true"><Film size={18} /></div> : posterSource ? <img src={posterSource} alt="" loading="lazy" decoding="async" /> : item.videoPoster ? <div className="media-preview-thumbnail-placeholder" aria-hidden="true"><Film size={18} /></div> : item.audio ? <Music2 size={18} /> : <Film size={18} />}<span>{itemIndex + 1}</span>
+              }} /> : thumbnailInput ? <div className="media-preview-thumbnail-placeholder" aria-hidden="true">{thumbnailPlaceholder}</div> : posterSource ? <img src={posterSource} alt="" loading="lazy" decoding="async" /> : <div className="media-preview-thumbnail-placeholder" aria-hidden="true">{thumbnailPlaceholder}</div>}<span className="media-preview-thumbnail-index">{itemIndex + 1}</span>
             </button>;
           })}
         </div>
         <button type="button" className="icon-button media-preview-result-nav" aria-label="下一个结果" title="下一个结果" disabled={index === items.length - 1} onClick={() => selectRelative(1)}><ChevronRight size={17} /></button>
       </div>
     </div>}
-    {(items.length === 0 && sources.length > 0 || error) && <div className="preview-actions">
+    {items.length === 0 && sources.length > 0 && <div className="preview-actions">
       {items.length === 0 && sources.length > 0 && <button className="button secondary" title="定位到画布节点" aria-label="定位到画布节点" onClick={() => onLocate(sources[0].id)}><LocateFixed size={15} />定位到节点</button>}
-      {error && <div className="creator-feedback" role="alert"><p>{error}</p>{imageOriginalSource && <a href={imageOriginalSource} target="_blank" rel="noreferrer">打开原图保存</a>}</div>}
     </div>}
   </>;
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { catalogModels, compatibleModels, mediaReferenceLimit, modelUnavailableReason, normalizeVideoModel, preferredModel, preferredModelForNode, resolveVideoSettings, selectedModelIdForNode, videoOptions, type MediaModel } from "../src/video-models.ts";
+import { canEnterMediaScheduler, catalogModels, compatibleModels, isMediaModelRecovering, mediaReferenceLimit, modelUnavailableReason, normalizeVideoModel, preferredModel, preferredModelForNode, resolveVideoSettings, selectedModelIdForNode, videoOptions, type MediaModel } from "../src/video-models.ts";
 
 test("preferred model honors the platform default marker", () => {
   const models: MediaModel[] = [
@@ -51,6 +51,16 @@ test("video catalog assigns endpoint type and preserves unavailable models for d
   assert.deepEqual(compatibleModels(models, "video"), []);
   assert.equal(modelUnavailableReason(models[0], "video"), "暂不可用");
   assert.deepEqual(catalogModels({ items: [{ id: "image" }] }, "image"), [{ id: "image", type: "image" }]);
+});
+
+test("recovering media supply can enter the scheduler trial while hard-unavailable supply stays blocked", () => {
+  const recovering: MediaModel = { id: "recovering-image", type: "image", available: false, supply_status: "recovering", supported_operations: ["generation"], supported_input_modes: ["text"] };
+  const unavailable: MediaModel = { id: "offline-image", type: "image", available: false, supply_status: "unavailable", supported_operations: ["generation"], supported_input_modes: ["text"] };
+  assert.equal(isMediaModelRecovering(recovering), true);
+  assert.equal(canEnterMediaScheduler(recovering), true);
+  assert.equal(modelUnavailableReason(recovering, "image"), "");
+  assert.deepEqual(compatibleModels([recovering, unavailable], "image"), [recovering]);
+  assert.equal(canEnterMediaScheduler(unavailable), false);
 });
 
 test("both public and nested video capabilities allow two references without mixing image models", () => {

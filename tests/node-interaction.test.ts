@@ -64,6 +64,50 @@ test("image and video are previewable output values and cannot receive input", (
   }
 });
 
+test("loaded media can receive a visible port for references", () => {
+  const image = node("image", { image: "https://cdn.test/legacy.png?token=expired" });
+  assert.equal(getNodeInteraction(image).canReceiveConnection, false);
+  const referenceTarget = getNodeInteraction(image, {
+    hasMediaContent: true,
+    allowCompletedMediaInput: true,
+  });
+  assert.equal(referenceTarget.canReceiveConnection, true);
+  assert.equal(referenceTarget.canStartConnection, true);
+});
+
+test("completed prompt media exposes a reference target port", () => {
+  const policy = getNodeInteraction(node("prompt", { image: "https://cdn.test/result.png" }), {
+    hasMediaContent: true,
+    allowCompletedMediaInput: true,
+  });
+  assert.equal(policy.completedMedia, true);
+  assert.equal(policy.canReceiveConnection, true);
+});
+
+test("asset-only media identities remain connectable while their delivery URL hydrates", () => {
+  const image = node("image", { assetId: "restored-image" });
+  assert.equal(nodeHasMediaContent(image), true);
+  const interaction = getNodeInteraction(image, { allowCompletedMediaInput: true });
+  assert.equal(interaction.canReceiveConnection, true);
+  assert.equal(interaction.canStartConnection, true);
+});
+
+test("completed media remains a value while its delivery URL is unloaded", () => {
+  const legacy = node("prompt", { mediaType: "image", status: "completed" });
+  assert.equal(nodeHasMediaContent(legacy), false);
+  const interaction = getNodeInteraction(legacy, { hasMediaContent: false, allowCompletedMediaInput: true });
+  assert.equal(interaction.completedMedia, false);
+  assert.equal(interaction.canPreview, false);
+  assert.equal(interaction.canReceiveConnection, true);
+});
+
+test("completed imported image accepts a reference while its URL is unloaded", () => {
+  const legacy = node("image", { status: "completed" });
+  const interaction = getNodeInteraction(legacy, { allowCompletedMediaInput: true });
+  assert.equal(interaction.canReceiveConnection, true);
+  assert.equal(interaction.canStartConnection, true);
+});
+
 test("empty image placeholders offer upload instead of a dead preview action", () => {
   const policy = getNodeInteraction(node("image"));
   assert.equal(policy.canPreview, false);

@@ -40,6 +40,15 @@ export class VoiceDesignError extends Error {
 type RecordValue = Record<string, unknown>;
 const record = (value: unknown): RecordValue => value && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : {};
 const string = (value: unknown) => typeof value === "string" ? value : "";
+const legacyGatewayContentURL = (value: string) => {
+  if (!value) return false;
+  try {
+    const pathname = new URL(value, "https://gateway.invalid").pathname;
+    return /\/(?:v1\/)?(?:music|voice-design|tts)\/tasks\/[^/]+\/content\/?$/i.test(pathname) ||
+      /\/(?:v1\/)?media\/assets\/[^/]+\/content\/?$/i.test(pathname);
+  } catch { return false; }
+};
+const directDeliveryURL = (value: string) => /^https?:\/\//i.test(value) && !legacyGatewayContentURL(value);
 const validId = (value: string) => /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
 const taskRecord = (value: unknown) => { const body = record(value); return Object.keys(record(body.task)).length ? record(body.task) : record(body.data); };
 const taskIdFrom = (value: unknown) => {
@@ -68,11 +77,12 @@ const lifecycleFor = (snapshot: VoiceDesignSnapshot) => ({ status: snapshot.stat
 export function voiceDesignSnapshot(value: unknown, expectedTaskId?: string): VoiceDesignSnapshot {
   const body = record(value), task = taskRecord(value), trialAudio = record(body.trial_audio || task.trial_audio);
   const taskId = taskIdFrom(value) || expectedTaskId || "";
+  const contentUrl = [string(body.content_url), string(task.content_url), string(trialAudio.url)].find(directDeliveryURL) || "";
   return {
     taskId,
     status: statusFrom(value),
     ...(string(body.voice_id || task.voice_id) ? { voiceId: string(body.voice_id || task.voice_id) } : {}),
-    ...(string(body.content_url || task.content_url || trialAudio.url) ? { contentUrl: string(body.content_url || task.content_url || trialAudio.url) } : {}),
+    ...(contentUrl ? { contentUrl } : {}),
     ...(string(body.asset_id || task.asset_id) ? { assetId: string(body.asset_id || task.asset_id) } : {}),
     ...(messageFrom(value) ? { error: messageFrom(value) } : {}),
     ...(codeFrom(value) ? { code: codeFrom(value) } : {}),
@@ -132,23 +142,16 @@ export async function cancelVoiceDesign(request: MusicRequest, taskId: string, i
   return snapshot;
 }
 
-export async function readVoiceDesignContent(request: MusicRequest, taskId: string, contentUrl?: string, signal?: AbortSignal): Promise<Blob> {
+export async function readVoiceDesignContent(request: MusicRequest, taskId: string, contentUrl?: string, signal?: AbortSignal, fetchResource: typeof fetch = fetch): Promise<Blob> {
   if (!validId(taskId)) throw new VoiceDesignError("音色任务 ID 无效。", { code: "VOICE_DESIGN_INVALID_ID" });
-  const fallback = `/voice-design/tasks/${taskId}/content`;
-  let path = fallback;
-  if (contentUrl) {
-    let parsed: URL;
-    try { parsed = new URL(contentUrl, "https://canvas.invalid"); }
-    catch { throw new VoiceDesignError("试听音频地址无效。", { taskId, code: "VOICE_DESIGN_CONTENT_URL_INVALID" }); }
-    const match = /^\/(?:v1\/)?voice-design\/tasks\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/content$/.exec(parsed.pathname);
-    const indexes = parsed.searchParams.getAll("index");
-    if (parsed.hash || match?.[1] !== taskId || [...parsed.searchParams.keys()].some(key => key !== "index") || indexes.length > 1 || indexes.some(index => !/^\d+$/.test(index))) throw new VoiceDesignError("试听音频地址与任务不匹配。", { taskId, code: "VOICE_DESIGN_CONTENT_URL_INVALID" });
-    path = `${fallback}${indexes.length ? `?index=${indexes[0]}` : ""}`;
-  }
+  let deliveryURL = directDeliveryURL(contentUrl || "") ? contentUrl! : "";
   abortCheck(signal);
   try {
-    const blob = await withAbort(request(path, { responseType: "blob", signal }), signal) as Blob;
-    return await withAbort(validateMusicContentBlob(blob), signal);
+    if (!deliveryURL) deliveryURL = (await readVoiceDesignTask(request, taskId, signal)).contentUrl || "";
+    if (!directDeliveryURL(deliveryURL)) throw new VoiceDesignError("任务没有可用的对象存储试听地址。", { taskId, code: "VOICE_DESIGN_CONTENT_URL_UNAVAILABLE" });
+    const response = await withAbort(fetchResource(deliveryURL, { credentials: "omit", signal }), signal);
+    if (!response.ok) throw new Error(`voice design object download failed (${response.status})`);
+    return await withAbort(validateMusicContentBlob(await response.blob()), signal);
   } catch (cause) {
     throw new VoiceDesignError(signal?.aborted ? "已暂停读取音色试听音频。" : "音色试听音频暂时不可用。", { taskId, pending: true, code: signal?.aborted ? "VOICE_DESIGN_CONTENT_PAUSED" : "VOICE_DESIGN_CONTENT_INVALID", cause });
   }
@@ -160,7 +163,7 @@ export async function generateVoiceDesign(
   input: VoiceDesignInput,
   onTask?: (taskId: string) => void | Promise<void>,
   options: {
-    signal?: AbortSignal; recovery?: boolean; delay?: (ms: number) => Promise<void>; intervalMs?: number;
+    signal?: AbortSignal; recovery?: boolean; allowResubmit?: boolean; delay?: (ms: number) => Promise<void>; intervalMs?: number;
     reconciliationIntervalMs?: number; maxConsecutiveReadFailures?: number;
     onStatus?: (snapshot: VoiceDesignSnapshot) => void | Promise<void>;
   } = {},
@@ -194,6 +197,10 @@ export async function generateVoiceDesign(
       taskId = found.taskId;
       await remember(taskId);
       if (await observe(found)) return found;
+    } else if (options.allowResubmit === false) {
+      throw new VoiceDesignError("原音色提交暂未查到，已停止自动重提，请稍后重试。", {
+        pending: true, code: "VOICE_DESIGN_SUBMISSION_NOT_FOUND",
+      });
     }
   }
   if (!taskId) {

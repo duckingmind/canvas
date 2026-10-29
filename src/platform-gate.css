@@ -37,6 +37,29 @@
   backdrop-filter: blur(5px);
 }
 
+.platform-gate-toast {
+  position: fixed;
+  z-index: 2;
+  top: max(20px, env(safe-area-inset-top));
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: min(560px, calc(100vw - 32px));
+  padding: 12px 14px;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.platform-gate-toast > span { flex: 1; overflow-wrap: anywhere; }
+.platform-gate-toast > button { border: 0; background: none; color: inherit; cursor: pointer; font: inherit; }
+
 .platform-gate-card {
   width: min(100%, 440px);
   flex-shrink: 0;
@@ -325,36 +348,13 @@
   outline: none;
 }
 
-/* The platform check only answers whether Workspace may mount. Workspace
-   renders the richer canvas bootstrap animation after admission, so the gate
-   uses a small status pill during this transient phase instead of showing a
-   second full startup card. */
+/* Platform admission and workspace preparation share CanvasLoadingIndicator. */
 .platform-gate-dialog.is-checking {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 100%;
   min-height: 100%;
-}
-
-.platform-gate-loading-only {
-  display: inline-flex;
-  align-items: center;
-  gap: 9px;
-  min-height: 40px;
-  padding: 10px 14px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--surface);
-  box-shadow: var(--shadow);
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.platform-gate-loading-only .platform-gate-spinner {
-  flex-shrink: 0;
-  color: var(--text);
 }
 
 .platform-gate-card.is-compact {

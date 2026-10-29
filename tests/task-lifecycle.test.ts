@@ -24,7 +24,6 @@ test("video submission snapshots normalize old strings and gateway references", 
   ]), [
     { image: "https://cdn.test/a.png" },
     { image: "https://cdn.test/b.png" },
-    { localImage: "proxy-canvas:image:sha256:abc" },
   ]);
   assert.deepEqual(normalizeVideoSubmission({
     key: "video-submit",

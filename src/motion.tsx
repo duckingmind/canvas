@@ -59,13 +59,22 @@ export function PresenceLayer({
 }: PresenceLayerProps) {
   const presence = usePresence(open, duration);
   const lastChild = React.useRef<React.ReactNode>(null);
+  // Keep state-dependent presentation modifiers with the retained content.
+  // A closing lightbox changes `open` before the exit timer finishes; using
+  // the new closed class here would briefly turn it into a regular modal and
+  // reflow its thumbnail rail during the fade-out.
+  const lastOpenClassName = React.useRef(className);
   if (open && children !== null && children !== undefined && children !== false) {
     lastChild.current = children;
   }
+  if (open) lastOpenClassName.current = className;
 
   React.useEffect(() => {
-    if (!presence.mounted) lastChild.current = null;
-  }, [presence.mounted]);
+    if (!presence.mounted) {
+      lastChild.current = null;
+      lastOpenClassName.current = className;
+    }
+  }, [className, presence.mounted]);
 
   if (!presence.mounted) return null;
 
@@ -77,11 +86,12 @@ export function PresenceLayer({
   const inertProps = {
     inert: presence.phase === "exit" ? "" : undefined,
   };
+  const visibleClassName = open ? className : lastOpenClassName.current;
   return (
     <div
       {...props}
       {...inertProps}
-      className={`${className} motion-${presence.phase}`.trim()}
+      className={`${visibleClassName} motion-${presence.phase}`.trim()}
       data-motion-phase={presence.phase}
       aria-hidden={presence.phase === "exit" ? true : undefined}
     >

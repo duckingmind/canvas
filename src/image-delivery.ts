@@ -10,11 +10,14 @@ type DeliveryReaders = {
 
 /** A thumbnail address is never evidence that the original was recovered. */
 export function recoveredImageOriginal(source?: string, thumbnail?: string): string | undefined {
-  if (!source || !/^(?:https?:\/\/|\/|data:image\/|blob:)/i.test(source)) return undefined;
+  // Recovery is a server-owned delivery path. Inline data and browser object
+  // URLs are transient representations and must never become a recovered
+  // image after a task or asset lookup.
+  if (!source || !/^(?:https?:\/\/|\/)/i.test(source)) return undefined;
   if (isThumbnailURL(source)) return undefined;
   const original = imageOriginalURL(source);
   if (!original || isThumbnailURL(original)) return undefined;
-  if (!/^(?:data:image\/|blob:)/i.test(original) && original === thumbnail) return undefined;
+  if (thumbnail && original === thumbnail) return undefined;
   return original;
 }
 

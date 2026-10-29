@@ -5,3 +5,4 @@ tests/artifacts/
 *.zip
 .DS_Store
 .proxy-app-build/
+thirdparts

@@ -7,6 +7,17 @@ export function hasRecoverableVideoIdentity(node: { type?: string; mediaType?: s
     Boolean(node.localVideo || node.assetId || node.status === "completed" && node.taskId);
 }
 
+/** Full-video extraction can share immutable bytes when a durable source key exists. */
+export function canReuseVideoContent(node: Pick<CanvasNode, "assetId" | "taskId" | "localVideo" | "video" | "videoContentUrl" | "status">): boolean {
+  if (node.localVideo) return true;
+  // A node may retain legacy delivery metadata beside the actual inline
+  // bytes. The current playable value takes precedence for this decision.
+  if (/^(?:blob:|data:video\/)/i.test(node.video || node.videoContentUrl || "")) return false;
+  if (node.assetId) return true;
+  if (!(["", "idle", "completed"].includes(node.status || ""))) return false;
+  return Boolean(node.taskId || /(?:^|\/)videos\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\/content(?:[?#]|$)/.test(node.videoContentUrl || node.video || ""));
+}
+
 /** A newly generated result must never inherit an older local video or cover. */
 export function completedVideoMedia(result: { contentUrl: string; contentUrlExpiresAt?: string; assetId?: string }) {
   return {

@@ -142,6 +142,26 @@ test("direct downloads never forward application authorization or cookies to COS
   assert.equal(blob.type, "video/mp4"); assert.equal(blob.size, mp4.length); assert.equal(fetched, 1);
 });
 
+test("streamed downloads report throttled byte progress and the trustworthy total size", async () => {
+  const chunks = [mp4.subarray(0, 8), mp4.subarray(8)];
+  let index = 0;
+  const stream = new ReadableStream({ pull(controller) {
+    const chunk = chunks[index++];
+    if (chunk) controller.enqueue(chunk);
+    else controller.close();
+  } }, { highWaterMark: 0 });
+  const progress: Array<{ loadedBytes: number; totalBytes?: number }> = [];
+  const blob = await readVideoSourceBlob(unavailable, { video: url }, {
+    now,
+    onProgress: value => progress.push(value),
+    fetchResource: async () => new Response(stream, { headers: { "content-type": "video/mp4", "content-length": String(mp4.length) } }),
+  });
+  assert.equal(blob.size, mp4.length);
+  assert.ok(progress.length >= 1);
+  assert.deepEqual(progress.at(-1), { loadedBytes: mp4.length, totalBytes: mp4.length });
+  assert.ok(progress.every(value => value.loadedBytes <= mp4.length));
+});
+
 test("a failed direct URL is refreshed once through details, never through POST or content", async () => {
   let fetched = 0; const calls: string[] = [];
   const blob = await readVideoSourceBlob({ request: async (path, init) => { calls.push(path); assert.notEqual(init?.method, "POST"); return result({ url: `${url}&fresh=1` }); } }, { assetId: "asset-1", video: url }, { now, fetchResource: async input => {

@@ -1,12 +1,13 @@
 import React from "react";
 
-export function ParameterChoices({ label, values, value, onChange, render, ratios = false }: {
+export function ParameterChoices({ label, values, value, onChange, render, ratios = false, disabled = false }: {
   label: string;
   values: string[];
   value?: string;
   onChange: (value: string) => void;
   render?: (value: string) => React.ReactNode;
   ratios?: boolean;
+  disabled?: boolean;
 }) {
   if (!values.length) return null;
   return <section className={`context-parameter-section${ratios ? " is-ratios" : ""}`}>
@@ -20,12 +21,13 @@ export function ParameterChoices({ label, values, value, onChange, render, ratio
         const direction = event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 1;
         const index = event.key === "Home" ? 0 : event.key === "End" ? values.length - 1
           : (current + direction + values.length) % values.length;
+        if (disabled) return;
         onChange(values[index]);
         buttons[index]?.focus();
       }}>
       {values.map((option, index) => <button key={option} type="button" role="radio"
         aria-checked={option === value} tabIndex={option === value || (!values.includes(value || "") && index === 0) ? 0 : -1}
-        className={option === value ? "is-selected" : ""} onClick={() => onChange(option)}>
+        className={option === value ? "is-selected" : ""} disabled={disabled} onClick={() => onChange(option)}>
         {ratios && <span className="context-ratio-icon"><RatioMark value={option} /></span>}
         <span>{render ? render(option) : option}</span>
       </button>)}

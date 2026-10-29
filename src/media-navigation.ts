@@ -7,7 +7,6 @@ type MediaNode = {
   mediaType?: string;
   title?: string;
   image?: string;
-  localImage?: string;
   video?: string;
   localVideo?: string;
   videoContentUrl?: string;
@@ -27,8 +26,27 @@ type MediaNode = {
 };
 type Connection = { from: string; to: string };
 
+export type MediaNavigationResult<T extends MediaNode = MediaNode> = {
+  sources: T[];
+  items: T[];
+  index: number;
+};
+
+/**
+ * The graph is allowed to change while a preview is open (for example when
+ * signed media URLs are refreshed). Keep the gallery membership by stable
+ * node IDs so a content refresh cannot make the strip collapse to one item.
+ */
+export type MediaNavigationContext<T extends MediaNode = MediaNode> = {
+  itemIds: string[];
+  sourceIds: string[];
+  /** Last known node data keeps an open gallery stable across incomplete snapshots. */
+  itemSnapshots: T[];
+  sourceSnapshots: T[];
+};
+
 const hasMedia = (node: MediaNode) =>
-  ((node.type === "image" || node.type === "prompt") && Boolean(node.image || node.localImage)) ||
+  ((node.type === "image" || node.type === "prompt" && node.mediaType !== "video" && node.mediaType !== "audio") && Boolean(node.image || node.assetId)) ||
   ((node.type === "video" || node.type === "prompt") && Boolean(node.video || node.videoContentUrl)) ||
   hasRecoverableVideoIdentity(node) ||
   ((node.type === "audio" || node.type === "prompt" && node.mediaType === "audio") && Boolean(node.audio)) || hasRecoverableAudioIdentity(node);
@@ -82,15 +100,19 @@ const firstBatch = (...values: unknown[]) =>
  * `resultOf` is authoritative; the incoming prompt and direct output edge
  * are retained only for canvases saved before result lineage was persisted.
  */
-export function mediaNavigation<T extends MediaNode>(nodes: readonly T[], edges: readonly Connection[], current: T) {
-  const parentIds = new Set(edges.filter((edge) => edge.to === current.id).map((edge) => edge.from));
+export function mediaNavigation<T extends MediaNode>(nodes: readonly T[], edges: readonly Connection[], current: T): MediaNavigationResult<T> {
+  // `current` can be a preview snapshot whose navigation metadata predates a
+  // document refresh. Resolve it by ID before deriving the graph relationship.
+  // The document node is authoritative for resultOf/resultBatchId/resultIndex.
+  const canonicalCurrent = nodes.find((node) => node.id === current.id) || current;
+  const parentIds = new Set(edges.filter((edge) => edge.to === canonicalCurrent.id).map((edge) => edge.from));
   const incomingSources = uniqueNodes(nodes.filter((node) => node.type === "prompt" && parentIds.has(node.id)));
-  const hasLineage = typeof current.resultOf === "string" && current.resultOf.length > 0;
-  const lineageSource = current.resultOf
-    ? nodes.find((node) => node.id === current.resultOf)
+  const hasLineage = typeof canonicalCurrent.resultOf === "string" && canonicalCurrent.resultOf.length > 0;
+  const lineageSource = canonicalCurrent.resultOf
+    ? nodes.find((node) => node.id === canonicalCurrent.resultOf)
     : undefined;
-  if (hasLineage && !lineageSource) return { sources: [], items: [current], index: 0 };
-  const currentBatch = current.resultBatchId;
+  if (hasLineage && !lineageSource) return { sources: [], items: [canonicalCurrent], index: 0 };
+  const currentBatch = canonicalCurrent.resultBatchId;
   const batchSources = currentBatch
     ? uniqueNodes(nodes.filter((node) => {
       if (node.type !== "prompt") return false;
@@ -107,14 +129,14 @@ export function mediaNavigation<T extends MediaNode>(nodes: readonly T[], edges:
   // explicit lineage is intentionally not limited to prompt nodes.
   const sources = lineageSource
     ? [lineageSource]
-    : current.type === "prompt"
-      ? [current]
+    : canonicalCurrent.type === "prompt"
+      ? [canonicalCurrent]
       : incomingSources.length
         ? incomingSources
         : batchSources;
 
   // Without one unambiguous source, do not mix unrelated results in a gallery.
-  if (sources.length !== 1) return { sources, items: [current], index: 0 };
+  if (sources.length !== 1) return { sources, items: [canonicalCurrent], index: 0 };
   const source = sources[0];
   const outputIds = new Set(edges.filter((edge) => edge.from === source.id).map((edge) => edge.to));
   const incomingTargetIds = new Set(edges.map((edge) => edge.to));
@@ -123,7 +145,7 @@ export function mediaNavigation<T extends MediaNode>(nodes: readonly T[], edges:
     source.generationBatchId,
     source.resultBatchId,
   );
-  const requestedBatch = firstBatch(current.resultBatchId, sourceBatch);
+  const requestedBatch = firstBatch(canonicalCurrent.resultBatchId, sourceBatch);
   const candidates = uniqueNodes(nodes.filter((node) => {
     if (node.id === source.id || !hasMedia(node)) return false;
     if (node.resultOf === source.id) return true;
@@ -140,20 +162,20 @@ export function mediaNavigation<T extends MediaNode>(nodes: readonly T[], edges:
       // If explicit lineage exists on the selected node, recover a sibling
       // only when it has no competing incoming source. A stale edge from a
       // different creator must never be pulled into this gallery.
-      (!current.resultOf || outputIds.has(node.id) || !incomingTargetIds.has(node.id)),
+      (!canonicalCurrent.resultOf || outputIds.has(node.id) || !incomingTargetIds.has(node.id)),
     );
   }));
   // Single-output generations are stored directly on separate prompt nodes.
   // There is no result edge to follow, but the completed prompt still belongs
   // to the canvas media sequence. Use that sequence only as a last resort;
   // explicit lineage and batch metadata above always take precedence.
-  if (!candidates.length && !hasLineage && isInlineGeneratedMedia(current)) {
+  if (!candidates.length && !hasLineage && isInlineGeneratedMedia(canonicalCurrent)) {
     const canvasItems = orderResults(uniqueNodes(nodes.filter(isCanvasMedia)));
-    const canvasIndex = canvasItems.findIndex((node) => node.id === current.id);
+    const canvasIndex = canvasItems.findIndex((node) => node.id === canonicalCurrent.id);
     if (canvasItems.length > 1 && canvasIndex >= 0)
       return { sources, items: canvasItems, index: canvasIndex };
   }
-  if (!candidates.length) return { sources, items: [current], index: 0 };
+  if (!candidates.length) return { sources, items: [canonicalCurrent], index: 0 };
 
   // The selected result identifies its batch first. During recovery the source
   // can still hold the frozen submission or generation batch, so use those
@@ -169,7 +191,7 @@ export function mediaNavigation<T extends MediaNode>(nodes: readonly T[], edges:
   // creator identifies the selected batch, or when there is no competing
   // batch metadata. This recovers legacy galleries without mixing a known
   // historical batch into the current one.
-  const currentIsUnbatchedSibling = current.resultOf === source.id && !current.resultBatchId;
+  const currentIsUnbatchedSibling = canonicalCurrent.resultOf === source.id && !canonicalCurrent.resultBatchId;
   const includeUnbatched = Boolean(
     batchId && (
       // The creator's batch is authoritative. Results written by older
@@ -195,8 +217,8 @@ export function mediaNavigation<T extends MediaNode>(nodes: readonly T[], edges:
   // unbatched while other siblings carry a historical batch id, in which case
   // including every unbatched node would be too broad but dropping the
   // selected node would collapse the gallery back to one item.
-  const selectedItems = currentIsUnbatchedSibling && !batchItems.some((node) => node.id === current.id)
-    ? [current, ...batchItems]
+  const selectedItems = currentIsUnbatchedSibling && !batchItems.some((node) => node.id === canonicalCurrent.id)
+    ? [canonicalCurrent, ...batchItems]
     : batchItems;
   const orderedResults = orderResults(selectedItems);
   // A completed creator keeps a single output on its prompt node. When later
@@ -207,10 +229,56 @@ export function mediaNavigation<T extends MediaNode>(nodes: readonly T[], edges:
   const items = sourceIsCurrentMedia
     ? [source, ...orderedResults.filter((node) => node.id !== source.id)]
     : orderedResults;
-  const index = items.findIndex((node) => node.id === current.id);
+  const index = items.findIndex((node) => node.id === canonicalCurrent.id);
   // If a malformed legacy node cannot be associated with the selected batch,
   // keep it viewable without exposing unrelated results beside it.
   return index < 0
-    ? { sources, items: [current], index: 0 }
+    ? { sources, items: [canonicalCurrent], index: 0 }
     : { sources, items, index };
+}
+
+export function createMediaNavigationContext<T extends MediaNode>(navigation: MediaNavigationResult<T>): MediaNavigationContext<T> {
+  return {
+    itemIds: navigation.items.map((node) => node.id),
+    sourceIds: navigation.sources.map((node) => node.id),
+    itemSnapshots: navigation.items.map((node) => ({ ...node })),
+    sourceSnapshots: navigation.sources.map((node) => ({ ...node })),
+  };
+}
+
+/** Drop stale fallback data after a node is explicitly removed from the document. */
+export function removeMediaNavigationSnapshots<T extends MediaNode>(
+  context: MediaNavigationContext<T>,
+  removedIds: readonly string[],
+): MediaNavigationContext<T> {
+  if (!removedIds.length) return context;
+  const removed = new Set(removedIds);
+  return {
+    ...context,
+    itemSnapshots: context.itemSnapshots.filter((node) => !removed.has(node.id)),
+    sourceSnapshots: context.sourceSnapshots.filter((node) => !removed.has(node.id)),
+  };
+}
+
+/** Rehydrate a previously opened gallery from the current document snapshot. */
+export function mediaNavigationFromContext<T extends MediaNode>(
+  nodes: readonly T[],
+  current: T,
+  context: MediaNavigationContext<T>,
+): MediaNavigationResult<T> {
+  const currentNode = nodes.find((node) => node.id === current.id) || current;
+  const byId = new Map(nodes.map((node) => [node.id, node] as const));
+  const itemSnapshots = new Map(context.itemSnapshots.map((node) => [node.id, node] as const));
+  const sourceSnapshots = new Map(context.sourceSnapshots.map((node) => [node.id, node] as const));
+  const items = uniqueNodes(context.itemIds
+    .map((id) => byId.get(id) || itemSnapshots.get(id))
+    .filter((node): node is T => Boolean(node)));
+  const sources = uniqueNodes(context.sourceIds
+    .map((id) => byId.get(id) || sourceSnapshots.get(id))
+    .filter((node): node is T => Boolean(node)));
+  // A node can be refreshed in place, but it must remain in the open gallery
+  // even if an external update temporarily omitted its ID from the context.
+  if (!items.some((node) => node.id === currentNode.id)) items.push(currentNode);
+  const index = items.findIndex((node) => node.id === currentNode.id);
+  return { sources, items, index: index < 0 ? 0 : index };
 }

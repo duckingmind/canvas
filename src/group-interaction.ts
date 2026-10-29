@@ -9,7 +9,34 @@ export type GroupableNode = {
   width: number;
   height: number;
   groupId?: string;
+  groupMembershipOverride?: boolean;
 };
+
+/**
+ * Restore legacy generated-result membership without overriding a group that
+ * a user explicitly assigned to the result. Old automatic result batches are
+ * identifiable by their generated batch IDs; ungrouped descendants may still
+ * inherit their creator's group for backwards compatibility.
+ */
+export function inheritGeneratedGroupIds<
+  T extends GroupableNode & { resultOf?: string; continuationOf?: string },
+>(source: readonly T[]): T[] {
+  const byId = new Map(source.map((node) => [node.id, node]));
+  return source.map((node) => {
+    const sourceId = node.resultOf || node.continuationOf;
+    if (!sourceId) return { ...node };
+    if (node.groupMembershipOverride) return { ...node };
+    const parent = byId.get(sourceId);
+    if (!parent?.groupId) return { ...node };
+    const generatedBatchGroup = Boolean(
+      node.groupId &&
+        (node.groupId.startsWith("image-batch-") ||
+          node.groupId.startsWith("video-batch-")),
+    );
+    if (node.groupId && !generatedBatchGroup) return { ...node };
+    return { ...node, groupId: parent.groupId };
+  });
+}
 
 export type GroupState<T extends GroupableNode> = {
   nodes: T[];
@@ -60,7 +87,7 @@ export function rebuildGroupState<T extends GroupableNode>(
   });
   const nodes = source.map((node) =>
     node.groupId && (counts.get(node.groupId) || 0) < 2
-      ? { ...node, groupId: undefined }
+      ? { ...node, groupId: undefined, groupMembershipOverride: true }
       : { ...node },
   );
   const ids = [...new Set(
@@ -82,7 +109,7 @@ export function regroupNodes<T extends GroupableNode>(
   const selected = new Set(selectedIds);
   if (!groupId || selected.size < 2) return rebuildGroupState(source, padding);
   return rebuildGroupState(
-    source.map((node) => selected.has(node.id) ? { ...node, groupId } : node),
+    source.map((node) => selected.has(node.id) ? { ...node, groupId, groupMembershipOverride: true } : node),
     padding,
   );
 }
@@ -106,7 +133,9 @@ export function ungroupNodes<T extends GroupableNode>(
     source.map((node) => {
       const remove = selected.has(node.id) ||
         Boolean(wholeGroups && node.groupId && groupIds.has(node.groupId));
-      return remove && node.groupId ? { ...node, groupId: undefined } : node;
+      return remove && node.groupId
+        ? { ...node, groupId: undefined, groupMembershipOverride: true }
+        : node;
     }),
     padding,
   );
@@ -137,10 +166,11 @@ export function translateGroup<T extends GroupableNode>(
 }
 
 /**
- * Resolve a node click without changing the editor's modifier contract:
- * plain clicks select a group as one target, while Shift keeps the member
- * level toggle used by multi-select. Hidden task metadata is handled by the
- * drag/command layer.
+ * Resolve a node-level selection. A group is a movement and organization
+ * primitive; the card itself must remain addressable so its editor, preview,
+ * toolbar and context menu are still usable after grouping. Group movement is
+ * handled by the pointer layer, which can expand the logical member set only
+ * after the user crosses the drag threshold.
  */
 export function selectionForGroupMember(
   visibleNodes: readonly Pick<GroupableNode, "id" | "groupId">[],
@@ -155,10 +185,7 @@ export function selectionForGroupMember(
       ? currentIds.filter((id) => id !== nodeId)
       : [...new Set([...currentIds, nodeId])];
   }
-  const members = visibleNodes
-    .filter((candidate) => candidate.groupId === node.groupId)
-    .map((candidate) => candidate.id);
-  if (!extend) return members;
+  if (!extend) return [nodeId];
   return currentIds.includes(nodeId)
     ? currentIds.filter((id) => id !== nodeId)
     : [...new Set([...currentIds, nodeId])];

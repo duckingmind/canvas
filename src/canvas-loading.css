@@ -1,0 +1,116 @@
+.canvas-loading-indicator {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  min-width: 220px;
+  padding: 18px;
+  color: #d7d7da;
+  animation: canvas-loading-enter 360ms cubic-bezier(.2,.75,.25,1) both;
+}
+.canvas-loading-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.canvas-loading-mark {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  color: #e7e7e9;
+}
+.canvas-loading-mark > svg {
+  filter: drop-shadow(0 0 10px #ffffff30);
+}
+.canvas-loading-orbit {
+  position: absolute;
+  inset: 0;
+  border: 1px solid #ffffff19;
+  border-radius: 50%;
+}
+.canvas-loading-orbit-a {
+  border-top-color: #e4e4e6;
+  border-right-color: #929297;
+  animation: canvas-loading-orbit 1.65s cubic-bezier(.55,.08,.45,.92) infinite;
+}
+.canvas-loading-orbit-b {
+  inset: 6px;
+  border-bottom-color: #ffffffa0;
+  border-left-color: #ffffff08;
+  animation: canvas-loading-orbit 2.2s linear infinite reverse;
+}
+.canvas-loading-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 132px;
+}
+.canvas-loading-copy strong {
+  color: #eeeeef;
+  font-size: 20px;
+  font-weight: 580;
+  line-height: 1.15;
+}
+.canvas-loading-copy > span {
+  color: #85858d;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.canvas-loading-track {
+  position: relative;
+  display: block;
+  width: 152px;
+  height: 2px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: #ffffff14;
+}
+.canvas-loading-track > span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 38%;
+  border-radius: inherit;
+  background: #d4d4d8;
+  box-shadow: 0 0 9px #ffffff55;
+  animation: canvas-loading-progress 1.5s cubic-bezier(.4,0,.6,1) infinite;
+}
+
+@keyframes canvas-loading-orbit {
+  to { transform: rotate(360deg); }
+}
+@keyframes canvas-loading-progress {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(280%); }
+}
+@keyframes canvas-loading-enter {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 520px) {
+  .canvas-loading-indicator {
+    gap: 17px;
+    min-width: 0;
+  }
+  .canvas-loading-mark {
+    width: 44px;
+    height: 44px;
+  }
+  .canvas-loading-copy strong {
+    font-size: 18px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .canvas-loading-indicator,
+  .canvas-loading-orbit-a,
+  .canvas-loading-orbit-b,
+  .canvas-loading-track > span {
+    animation: none;
+  }
+  .canvas-loading-track > span {
+    left: 31%;
+    width: 38%;
+  }
+}

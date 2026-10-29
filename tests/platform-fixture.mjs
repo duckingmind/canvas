@@ -10,7 +10,8 @@
  * GET /__fixture/state exposes only this process's disposable requests/storage/tasks.
  * POST /__fixture/control accepts { reset:true, slowPolls:6, failuresRemaining:1,
  *   storageFailuresRemaining:0, imageMode:"url"|"base64", videoCatalogStatus:200|403|503,
- *   storage:{key:document}, assets:[{id,task_id,type,...metadata}], videoTasks:[{id,key,body}],
+ *   storage:{key:document}, assets:[{id,task_id,type,...metadata}], imageVariant:"landscape"|"portrait",
+ *   videoTasks:[{id,key,body}],
  *   videoMode:"in_progress"|"cancel_pending"|"completed"|"failed"|"read-failure"|"unauthorized",
  *   videoReadFailuresRemaining:0, videoLostResponsesRemaining:0, videoCreateError:false }.
  * The video catalog covers public/nested capabilities, text-only and unavailable models.
@@ -29,6 +30,7 @@ import { createPlatformDevProxy } from '@ducking-mind/proxy-app-sdk/vite';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const image = await readFile(new URL('./fixtures/aspect-ratio.png', import.meta.url));
+const portraitImage = await readFile(new URL('./fixtures/portrait-reference.svg', import.meta.url));
 const fixtureAppId = JSON.parse(await readFile(new URL('../manifest.json', import.meta.url), 'utf8')).id;
 const args = process.argv.slice(2);
 const portOption = (name, fallback) => {
@@ -41,15 +43,21 @@ const apiPort = portOption('--api-port', 5192);
 const apiOnly = args.includes('--api-only');
 const uiOrigin = `http://127.0.0.1:${apiOnly ? apiPort : uiPort}`;
 const apiOrigin = `http://127.0.0.1:${apiPort}`;
-const defaults = () => ({ slowPolls: 6, failuresRemaining: 1, storageFailuresRemaining: 0, imageMode: 'url', videoCatalogStatus: 200,
-  videoMode: 'in_progress', videoReadFailuresRemaining: 0, videoLostResponsesRemaining: 0, videoCreateError: false, videoCorsEnabled: true });
+const fixtureAppSession = {
+  access_token: 'ast_fixture-canvas-session', token_type: 'Bearer', expires_in: 3600,
+  gateway_url: `${apiOrigin}/v1`, app_id: 'canvas', app_slug: 'canvas', app_version: '0.2.7',
+  account_scope: 'acs_' + 'f'.repeat(64), scopes: [],
+};
+const defaults = () => ({ slowPolls: 6, failuresRemaining: 1, storageFailuresRemaining: 0, storageBatchDelayMs: 0, imageMode: 'url', imageVariant: 'landscape', videoCatalogStatus: 200,
+  videoMode: 'in_progress', videoReadFailuresRemaining: 0, videoLostResponsesRemaining: 0, videoCreateError: false, videoCorsEnabled: true, hostFailuresRemaining: 0 });
 let settings = defaults();
-const storage = new Map(), tasks = new Map(), assets = new Map(), requests = [];
+const storage = new Map(), tasks = new Map(), assets = new Map(), directUploads = new Map(), directUploadsByIdempotency = new Map(), requests = [];
 const videoTasks = new Map();
 const storageRevisions = new Map();
 let storageClock = 0;
 let taskSequence = 0;
 let videoArtifact;
+let directUploadSequence = 0;
 const models = [
   { id: 'fixture-sync', name: '测试 · 同步成功' },
   { id: 'fixture-slow', name: '测试 · 慢任务可恢复' },
@@ -96,7 +104,10 @@ async function bodyFor(request) {
   return JSON.parse(bytes.toString('utf8'));
 }
 function resultImage() {
-  return settings.imageMode === 'base64' ? { b64_json: image.toString('base64') } : { url: `${uiOrigin}/v1/fixture-image.png` };
+  const bytes = settings.imageVariant === 'portrait' ? portraitImage : image;
+  return settings.imageMode === 'base64'
+    ? { b64_json: bytes.toString('base64') }
+    : { url: `${uiOrigin}/v1/fixture-image.${settings.imageVariant === 'portrait' ? 'svg' : 'png'}` };
 }
 function assetDTO(asset) {
   const videoDelivery = asset.type === 'video' && videoArtifact ? signedVideoDelivery(asset.id) : null;
@@ -120,21 +131,30 @@ function videoDTO(task, status = settings.videoMode) {
   };
 }
 function control(body) {
-  if (body.reset) { settings = defaults(); videoArtifact = undefined; storage.clear(); storageRevisions.clear(); tasks.clear(); videoTasks.clear(); assets.clear(); requests.length = 0; taskSequence = 0; }
+  if (body.reset) { settings = defaults(); videoArtifact = undefined; storage.clear(); storageRevisions.clear(); tasks.clear(); videoTasks.clear(); assets.clear(); directUploads.clear(); directUploadsByIdempotency.clear(); requests.length = 0; taskSequence = 0; directUploadSequence = 0; }
   if (body.videoDataURL !== undefined) {
     const match = typeof body.videoDataURL === 'string' && /^data:(video\/(?:webm|mp4))(?:;[^,]*)?;base64,(.+)$/.exec(body.videoDataURL);
     if (!match) throw new Error('videoDataURL 必须为本机录制的WebM或MP4');
     videoArtifact = { type: match[1], bytes: Buffer.from(match[2], 'base64') };
   }
-  for (const field of ['slowPolls', 'failuresRemaining', 'storageFailuresRemaining', 'videoReadFailuresRemaining', 'videoLostResponsesRemaining']) {
+  for (const field of ['slowPolls', 'failuresRemaining', 'storageFailuresRemaining', 'videoReadFailuresRemaining', 'videoLostResponsesRemaining', 'hostFailuresRemaining']) {
     if (body[field] !== undefined) {
       if (!Number.isInteger(body[field]) || body[field] < 0 || body[field] > 10000) throw new Error(`${field} 必须是 0–10000 的整数`);
       settings[field] = body[field];
     }
   }
+  if (body.storageBatchDelayMs !== undefined) {
+    if (!Number.isInteger(body.storageBatchDelayMs) || body.storageBatchDelayMs < 0 || body.storageBatchDelayMs > 10000)
+      throw new Error('storageBatchDelayMs 必须是 0–10000 的整数');
+    settings.storageBatchDelayMs = body.storageBatchDelayMs;
+  }
   if (body.imageMode !== undefined) {
     if (!['url', 'base64'].includes(body.imageMode)) throw new Error('imageMode 必须为 url 或 base64');
     settings.imageMode = body.imageMode;
+  }
+  if (body.imageVariant !== undefined) {
+    if (!['landscape', 'portrait'].includes(body.imageVariant)) throw new Error('imageVariant 必须为 landscape 或 portrait');
+    settings.imageVariant = body.imageVariant;
   }
   if (body.videoCatalogStatus !== undefined) {
     if (![200, 403, 503].includes(body.videoCatalogStatus)) throw new Error('videoCatalogStatus 必须为 200、403 或 503');
@@ -172,6 +192,35 @@ const server = http.createServer(async (request, response) => {
   if (host !== `127.0.0.1:${apiPort}`) return error(response, 400, 'fixture_host_required', '验证服务仅接受本机访问');
   const url = new URL(request.url || '/', apiOrigin), route = url.pathname, method = request.method || 'GET';
   try {
+    // COS direct-upload stand-in. This route intentionally sits before the
+    // JSON/multipart parser below because PUT carries raw media bytes.
+    const directObjectMatch = route.match(/^\/__fixture\/cos\/uploads\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/);
+    if (directObjectMatch) {
+      const allowOrigin = uiOrigin;
+      response.setHeader('Access-Control-Allow-Origin', allowOrigin);
+      response.setHeader('Access-Control-Allow-Methods', 'OPTIONS, PUT');
+      response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      response.setHeader('Vary', 'Origin');
+      if (method === 'OPTIONS') { response.writeHead(204); return response.end(); }
+      if (method !== 'PUT') return error(response, 405, 'method_not_allowed', '仅支持直传 PUT');
+      const id = decodeURIComponent(directObjectMatch[1]);
+      const direct = directUploads.get(id);
+      const signature = createHash('sha256').update(`direct-upload:${id}`).digest('hex');
+      if (!direct || url.searchParams.get('signature') !== signature) return error(response, 403, 'fixture_signature_expired', '验证签名无效');
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of request) {
+        size += chunk.length;
+        if (size > 100 * 1024 * 1024) return error(response, 413, 'fixture_asset_too_large', '测试素材超过 100 MiB');
+        chunks.push(chunk);
+      }
+      direct.bytes = Buffer.concat(chunks);
+      direct.uploaded = true;
+      direct.contentType = request.headers['content-type'] || direct.asset.content_type;
+      log({ method, path: route, assetId: id, outcome: 'direct-object-uploaded', bytes: size, contentType: direct.contentType });
+      response.writeHead(200, { 'Access-Control-Allow-Origin': allowOrigin, 'Cache-Control': 'no-store' });
+      return response.end();
+    }
     if (route === '/__fixture/state' && method === 'GET') return send(response, 200, { settings, models, storage: Object.fromEntries(storage), tasks: Object.fromEntries(tasks), videoTasks: Object.fromEntries(videoTasks), assets: Object.fromEntries([...assets].map(([id, asset]) => [id, assetDTO(asset)])), requests });
     if (route === '/__fixture/control' && method === 'POST') { control(await bodyFor(request)); return send(response, 200, { success: true, settings }); }
     if (route === '/__fixture/health') return send(response, 200, { fixture: true, apiOrigin, uiOrigin });
@@ -197,19 +246,16 @@ const server = http.createServer(async (request, response) => {
       response.writeHead(range ? 206 : 200, { 'Content-Type': videoArtifact.type, 'Content-Length': end - start + 1, 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store', ...(range ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}) });
       return response.end(method === 'HEAD' ? undefined : videoArtifact.bytes.subarray(start, end + 1));
     }
-    if (route === '/v1/fixture-image.png' && method === 'GET') {
-      response.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
-      return response.end(image);
+    if ((route === '/v1/fixture-image.png' || route === '/v1/fixture-image.svg') && method === 'GET') {
+      const isPortrait = route.endsWith('.svg');
+      response.writeHead(200, { 'Content-Type': isPortrait ? 'image/svg+xml' : 'image/png', 'Cache-Control': 'no-store' });
+      return response.end(isPortrait ? portraitImage : image);
     }
     const body = method === 'GET' ? {} : await bodyFor(request);
     const entry = { method, path: route + url.search, requestId: request.headers['x-request-id'] || null, idempotencyKey: request.headers['idempotency-key'] || null };
-    if (route.startsWith('/__fixture/auth/')) {
+    if (route === '/v1/profile' && method === 'GET') {
       log(entry);
-      if (route === '/__fixture/auth/profile' && method === 'GET') {
-        return send(response, 200, { data: { id: 'fixture-user', email: 'canvas@example.test', username: 'Canvas 测试账户' } });
-      }
-      // A local development client has an in-memory session; these endpoints never issue credentials.
-      return send(response, 200, route.endsWith('/logout') ? { success: true } : { authenticated: true, account_scope: "acs_" + "f".repeat(64) });
+      return send(response, 200, { data: { id: 'fixture-user', email: 'canvas@example.test', username: 'Canvas 测试账户' } });
     }
     if (route === '/v1/storage/keys' && method === 'GET') {
       const prefix = url.searchParams.get('prefix') || '', cursor = url.searchParams.get('cursor') || '';
@@ -219,6 +265,15 @@ const server = http.createServer(async (request, response) => {
       return send(response, 200, { data: { keys: keys.slice(0, limit), next_cursor: keys.length > limit ? keys[limit - 1] : '' } });
     }
     if (route === '/v1/storage/batch' && method === 'POST') {
+      if (settings.storageFailuresRemaining > 0) {
+        settings.storageFailuresRemaining--;
+        log({ ...entry, outcome: 'retryable-storage-failure' });
+        return error(response, 503, 'fixture_storage_unavailable', '云端存储暂不可用，请重试（本机验证）');
+      }
+      if (settings.storageBatchDelayMs > 0) {
+        log({ ...entry, outcome: 'delayed-batch-started' });
+        await new Promise(resolve => setTimeout(resolve, settings.storageBatchDelayMs));
+      }
       const next = new Map(storage), revisions = new Map(storageRevisions), results = [];
       for (const op of body.operations || []) {
         if (op.expected_revision !== undefined && op.expected_revision !== (revisions.get(op.key) || 0))
@@ -326,6 +381,64 @@ const server = http.createServer(async (request, response) => {
         .filter(asset => !query || [asset.name, asset.folder, ...asset.tags].join(' ').toLocaleLowerCase().includes(query));
       return send(response, 200, { items: items.slice((page - 1) * limit, page * limit).map(assetDTO), total: items.length, page, limit });
     }
+    if (route === '/v1/media/assets/upload-intents' && method === 'POST') {
+      const idempotencyKey = request.headers['idempotency-key'] || body.idempotency_key;
+      if (settings.hostFailuresRemaining > 0) {
+        settings.hostFailuresRemaining--;
+        log({ ...entry, outcome: 'retryable-host-failure', sizeBytes: body.size_bytes, contentType: body.content_type });
+        return error(response, 503, 'fixture_asset_unavailable', '素材托管暂不可用（本机验证）');
+      }
+      if (typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(idempotencyKey) ||
+          !Number.isSafeInteger(body.size_bytes) || body.size_bytes <= 0 || body.size_bytes > 100 * 1024 * 1024 ||
+          typeof body.content_type !== 'string' || !/^(image|video|audio)\//.test(body.content_type)) {
+        log({ ...entry, outcome: 'invalid-direct-upload-intent' });
+        return error(response, 400, 'fixture_asset_invalid', '测试直传素材无效');
+      }
+    const existingID = directUploadsByIdempotency.get(idempotencyKey);
+      const existing = existingID && directUploads.get(existingID);
+      if (existing?.asset?.status === 'ready') {
+        log({ ...entry, outcome: 'direct-upload-already-ready', assetId: existing.asset.id });
+        return send(response, 201, { asset_id: existing.asset.id, status: 'ready', size_bytes: existing.asset.size_bytes, content_type: existing.asset.content_type, asset: assetDTO(existing.asset) });
+      }
+      const direct = existing || (() => {
+        const id = `direct-hosted-${++directUploadSequence}`;
+        const now = new Date().toISOString();
+        const asset = { id, task_id: `task:${id}`, type: body.content_type.split('/', 1)[0], size_bytes: body.size_bytes, content_type: body.content_type, created_at: now, updated_at: now,
+          name: body.name || '未命名素材', category: body.category || 'other', tags: Array.isArray(body.tags) ? body.tags : [], folder: body.folder || '', saved_to_library: true, metadata_revision: 0, source_app_id: fixtureAppId, status: 'pending' };
+        const value = { asset, uploaded: false, bytes: Buffer.alloc(0), contentType: body.content_type, idempotencyKey };
+        directUploads.set(id, value); directUploadsByIdempotency.set(idempotencyKey, id);
+        return value;
+      })();
+      log({ ...entry, outcome: 'direct-upload-intent', assetId: direct.asset.id, idempotencyKey });
+      return send(response, 201, { asset_id: direct.asset.id, status: 'pending', upload_url: `${apiOrigin}/__fixture/cos/uploads/${encodeURIComponent(direct.asset.id)}?signature=${createHash('sha256').update(`direct-upload:${direct.asset.id}`).digest('hex')}`, upload_url_expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(), size_bytes: direct.asset.size_bytes, content_type: direct.asset.content_type });
+    }
+    const directComplete = route.match(/^\/v1\/media\/assets\/([^/]+)\/complete$/);
+    if (directComplete && method === 'POST') {
+      const id = decodeURIComponent(directComplete[1]);
+      const direct = directUploads.get(id);
+      if (!direct) return error(response, 404, 'media_asset_not_found', '找不到测试直传素材');
+      if (direct.asset.status === 'ready') {
+        log({ ...entry, assetId: id, outcome: 'direct-upload-already-completed' });
+        return send(response, 200, assetDTO(direct.asset));
+      }
+      if (!direct.uploaded || direct.bytes.length !== direct.asset.size_bytes || !/^\w+\/[-+.\w]+$/.test(direct.contentType || '')) {
+        log({ ...entry, assetId: id, outcome: 'direct-upload-incomplete' });
+        return error(response, 409, 'media_asset_not_ready', '测试直传素材尚未上传完成');
+      }
+      direct.asset.status = 'ready'; direct.asset.updated_at = new Date().toISOString();
+      assets.set(id, direct.asset);
+      log({ ...entry, assetId: id, outcome: 'direct-upload-completed' });
+      return send(response, 200, assetDTO(direct.asset));
+    }
+    const directAbort = route.match(/^\/v1\/media\/assets\/([^/]+)\/upload-intent$/);
+    if (directAbort && method === 'DELETE') {
+      const id = decodeURIComponent(directAbort[1]);
+      const direct = directUploads.get(id);
+      if (!direct || direct.asset.status === 'ready') return send(response, 200, { aborted: true });
+      directUploads.delete(id); directUploadsByIdempotency.delete(direct.idempotencyKey);
+      log({ ...entry, assetId: id, outcome: 'direct-upload-aborted' });
+      return send(response, 200, { aborted: true });
+    }
     const assetMatch = route.match(/^\/v1\/media\/assets\/([^/]+)$/);
     if (assetMatch) {
       const asset = assets.get(decodeURIComponent(assetMatch[1]));
@@ -406,7 +519,7 @@ const server = http.createServer(async (request, response) => {
 });
 
 // Override only this disposable process. The public helper must never inherit an online relay.
-for (const name of ['PROXY_PLATFORM_GATEWAY_URL', 'PROXY_PLATFORM_AUTH_URL', 'PROXY_PLATFORM_RELAY_SECRET']) process.env[name] = '';
+for (const name of ['PROXY_PLATFORM_GATEWAY_URL', 'PROXY_PLATFORM_RELAY_SECRET']) process.env[name] = '';
 let vite;
 async function close() {
   if (vite) await vite.close();
@@ -416,18 +529,23 @@ try {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(apiPort, '127.0.0.1', resolve); });
   if (!apiOnly) {
     vite = await createViteServer({
-      configFile: false, envDir: false, root, base: './', cacheDir: path.join(root, 'node_modules/.vite-platform-fixture'), plugins: [react()],
-      define: { 'import.meta.env.VITE_CANVAS_FIXTURE_AUTH': JSON.stringify('1') },
+      configFile: false, envDir: false, root, base: './', cacheDir: path.join(root, 'node_modules/.vite-platform-fixture'), plugins: [react(), {
+        name: 'canvas-fixture-gateway-session',
+        transformIndexHtml(html, context) {
+          const requestURL = new URL(context.originalUrl || '/', uiOrigin);
+          // Auth tests can deliberately open the page without a handoff. All
+          // other Canvas E2E cases use the same one-tab AST handoff as the
+          // Portal launcher; there is no fixture `/auth/*` transport.
+          if (requestURL.searchParams.get('fixture_session') === 'none') return html;
+          const key = `proxy-app:gateway-session:${encodeURIComponent(fixtureAppId)}`;
+          const serialized = JSON.stringify({ ...fixtureAppSession, gateway_url: '/v1' })
+            .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
+          const script = `<script>try{sessionStorage.setItem(${JSON.stringify(key)},${JSON.stringify(serialized)})}catch{}</script>`;
+          return html.includes('</head>') ? html.replace('</head>', `${script}</head>`) : `${script}${html}`;
+        },
+      }],
       server: { host: '127.0.0.1', port: uiPort, strictPort: true, proxy: {
         ...createPlatformDevProxy({ gatewayURL: `${apiOrigin}/v1` }),
-        // The fixture uses disposable auth endpoints instead of the normal
-        // CLI relay. Keep the SDK's standard local profile path working so
-        // Canvas can exercise the same account-card flow as development.
-        '/__platform/auth': {
-          target: apiOrigin,
-          changeOrigin: true,
-          rewrite: requestPath => requestPath.replace(/^\/__platform\/auth/, '/__fixture/auth'),
-        },
         '/__fixture': { target: apiOrigin, changeOrigin: true },
       } },
     });
@@ -440,8 +558,7 @@ try {
       if (!response.ok) throw Object.assign(new Error(value.error?.message || 'request failed'), { code: value.error?.code, details: value, status: response.status });
       return value;
     };
-    assert.equal((await request('/__fixture/auth/status')).authenticated, true);
-    assert.deepEqual((await request('/__platform/auth/profile')).data, {
+    assert.deepEqual((await request('/v1/profile', { headers: { Authorization: `Bearer ${fixtureAppSession.access_token}` } })).data, {
       id: 'fixture-user', email: 'canvas@example.test', username: 'Canvas 测试账户',
     });
     assert.equal((await request('/v1/storage/items?key=fixture-test')).data, null);
@@ -462,7 +579,12 @@ try {
     assert.equal(requests.filter(entry => entry.model === 'fixture-slow' && entry.method === 'POST').length, 1);
     await assert.rejects(generateImage(call, { model: 'fixture-retry', prompt: '重试测试' }), /暂时繁忙/);
     assert.ok((await generateImage(call, { model: 'fixture-retry', prompt: '重试测试' })).image);
-    const edit = await generateImage(call, { model: 'fixture-sync', prompt: '参考图测试', images: [sync.image] });
+    // The node self-check runs outside a browser, so inject the already-loaded
+    // fixture bytes instead of asking the Canvas network boundary to fetch a
+    // loopback URL. Browser edits still use the normal Gateway/COS reader.
+    const edit = await generateImage(call, { model: 'fixture-sync', prompt: '参考图测试', images: ['fixture-reference'] }, undefined, {
+      loadReference: async () => new Blob([image], { type: 'image/png' }),
+    });
     assert.ok(edit.image);
     const editRequest = requests.find(entry => entry.path === '/v1/images/edits');
     assert.equal(editRequest.files[0].sha256, createHash('sha256').update(image).digest('hex'));
@@ -480,7 +602,7 @@ try {
     await patchAsset({ expected_revision: 1, saved_to_library: false });
     assert.equal((await request('/v1/media/assets/fixture-media')).saved_to_library, false);
     if (!apiOnly) assert.match(await (await fetch(uiOrigin)).text(), /src\/main.tsx/);
-    process.stdout.write(JSON.stringify({ event: 'self-check', result: 'PASS', checks: ['gateway storage', 'local auth fixture', 'platform profile', 'models', 'sync image', '504 task resumes without resubmit', 'retry', 'multipart reference bytes', 'media metadata CAS and app isolation', 'vite root'] }) + '\n');
+    process.stdout.write(JSON.stringify({ event: 'self-check', result: 'PASS', checks: ['gateway session handoff', 'gateway storage', 'platform profile', 'models', 'sync image', '504 task resumes without resubmit', 'retry', 'multipart reference bytes', 'media metadata CAS and app isolation', 'vite root'] }) + '\n');
     await close();
   } else {
     for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { void close().then(() => process.exit(0)); });

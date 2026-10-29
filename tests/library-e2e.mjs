@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createImageNode } from "./canvas-ui.mjs";
 
 const { chromium } = await import(
   process.env.CANVAS_PLAYWRIGHT_MODULE || "playwright"
@@ -41,18 +42,17 @@ const hasText = async (text) => {
 };
 const management = async () => {
   await page.getByLabel("无限创作画布").waitFor();
-  if (await button("管理画布").isVisible()) await button("管理画布").click();
+  const libraryButton = button("我的画布");
+  if (await libraryButton.isVisible()) await libraryButton.click();
+  else if (await button("管理画布").isVisible()) await button("管理画布").click();
   await page.getByLabel("搜索画布名称").waitFor();
 };
 const collapse = async () => {
   await button("收起画布列表").first().click();
-  await button("管理画布").waitFor();
+  await button("我的画布").waitFor();
 };
 const current = async (name) => {
-  await page.waitForFunction(
-    (value) => document.querySelector(".project-name")?.value === value,
-    name,
-  );
+  await page.getByLabel(`当前画布：${name}`, { exact: true }).waitFor();
   await page.getByLabel("无限创作画布").waitFor();
 };
 const open = async (name) => {
@@ -94,7 +94,7 @@ try {
     "reload retains the initial canvas identity",
   );
   const aUrl = await create("城市海报 A");
-  await button("创建图片").click();
+  await createImageNode(page);
   await page
     .getByLabel("创作画面描述")
     .fill("A 专属内容：雨夜城市与暖色灯光。");
@@ -128,7 +128,7 @@ try {
     .fill("A 专属内容：雨夜城市与暖色灯光。");
   const bUrl = await create("产品灵感 B");
   assert.notEqual(aUrl, bUrl);
-  await button("创建图片").click();
+  await createImageNode(page);
   await page.getByLabel("创作画面描述").fill("B 专属内容：极简产品摄影。");
   await open("城市海报 A");
   await hasText("A 专属内容");
@@ -314,7 +314,7 @@ try {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.reload();
   await page.getByLabel("无限创作画布").waitFor();
-  await button("管理画布").waitFor();
+  await button("我的画布").waitFor();
   assert.equal(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,
@@ -322,8 +322,8 @@ try {
     true,
   );
   await create("移动端画布");
-  await button("管理画布").waitFor();
-  await button("创建图片").click();
+  await button("我的画布").waitFor();
+  await createImageNode(page);
   await page.getByLabel("创作画面描述").fill("移动端输入");
   await management();
   await page.screenshot({
@@ -331,7 +331,7 @@ try {
     fullPage: true,
   });
   await open("城市海报 · 最终 副本");
-  await button("管理画布").waitFor();
+  await button("我的画布").waitFor();
   await open("移动端画布");
   await hasText("移动端输入");
   await page.setViewportSize({ width: 1440, height: 960 });

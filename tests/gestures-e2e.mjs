@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createImageNode } from "./canvas-ui.mjs";
 
 const { chromium } = await import(process.env.CANVAS_PLAYWRIGHT_MODULE || "playwright");
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -56,7 +57,7 @@ try {
   await page.goto("http://127.0.0.1:5227/");
   const closeLibrary = button("收起画布列表").first();
   if (await closeLibrary.isVisible()) await closeLibrary.click();
-  await button("创建图片").click();
+  await createImageNode(page);
   await creator().waitFor();
   const id = await page.locator(".node.selected").getAttribute("data-node-id");
   const prompt = page.locator(`[data-node-id="${id}"]`);
@@ -169,6 +170,36 @@ try {
   await note.click();
   assert.equal(await page.locator(".node.selected").count(), 1);
   passed("Shift selects a group, dragging preserves relative positions, and a plain click returns to single selection");
+
+  await button("添加节点").click();
+  await page.getByRole("button", { name: "文本 记录灵感、脚本与创作说明 T", exact: true }).click();
+  await page.getByLabel("编辑节点内容", { exact: true }).fill("分组布局外的便签");
+  await button("完成").click();
+  const outsideNote = page.locator(".node.note").nth(1);
+  await outsideNote.waitFor();
+  await prompt.click(); await closeCreator();
+  await outsideNote.click({ modifiers: ["Shift"] });
+  assert.equal(await page.locator(".node.selected").count(), 3);
+  const quickLayoutBefore = [await geometry(prompt), await geometry(note), await geometry(outsideNote)];
+  await page.getByRole("button", { name: "整理所选", exact: true }).click();
+  assert.equal(await page.getByRole("dialog", { name: "布局配置", exact: true }).count(), 0, "selection toolbar applies smart layout immediately");
+  const quickLayoutAfter = [await geometry(prompt), await geometry(note), await geometry(outsideNote)];
+  assert.ok(quickLayoutAfter.some((after, index) => after.x !== quickLayoutBefore[index].x || after.y !== quickLayoutBefore[index].y), "quick layout changes the selected nodes without opening configuration");
+  passed("selection toolbar applies smart layout immediately without opening details");
+
+  const groupOffsetsBeforeLayout = [await geometry(prompt), await geometry(note)];
+  await page.getByRole("button", { name: "智能整理画布 · ⌥⇧F", exact: true }).click();
+  assert.equal(await page.getByRole("dialog", { name: "布局配置", exact: true }).count(), 0, "smart arrangement runs directly without opening configuration");
+  const groupOffsetsAfterLayout = [await geometry(prompt), await geometry(note)];
+  near(groupOffsetsAfterLayout[0].x - groupOffsetsBeforeLayout[0].x, groupOffsetsAfterLayout[1].x - groupOffsetsBeforeLayout[1].x, "smart group x displacement");
+  near(groupOffsetsAfterLayout[0].y - groupOffsetsBeforeLayout[0].y, groupOffsetsAfterLayout[1].y - groupOffsetsBeforeLayout[1].y, "smart group y displacement");
+  assert.equal(await page.locator(".node-group-frame").count(), 1);
+  const arrangedNodes = [await geometry(prompt), await geometry(note), await geometry(outsideNote)];
+  for (let first = 0; first < arrangedNodes.length; first++) for (let second = first + 1; second < arrangedNodes.length; second++) {
+    const a = arrangedNodes[first], b = arrangedNodes[second];
+    assert.ok(a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y, "smart layout must not overlap a group member and the outside node");
+  }
+  passed("smart layout treats the complete group as one unit, preserves its frame and avoids outside-node overlap");
 
   await prompt.click(); await closeCreator();
   await prompt.evaluate(el => el.addEventListener("pointerdown", event => { el.dataset.testPointer = String(event.pointerId); }, { once: true }));

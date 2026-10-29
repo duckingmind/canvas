@@ -1,9 +1,78 @@
+import type { CanvasNode } from "./canvas-types";
+import { isDurableAssetUrl } from "./asset-library.ts";
+import { hasStableMediaIdentity } from "./media-identity.ts";
+
+/** Reuse a completed media value; a duplicate is another reference, not a new upload. */
+export function copiedMediaIdentity(node: CanvasNode): Pick<CanvasNode, "assetId" | "taskId" | "status"> {
+  const mediaType = node.mediaType || node.type;
+  if (
+    !["image", "audio", "video"].includes(mediaType) ||
+    node.uploadState ||
+    (node.status !== undefined && node.status !== "completed") ||
+    !hasStableMediaIdentity({
+      assetId: node.assetId,
+      taskId: node.taskId,
+      url: node.image || node.video || node.videoContentUrl || node.audio,
+    })
+  ) return {};
+  const url = node.image || node.video || node.videoContentUrl || node.audio;
+  const reusableOutput = Boolean(node.assetId || isDurableAssetUrl(url) || node.status === "completed" && node.taskId);
+  if (!reusableOutput) return {};
+  return {
+    ...(node.assetId ? { assetId: node.assetId } : {}),
+    ...(node.taskId ? { taskId: node.taskId } : {}),
+    status: "completed",
+  };
+}
+
+function durableDelivery(value: string | undefined): string | undefined {
+  return value && isDurableAssetUrl(value) ? value : undefined;
+}
+
+/** Remove browser-local and expiring deliveries while retaining reusable IDs and durable URLs. */
+export function copiedMediaFields(node: CanvasNode): Partial<CanvasNode> {
+  const embeddedReferences = node.embeddedReferences?.map(reference => ({
+    ...reference,
+    image: durableDelivery(reference.image),
+    imageThumbnail: durableDelivery(reference.imageThumbnail),
+    video: durableDelivery(reference.video),
+    audio: durableDelivery(reference.audio),
+    videoContentUrl: undefined,
+    videoContentUrlExpiresAt: undefined,
+    localImage: undefined,
+    localVideo: undefined,
+    localAudio: undefined,
+  }));
+  return {
+    ...copiedMediaIdentity(node),
+    image: durableDelivery(node.image),
+    imageThumbnail: durableDelivery(node.imageThumbnail),
+    video: durableDelivery(node.video),
+    videoContentUrl: undefined,
+    videoContentUrlExpiresAt: undefined,
+    audio: durableDelivery(node.audio),
+    videoPoster: undefined,
+    localVideoPoster: undefined,
+    localImage: undefined,
+    localVideo: undefined,
+    localAudio: undefined,
+    uploadState: undefined,
+    uploadProgress: undefined,
+    uploadError: undefined,
+    embeddedReferences,
+    musicReference: node.musicReference
+      ? { ...node.musicReference, localAudio: undefined }
+      : undefined,
+  };
+}
+
 export type CreationInputs = {
   prompt: string;
   model: string;
   references: readonly {
     nodeId: string;
     image?: string;
+    /** Legacy marker is ignored; images must be server-delivered or asset-backed. */
     localImage?: string;
     video?: string;
     localVideo?: string;
@@ -15,6 +84,76 @@ export type CreationInputs = {
   ignoreImageRefs?: boolean;
   settings?: Record<string, unknown>;
 };
+
+/**
+ * Create the editable state for a new task while retaining the user's
+ * composition inputs. A retry must keep the original submission identity;
+ * this helper is for the separate "copy as new task" path and therefore
+ * removes every task/result identity that could accidentally resume or
+ * overwrite the old request.
+ */
+export function createEditableCanvasTaskCopy(node: CanvasNode, id: string): CanvasNode {
+  const copy: CanvasNode = {
+    ...node,
+    id,
+    title: `${node.title} · 新任务`,
+    embeddedReferences: node.embeddedReferences?.map((reference) => ({ ...reference })),
+    promptSegments: node.promptSegments?.map((segment) => ({ ...segment })),
+    imageSettings: node.imageSettings ? { ...node.imageSettings } : undefined,
+    videoSettings: node.videoSettings ? { ...node.videoSettings } : undefined,
+    musicSettings: node.musicSettings ? { ...node.musicSettings } : undefined,
+    musicReference: node.musicReference ? { ...node.musicReference } : undefined,
+  };
+
+  // Keep the list explicit. It documents the boundary between frozen input
+  // fields (prompt, references, model and parameters) and mutable task state.
+  const taskStateKeys: Array<keyof CanvasNode | "videoTaskId" | "taskStage" | "cancelRequested"> = [
+    "taskId",
+    "assetId",
+    "image",
+    "imageThumbnail",
+    "imageAspectRatio",
+    "localImage",
+    "video",
+    "localVideo",
+    "videoContentUrl",
+    "videoContentUrlExpiresAt",
+    "videoPoster",
+    "localVideoPoster",
+    "audio",
+    "localAudio",
+    "voiceId",
+    "voiceTrialAudioAvailable",
+    "uploadState",
+    "uploadProgress",
+    "uploadError",
+    "error",
+    "taskPrompt",
+    "taskDiagnostic",
+    "generationBatchId",
+    "inputSignature",
+    "submission",
+    "videoSubmission",
+    "musicSubmission",
+    "voiceDesignSubmission",
+    "ttsSubmission",
+    "audioTaskType",
+    "taskStage",
+    "cancelRequested",
+    "videoPollingPaused",
+    "videoPollingReason",
+    "resultOf",
+    "resultIndex",
+    "resultBatchId",
+    "operationId",
+    "operationParams",
+    "continuationOf",
+    "status",
+  ];
+  const mutable = copy as unknown as Record<string, unknown>;
+  for (const key of taskStateKeys) delete mutable[key];
+  return copy;
+}
 
 /**
  * A compact, synchronous fingerprint for the “inputs changed” UI. This is not
@@ -44,7 +183,7 @@ export function creationInputSignature(input: CreationInputs): string {
     feed(reference.nodeId);
     // A restored image and its cached copy represent one effective input.
     // Keep the cache identity only while the actual image is unavailable.
-    feed(reference.image || reference.localImage || reference.video || reference.localVideo || reference.audio || reference.localAudio || reference.assetId || reference.videoContentUrl || "");
+    feed(reference.image || reference.video || reference.localVideo || reference.audio || reference.localAudio || reference.assetId || reference.videoContentUrl || "");
   }
   return `v1:${(first >>> 0).toString(16).padStart(8, "0")}${(second >>> 0)
     .toString(16)
@@ -60,6 +199,7 @@ export type CreatorPanelPlacement = {
 type PanelPlacementOptions = {
   width?: number;
   gap?: number;
+  clampToBoard?: boolean;
 };
 
 const finite = (value: number | undefined, fallback: number) =>
@@ -67,10 +207,8 @@ const finite = (value: number | undefined, fallback: number) =>
 
 /**
  * Position a screen-space editor below its selected node, independent of
- * canvas zoom. The editor is deliberately allowed to leave the board when
- * the node leaves the viewport: clamping it to the viewport makes it appear
- * detached while panning. `left` and `top` therefore remain in the same
- * screen coordinate system as the transformed node. Height is owned by the
+ * canvas zoom. Small boards can opt into horizontal clamping so a node near
+ * an edge cannot make the editor impossible to reach. Height is owned by the
  * editor's content and CSS, never by the space below its changing position.
  */
 export function placeCreatorPanel(
@@ -93,11 +231,12 @@ export function placeCreatorPanel(
   // doing so breaks the visual relationship while panning a large canvas.
   const top = anchorTop;
   const center = finite(nodeRect.x, 0) + Math.max(0, finite(nodeRect.width, 0)) / 2;
+  const centeredLeft = center - width / 2;
+  const left = options.clampToBoard && boardWidth > 0
+    ? Math.max(margin, Math.min(centeredLeft, Math.max(margin, boardWidth - width - margin)))
+    : centeredLeft;
   return {
-    // Keep horizontal attachment even when the selected node is panned off
-    // screen. The panel will naturally follow it instead of teleporting to
-    // the center of the viewport.
-    left: center - width / 2,
+    left,
     top,
     width,
   };

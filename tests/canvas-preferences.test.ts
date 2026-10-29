@@ -8,6 +8,7 @@ test("legacy preferences retain supported behavior while discarding unimplemente
     panSensitivity: 2,
     backgroundPreset: "warm",
     referenceNaming: "number",
+    autoLayout: "grid",
     delayedSubmit: true,
     touchSnapRange: 250,
     minimalZoom: true,
@@ -24,7 +25,7 @@ test("legacy preferences retain supported behavior while discarding unimplemente
   assert.equal(preferences.backgroundPreset, "warm");
   assert.equal(preferences.referenceNaming, "number");
   assert.deepEqual(Object.keys(preferences).sort(), Object.keys(DEFAULT_CANVAS_PREFERENCES).sort());
-  for (const key of ["delayedSubmit", "touchSnapRange", "minimalZoom", "linkedPreview", "browserNotification", "notificationSound", "notifySave", "collapseCompletedResults", "theme", "simplifiedPalette", "unknownFutureSetting"]) {
+  for (const key of ["autoLayout", "delayedSubmit", "touchSnapRange", "minimalZoom", "linkedPreview", "browserNotification", "notificationSound", "notifySave", "collapseCompletedResults", "theme", "simplifiedPalette", "unknownFutureSetting"]) {
     assert.equal(key in preferences, false, `${key} must not be persisted again`);
   }
 });
@@ -75,6 +76,7 @@ test("saving removes legacy fields, survives reload and restores all defaults", 
   try {
     storage.set("codex.canvas.preferences.v1", JSON.stringify({
       ...DEFAULT_CANVAS_PREFERENCES,
+      autoLayout: "grid",
       theme: "system",
       gridStyle: "none",
       nodeDensity: "compact",
@@ -86,6 +88,7 @@ test("saving removes legacy fields, survives reload and restores all defaults", 
     saveCanvasPreferences(migrated);
     const saved = JSON.parse(storage.get("codex.canvas.preferences.v1")!);
     assert.equal("theme" in saved, false);
+    assert.equal("autoLayout" in saved, false);
     assert.equal(saved.gridStyle, "dots");
     assert.equal(saved.gridVisible, false);
     assert.equal(saved.nodeDensity, "compact");

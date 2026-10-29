@@ -1,22 +1,32 @@
 import React from "react";
 import { Check, Mic, RotateCcw, Square } from "lucide-react";
 import "./audio-recorder.css";
-import { AudioRecordingSession, MAX_RECORDING_MS, defaultRecordingFileName, formatRecordingDuration, type RecordingStatus } from "./audio-recording";
+import { AudioRecordingSession, defaultRecordingFileName, formatRecordingDuration, type RecordingStatus } from "./audio-recording";
 
 export type AudioRecorderProps = {
   onSave: (file: File) => void;
+  onReset?: () => void;
+  onCaptureStateChange?: (hasUncommittedCapture: boolean) => void;
+  onNotice?: (message: string) => void;
   disabled?: boolean;
 };
 
-export default function AudioRecorder({ onSave, disabled = false }: AudioRecorderProps) {
+export default function AudioRecorder({ onSave, onReset, onCaptureStateChange, onNotice, disabled = false }: AudioRecorderProps) {
   const [status, setStatus] = React.useState<RecordingStatus>("idle");
   const [elapsedMs, setElapsedMs] = React.useState(0);
-  const [errorMessage, setErrorMessage] = React.useState("");
+  const noticeRef = React.useRef(onNotice);
+  noticeRef.current = onNotice;
+  const captureStateChangeRef = React.useRef(onCaptureStateChange);
+  captureStateChangeRef.current = onCaptureStateChange;
   const [previewUrl, setPreviewUrl] = React.useState("");
   const [recordingBlob, setRecordingBlob] = React.useState<Blob | null>(null);
   const sessionRef = React.useRef<AudioRecordingSession | null>(null);
   const previewUrlRef = React.useRef("");
   const startingRef = React.useRef(false);
+  const updateStatus = React.useCallback((next: RecordingStatus) => {
+    setStatus(next);
+    captureStateChangeRef.current?.(next === "requesting" || next === "recording" || next === "ready");
+  }, []);
 
   const revokePreview = React.useCallback(() => {
     if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
@@ -26,7 +36,7 @@ export default function AudioRecorder({ onSave, disabled = false }: AudioRecorde
 
   React.useEffect(() => {
     const session = new AudioRecordingSession({
-      onStatus: setStatus,
+      onStatus: updateStatus,
       onElapsed: setElapsedMs,
       onComplete: blob => {
         const url = URL.createObjectURL(blob);
@@ -34,7 +44,9 @@ export default function AudioRecorder({ onSave, disabled = false }: AudioRecorde
         setPreviewUrl(url);
         setRecordingBlob(blob);
       },
-      onError: setErrorMessage,
+      onError: message => {
+        noticeRef.current?.(message);
+      },
     });
     sessionRef.current = session;
     return () => {
@@ -43,7 +55,7 @@ export default function AudioRecorder({ onSave, disabled = false }: AudioRecorde
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
       previewUrlRef.current = "";
     };
-  }, []);
+  }, [updateStatus]);
 
   const stopRecording = React.useCallback(() => sessionRef.current?.stop(), []);
 
@@ -53,21 +65,21 @@ export default function AudioRecorder({ onSave, disabled = false }: AudioRecorde
     revokePreview();
     setRecordingBlob(null);
     setElapsedMs(0);
-    setErrorMessage("");
+    onReset?.();
     try {
       await sessionRef.current?.start();
     } finally {
       startingRef.current = false;
     }
-  }, [disabled, revokePreview, status]);
+  }, [disabled, onReset, revokePreview, status]);
 
   const redoRecording = () => {
     if (disabled) return;
     revokePreview();
     setRecordingBlob(null);
     setElapsedMs(0);
-    setErrorMessage("");
-    setStatus("idle");
+    updateStatus("idle");
+    onReset?.();
   };
 
   const confirmRecording = () => {
@@ -81,42 +93,29 @@ export default function AudioRecorder({ onSave, disabled = false }: AudioRecorde
 
   const isRecording = status === "recording";
   const isBusy = status === "requesting";
-  const progress = Math.min(100, elapsedMs / MAX_RECORDING_MS * 100);
 
   return (
-    <section className={`audio-recorder${status === "ready" ? " is-ready" : ""}`} aria-label="录音">
+    <section className={`audio-recorder is-${status}`} aria-label="录音">
       <div className="audio-recorder-head">
         <span className="audio-recorder-icon" aria-hidden="true"><Mic size={17} /></span>
         <div className="audio-recorder-heading">
           <h3>{status === "ready" ? "试听录音" : "录音"}</h3>
-          {status !== "ready" && <p>录制一段声音，最长 1 分钟</p>}
+          {status === "idle" && <p>最长 1 分钟</p>}
         </div>
-        {status !== "ready" && (
-          <span className={`audio-recorder-badge${isRecording ? " is-recording" : ""}`} aria-live="polite">
-            {isBusy ? "正在请求权限" : isRecording ? "录制中" : status === "error" ? "需要处理" : "未开始"}
-          </span>
-        )}
       </div>
 
-      {status !== "ready" && (
-        <>
-          <div className={`audio-recorder-clock${isRecording ? " is-recording" : ""}`} role="timer" aria-label={`录音时长 ${formatRecordingDuration(elapsedMs)}`}>
-            <span className="audio-recorder-dot" aria-hidden="true" />
-            <span>{formatRecordingDuration(elapsedMs)}</span>
-            <span className="audio-recorder-limit">/ 01:00</span>
-          </div>
-          <div className="audio-recorder-progress" role="progressbar" aria-label="录音进度" aria-valuemin={0} aria-valuemax={60} aria-valuenow={Math.floor(elapsedMs / 1000)}>
-            <span style={{ width: `${progress}%` }} />
-          </div>
-        </>
-      )}
+      {isRecording && <div className="audio-recorder-clock is-recording" role="timer" aria-label={`录音时长 ${formatRecordingDuration(elapsedMs)}`}>
+        <span className="audio-recorder-dot" aria-hidden="true" />
+        <span>{formatRecordingDuration(elapsedMs)}</span>
+        <span className="audio-recorder-limit">/ 01:00</span>
+      </div>}
 
       {status !== "ready" && (
         <p className="audio-recorder-message" aria-live="polite">
-          {status === "idle" && "点击开始后，请在浏览器提示中允许使用麦克风。"}
+          {status === "idle" && "开始录制时，请允许使用麦克风。"}
           {isBusy && "正在连接麦克风，请稍候…"}
-          {isRecording && "正在录制，达到 1 分钟后会自动停止。"}
-          {status === "error" && errorMessage}
+          {isRecording && "达到 1 分钟后自动停止。"}
+          {status === "error" && "录音暂不可用，请重试。"}
         </p>
       )}
 

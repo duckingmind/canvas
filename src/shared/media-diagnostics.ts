@@ -1,5 +1,5 @@
 /** Safe, content-free facts shared by the task surfaces. Never include prompts or asset URLs. */
-import { mediaFailureCategory, mediaTaskNeedsManualReconciliation, mediaTaskReconciliationClosed, mediaTaskState, requiresMediaTaskReconciliation, type MediaFailureCategory, type MediaTaskStateInput } from './media-task-state.ts'
+import { mediaFailureCategory, mediaTaskAwaitingAutomaticFailover, mediaTaskReconciliationClosed, mediaTaskState, requiresMediaTaskReconciliation, type MediaFailureCategory, type MediaTaskStateInput } from './media-task-state.ts'
 
 export type MediaInputSummary = {
   model?: string
@@ -24,6 +24,13 @@ function referenceTransportUnsupported(input: MediaFailureDiagnosticInput) {
     (code === 'invalid_input_reference' && /(?:must be a remote HTTP\(S\) URL|data URLs must be uploaded)/i.test(message)) ||
     (['no_eligible_provider', 'no_eligible_supplier'].includes(code) &&
       /^(?:no eligible media provider: )?video protocol (?:requires a public HTTP\(S\) URL|accepts inline image data or a public HTTP\(S\) URL) for reference media$/i.test(message))
+}
+
+function contentPolicyFailure(input: MediaFailureDiagnosticInput) {
+  const code = (input.code || '').trim().toLowerCase()
+  if (['content_policy_violation', 'provider_content_blocked', 'content_policy', 'content_filter', 'content_filtered', 'safety_violation', 'safety_filter', 'moderation_blocked', 'prompt_blocked', 'prompt_rejected'].includes(code)) return true
+  const message = (input.message || '').trim().toLowerCase()
+  return ['content policy', 'content_policy', 'content safety', 'content_safety', 'content filter', 'content_filter', 'safety violation', 'safety_violation', 'moderation blocked', 'moderation_blocked', 'prompt blocked', 'prompt_blocked', 'prompt violates', 'prompt violation', 'disallowed content', 'content is not allowed', '违反内容政策', '违反了内容政策', '违反了我们的内容政策', '可能违反内容政策', '违反内容安全政策', '违反了内容安全政策', '违反了我们的内容安全政策', '不符合内容政策', '不符合内容安全政策', '未通过内容安全审核', '内容安全审核未通过', '触发内容安全限制'].some(marker => message.includes(marker))
 }
 
 export function summarizeMediaInput(payload?: Record<string, unknown>): MediaInputSummary | undefined {
@@ -55,27 +62,36 @@ export function diagnoseMediaFailure(input: MediaFailureDiagnosticInput, languag
   const code = (input.code || '').trim().toLowerCase()
   const status = (input.status || '').trim().toLowerCase()
   const reconciliationExpired = mediaTaskReconciliationClosed(input)
-  const manualReconciliationRequired = mediaTaskNeedsManualReconciliation(input)
+  const automaticFailoverPending = mediaTaskAwaitingAutomaticFailover(input)
   const uncertain = requiresMediaTaskReconciliation(input)
   if (reconciliationExpired) return {
-    title: en ? 'Provider result could not be confirmed' : '未能确认供应商结果',
-    advice: en ? 'The platform task is closed, but the provider result remains unconfirmed. Platform support must verify the original request. Retrying the original input stays blocked; do not resubmit while verification is pending.' : '平台任务已关闭，但供应商结果仍未知，需要平台核查原请求。原样重试仍被关闭，核查完成前请勿重复提交。',
+    title: en ? 'Automatic fallback ended · provider result unconfirmed' : '自动兜底已结束 · 供应商结果未确认',
+    advice: en ? 'Automatic fallback has ended, but the provider result remains unconfirmed. Check the task billing record before creating another request.' : '自动兜底已结束，但供应商结果仍未确认。重新发起前请先确认本任务的资金状态。',
     requiresChange: false, limit: undefined, category: 'reconciliation' as MediaFailureCategory,
   }
-  if (manualReconciliationRequired) return {
-    title: en ? 'Provider result needs manual confirmation' : '需要人工核对供应商结果',
-    advice: en ? 'Automatic verification could not confirm or deliver the original result. Platform support must investigate; do not resubmit while it remains unconfirmed.' : '自动核验未能确认或交付原结果，需由平台核对结果；必要时人工核查。核查完成前请勿重复提交。',
+  if (automaticFailoverPending) return {
+    title: en ? 'Switching to a fallback provider' : '正在切换备用渠道',
+    advice: en ? 'The original result could not be confirmed. The platform is trying the next available provider; customer billing is captured once.' : '原供应商结果无法确认，系统正在尝试下一个可用供应商；用户费用只在任务最终成功时结算一次。',
     requiresChange: false, limit: undefined, category: 'reconciliation' as MediaFailureCategory,
   }
   if (uncertain) return {
-    title: en ? 'Provider result is being confirmed' : '正在核对供应商结果',
-    advice: en ? 'The provider may have accepted the original request. The platform is checking that same task; do not submit it again. Refreshing checks its status without creating another task.' : '供应商可能已接收原请求，平台正在核对这条任务。请勿重复提交；刷新只查询原任务状态，不会再次创建任务。',
+    title: en ? 'Provider result is being recovered' : '系统正在恢复供应商结果',
+    advice: en ? 'The provider may have accepted the original request. The platform is checking it and will automatically try another provider if needed. Do not submit again.' : '供应商可能已接收原请求，系统正在核对并在需要时自动切换备用渠道。请勿重复提交。',
     requiresChange: false, limit: undefined, category: 'reconciliation' as MediaFailureCategory,
   }
   if (code === 'unknown_reconciled' && ['failed', 'cancelled', 'canceled'].includes(status)) return {
     title: en ? 'Provider outcome has been verified' : '供应商结果已核实',
     advice: en ? 'The original task has been confirmed as ended. You may adjust the input and generate again.' : '原任务已确认结束，可调整内容后重新生成。',
     requiresChange: false, limit: undefined, category: 'service' as MediaFailureCategory,
+  }
+  if (contentPolicyFailure(input)) return {
+    title: en ? 'Request blocked by content safety' : '请求未通过内容安全审核',
+    advice: en ? 'Review the prompt and any reference media, then try again.' : '请检查提示词和参考素材，调整后再试。',
+    requiresChange: true, limit: undefined, category: 'input' as MediaFailureCategory,
+  }
+  if (code === 'invalid_prompt') return {
+    title: en ? 'Prompt input is invalid' : '提示词未通过格式校验',
+    advice: en ? 'Provide a non-empty prompt or a valid reference image, then try again.' : '请填写有效提示词，或添加有效参考素材后重试。',
   }
   if (referenceTransportUnsupported(input)) return {
     title: en ? 'Reference media format is not supported by the channel' : '当前通道不支持这种参考素材格式',
@@ -119,16 +135,16 @@ export function mediaTaskUserFailure(input: MediaFailureDiagnosticInput, languag
   const assetStatus = String(input.assetStatus || '').trim().toLowerCase()
   // Missing assets never establish that an ambiguous upstream submission failed.
   if (mediaTaskReconciliationClosed(input)) return {
-    title: en ? 'Task closed · result unconfirmed' : '任务已关闭，结果待核查',
-    advice: en ? 'Automatic verification has ended, but the provider may have completed the request. Platform support must verify the original result; do not submit it again. See billing separately for any charge or released reservation.' : '自动核验已结束，但供应商可能已完成生成。平台仍需核查原请求，请勿重复提交；扣费和预留释放情况请查看计费信息。',
+    title: en ? 'Automatic fallback ended · result unconfirmed' : '自动兜底已结束 · 结果未确认',
+    advice: en ? 'Automatic fallback has ended, but the provider may have completed the request. Check the task billing record before deciding whether to create another request.' : '自动兜底已结束，但原供应商仍可能完成生成。决定是否重新发起前，请先确认本任务的资金状态。',
   }
   if (state.requiresReconciliation) return {
-    title: mediaTaskNeedsManualReconciliation(input)
-      ? en ? 'Awaiting manual verification' : '待人工核查'
-      : en ? 'Result awaiting verification' : '结果待核验',
-    advice: mediaTaskNeedsManualReconciliation(input)
-      ? en ? 'Automatic verification could not confirm or deliver the original result. Platform support must investigate; do not resubmit. Refreshing only updates this task.' : '自动核验未能确认或交付原结果，平台需人工核查。请勿重复提交；刷新只更新这条任务的状态。'
-      : en ? 'The request was submitted, but its result is not confirmed. Do not resubmit; refreshing checks the original task without generating again.' : '请求已提交，但结果尚未确认。请勿重复提交；刷新只查询原任务，不会再次生成。',
+    title: mediaTaskAwaitingAutomaticFailover(input)
+      ? en ? 'Switching to a fallback provider' : '正在切换备用渠道'
+      : en ? 'Recovering the provider result' : '系统正在恢复供应商结果',
+    advice: mediaTaskAwaitingAutomaticFailover(input)
+      ? en ? 'The original result could not be confirmed. The platform is trying the next available provider; customer billing is captured once.' : '原供应商结果无法确认，系统正在尝试下一个可用供应商；用户费用只在任务最终成功时结算一次。'
+      : en ? 'The request may have been accepted. The platform will check the original task and automatically try a fallback provider if needed. Do not resubmit.' : '原请求可能已被供应商接收。系统会核验原任务，并在需要时自动切换备用渠道。请勿重复提交。',
   }
   if (assetStatus === 'expired' || code === 'asset_expired') return {
     title: en ? 'Result expired' : '结果已过期',
@@ -141,6 +157,14 @@ export function mediaTaskUserFailure(input: MediaFailureDiagnosticInput, languag
   if (code === 'unknown_reconciled' && ['failed', 'cancelled', 'canceled'].includes(status)) return {
     title: ['cancelled', 'canceled'].includes(status) ? en ? 'Cancellation verified' : '已核实取消' : en ? 'Failure verified' : '已核实失败',
     advice: en ? 'The original request was verified as ended without a result. You may adjust the input and generate again.' : '原请求已核实结束且没有生成结果，可调整内容后重新生成。',
+  }
+  if (contentPolicyFailure(input)) return {
+    title: en ? 'Request blocked by content safety' : '请求未通过内容安全审核',
+    advice: en ? 'Review the prompt and any reference media, then try again.' : '请检查提示词和参考素材，调整后再试。',
+  }
+  if (code === 'invalid_prompt') return {
+    title: en ? 'Prompt input is invalid' : '提示词未通过格式校验',
+    advice: en ? 'Provide a non-empty prompt or a valid reference image, then try again.' : '请填写有效提示词，或添加有效参考素材后重试。',
   }
   if (referenceTransportUnsupported(input)) return {
     title: en ? 'Reference media format is not supported' : '参考素材格式不支持',

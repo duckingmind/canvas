@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { CanvasNode } from "../src/canvas-types.ts";
-import { canCreateNewCanvasTask, canLoadVideoContent, canvasTaskRetryPolicy, canvasTaskState, isTaskCancelled, isVideoResultUnconfirmed, pendingTaskLabel, videoTaskControls, videoTaskSnapshotPatch } from "../src/video-task-state.ts";
+import { canCreateNewCanvasTask, canLoadVideoContent, canRetryMissedSubmission, canvasTaskRetryPolicy, canvasTaskState, isSubmissionLookupMiss, isTaskCancelled, isVideoResultUnconfirmed, pendingTaskLabel, submissionRetryStartedDiagnostic, videoTaskControls, videoTaskSnapshotPatch } from "../src/video-task-state.ts";
 import { diagnoseMediaFailure } from "../src/shared/media-diagnostics.ts";
 
 const node: CanvasNode = {
@@ -68,15 +68,16 @@ test("video task labels keep queued, generating and terminal failure distinct", 
 
 test("video diagnostics distinguish active reconciliation from its terminal close", () => {
   const active = diagnoseMediaFailure({ status: "unknown", code: "creation_result_unknown" });
-  assert.equal(active.title, "正在核对供应商结果");
+  assert.equal(active.title, "系统正在恢复供应商结果");
   assert.match(active.advice, /请勿重复提交/);
 
   const expired = diagnoseMediaFailure({ status: "failed", code: "unknown_resolution_expired" });
-  assert.equal(expired.title, "未能确认供应商结果");
-  assert.match(expired.advice, /任务已关闭/);
+  assert.equal(expired.title, "自动兜底已结束 · 供应商结果未确认");
+  assert.match(expired.advice, /重新发起前请先确认/);
 
-  const manual = diagnoseMediaFailure({ status: "failed", code: "provider_lookup_unsupported" });
-  assert.equal(manual.title, "需要人工核对供应商结果");
+  const fallback = diagnoseMediaFailure({ status: "failed", code: "provider_lookup_unsupported" });
+  assert.equal(fallback.title, "正在切换备用渠道");
+  assert.match(fallback.advice, /尝试下一个可用供应商/);
 });
 
 test("new submissions stay blocked after reconciliation closes until evidence resolves the original task", () => {
@@ -92,12 +93,12 @@ test("new submissions stay blocked after reconciliation closes until evidence re
 
 test("missing lookup support stays unresolved across cards, controls and retry actions", () => {
   for (const status of ["unknown", "failed"]) {
-    const manual = { ...node, status: "failed" as const, taskDiagnostic: { status, code: "provider_lookup_unsupported" } };
-    assert.notEqual(canvasTaskState(manual), "failed");
-    assert.equal(pendingTaskLabel(manual), "生成中");
-    assert.deepEqual(canvasTaskRetryPolicy(manual), { canRetry: false, requiresConfirmation: true, reason: "reconciliation_pending" });
-    assert.deepEqual(videoTaskControls(manual, true), { canPause: false, canCancel: false });
-    assert.match(diagnoseMediaFailure(manual.taskDiagnostic).advice, /需由平台核对结果/);
+    const fallback = { ...node, status: "failed" as const, taskDiagnostic: { status, code: "provider_lookup_unsupported" } };
+    assert.notEqual(canvasTaskState(fallback), "failed");
+    assert.equal(pendingTaskLabel(fallback), "生成中");
+    assert.deepEqual(canvasTaskRetryPolicy(fallback), { canRetry: false, requiresConfirmation: true, reason: "reconciliation_pending" });
+    assert.deepEqual(videoTaskControls(fallback, true), { canPause: false, canCancel: false });
+    assert.match(diagnoseMediaFailure(fallback.taskDiagnostic).advice, /尝试下一个可用供应商/);
   }
 });
 
@@ -127,6 +128,27 @@ test("a missing task id is shown as an unconfirmed submission", () => {
   const withoutIdentity = { ...withSubmission, videoSubmission: undefined };
   assert.equal(canvasTaskState(withoutIdentity), "no_task_id");
   assert.equal(pendingTaskLabel(withoutIdentity), "排队中");
+});
+
+test("a missed idempotency lookup stops background recovery and exposes only an explicit frozen retry", () => {
+  const missed = {
+    ...node,
+    taskId: undefined,
+    status: "queued" as const,
+    videoSubmission: { key: "original-key", model: "fixture-video", prompt: "frozen prompt", images: [], duration: 6 },
+    taskDiagnostic: { status: "pending", code: "VIDEO_SUBMISSION_NOT_FOUND" },
+    error: "原视频提交暂未查到，已停止自动重提，请稍后重试。",
+  };
+  assert.equal(isSubmissionLookupMiss(missed), true);
+  assert.equal(canvasTaskState(missed), "action_required");
+  assert.equal(pendingTaskLabel(missed), "需要操作");
+  assert.equal(canRetryMissedSubmission(missed), true);
+  assert.equal(canRetryMissedSubmission({ ...missed, taskId: "accepted-task" }), false);
+  assert.equal(canRetryMissedSubmission({ ...missed, videoSubmission: undefined }), false);
+  assert.deepEqual(submissionRetryStartedDiagnostic(missed), { status: "running", code: undefined, phase: "submitting" });
+  const unknownResult = { ...missed, taskDiagnostic: { status: "unknown", code: "creation_result_unknown" } };
+  assert.equal(isSubmissionLookupMiss(unknownResult), false);
+  assert.equal(canRetryMissedSubmission(unknownResult), false);
 });
 
 test("server observations replace stale running state and suppress duplicate revisions", () => {
@@ -186,8 +208,12 @@ test("unknown or reconciliation tasks do not expose pause or cancel controls", (
   assert.deepEqual(videoTaskControls(supplierUnconfirmed, true), { canPause: false, canCancel: false });
 
   const runningTask = { ...node, status: "running" as const };
-  assert.deepEqual(videoTaskControls(runningTask, true), { canPause: true, canCancel: true });
-  assert.deepEqual(videoTaskControls(runningTask, false), { canPause: false, canCancel: true });
+  assert.deepEqual(videoTaskControls(runningTask, true), { canPause: true, canCancel: false });
+  assert.deepEqual(videoTaskControls(runningTask, false), { canPause: false, canCancel: false });
+
+  const queuedTask = { ...node, status: "queued" as const };
+  assert.deepEqual(videoTaskControls(queuedTask, true), { canPause: true, canCancel: true });
+  assert.deepEqual(videoTaskControls(queuedTask, false), { canPause: false, canCancel: true });
 
   const staleCompleted = { ...runningTask, taskDiagnostic: { status: "completed" } };
   assert.deepEqual(videoTaskControls(staleCompleted, true), { canPause: false, canCancel: false });

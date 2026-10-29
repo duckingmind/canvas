@@ -21,6 +21,24 @@ test("local development registration failures explain the owner-only boundary", 
   assert.equal(failure.switchDeveloperAccount, true);
 });
 
+test("development session errors stay separate from normal user login", () => {
+  const denied = platformFailure({ code: "APP_DEVELOPMENT_ACCESS_DENIED", status: 403 });
+  assert.equal(denied.kind, "developer");
+  assert.equal(denied.switchDeveloperAccount, true);
+  assert.match(denied.message, /创建者账户/);
+  assert.match(denied.message, /普通用户/);
+  assert.doesNotMatch(denied.message, /重新登录|连接账户/);
+
+  const missingVersion = platformFailure({ code: "APP_DEVELOPMENT_VERSION_NOT_FOUND", status: 404 });
+  assert.equal(missingVersion.kind, "developer");
+  assert.match(missingVersion.message, /manifest\.version/);
+  assert.equal(missingVersion.switchDeveloperAccount, undefined);
+
+  const missingApp = platformFailure({ code: "APP_DEVELOPMENT_APP_UNAVAILABLE", status: 404 });
+  assert.equal(missingApp.kind, "developer");
+  assert.match(missingApp.message, /应用标识/);
+});
+
 test("registration permission, version conflict and outage keep distinct recovery paths", () => {
   const denied = platformFailure({
     code: "APP_LOGIN_NOT_ALLOWED",

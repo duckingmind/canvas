@@ -50,10 +50,43 @@ export type CanvasSummary = {
 const DATABASE = "proxy-canvas:library:v1";
 const DOCUMENTS = "documents";
 const METADATA = "metadata";
+const PENDING_SYNC = "pendingSync";
+const DATABASE_VERSION = 2;
 // Array keys never collide with the string IDs used by canvas documents.
 const LEGACY_MARKER = ["migration", "legacy:v1"];
 const queues = scopedMemory<string, Promise<void>>();
 const sessionDocuments = scopedMemory<string, LibraryDocument>();
+export type PendingCloudSync = {
+  id: string;
+  /** Opaque delivery token. A late acknowledgement cannot clear a newer save. */
+  revision: string;
+  updatedAt: string;
+  contentHash?: string;
+  /** A user's local-only choice survives reloads and suppresses background delivery. */
+  paused?: boolean;
+};
+const sessionPendingSync = scopedMemory<string, PendingCloudSync>();
+
+async function documentHash(document: LibraryDocument): Promise<string> {
+  const value = JSON.stringify(document);
+  if (globalThis.crypto?.subtle) {
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(value),
+    );
+    return Array.from(new Uint8Array(digest), (item) =>
+      item.toString(16).padStart(2, "0"),
+    ).join("");
+  }
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ code, 0x85ebca6b);
+  }
+  return `fallback:${(first >>> 0).toString(16)}${(second >>> 0).toString(16)}`;
+}
 
 function cacheSessionDocument(document: LibraryDocument): void {
   const snapshot = structuredClone(document);
@@ -100,10 +133,10 @@ function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === "undefined")
       return reject(new Error("当前浏览器无法使用画布资料库。"));
-    const request = indexedDB.open(localDatabaseName(DATABASE), 1);
+    const request = indexedDB.open(localDatabaseName(DATABASE), DATABASE_VERSION);
     let failed = false;
     request.onupgradeneeded = () => {
-      for (const store of [DOCUMENTS, METADATA])
+      for (const store of [DOCUMENTS, METADATA, PENDING_SYNC])
         if (!request.result.objectStoreNames.contains(store))
           request.result.createObjectStore(store);
     };
@@ -126,7 +159,11 @@ function openDatabase(): Promise<IDBDatabase> {
   });
 }
 
-type Stores = { documents: IDBObjectStore; metadata: IDBObjectStore };
+type Stores = {
+  documents: IDBObjectStore;
+  metadata: IDBObjectStore;
+  pendingSync: IDBObjectStore;
+};
 async function transact<T>(
   mode: IDBTransactionMode,
   action: (
@@ -140,7 +177,10 @@ async function transact<T>(
     const database = await openDatabase();
     try {
       return await new Promise<T>((resolve, reject) => {
-        const transaction = database.transaction([DOCUMENTS, METADATA], mode);
+        const transaction = database.transaction(
+          [DOCUMENTS, METADATA, PENDING_SYNC],
+          mode,
+        );
         let result: T;
         let failure: unknown;
         const abort = (error: unknown) => {
@@ -160,6 +200,7 @@ async function transact<T>(
             {
               documents: transaction.objectStore(DOCUMENTS),
               metadata: transaction.objectStore(METADATA),
+              pendingSync: transaction.objectStore(PENDING_SYNC),
             },
             (value) => {
               result = value;
@@ -190,8 +231,7 @@ function summary(document: LibraryDocument): CanvasSummary {
     (node) =>
       node.type === "image" &&
       typeof (node.imageThumbnail || node.image) === "string" &&
-      (/^https?:\/\//i.test(node.imageThumbnail || node.image || "") ||
-        (/^data:image\//i.test(node.imageThumbnail || node.image || "") && (node.imageThumbnail || node.image || "").length < 120_000)),
+      /^https?:\/\//i.test(node.imageThumbnail || node.image || ""),
   );
   const cover = coverNode?.imageThumbnail || coverNode?.image;
   return {
@@ -240,24 +280,46 @@ export async function getCanvas<T extends LibraryDocument>(
 /** Snapshot immediately; document and summary become visible together only at commit. */
 export async function saveCanvas<T extends LibraryDocument>(
   document: T,
+  options: { queueCloudSync?: true } = {},
 ): Promise<void> {
   checkDocument(document);
+  const checkScope = captureLocalStorageScope();
   let snapshot: T;
   try {
     snapshot = structuredClone(document);
   } catch (cause) {
     throw new Error("本机画布保存失败：文档包含无法存储的数据。", { cause });
   }
+  const contentHash = options.queueCloudSync
+    ? await documentHash(snapshot)
+    : undefined;
+  checkScope();
   return enqueue("保存", () =>
     transact<void>(
       "readwrite",
-      ({ documents, metadata }, _result, abort) => {
+      ({ documents, metadata, pendingSync }, _result, abort) => {
         const existing = metadata.get(snapshot.id);
         existing.onsuccess = () => {
           try {
             const value = preserveDeletion(snapshot, existing.result);
             documents.put(value, value.id);
             metadata.put(summary(value), value.id);
+            if (options.queueCloudSync) {
+              const queued = pendingSync.get(snapshot.id);
+              queued.onsuccess = () => {
+                try {
+                  const record: PendingCloudSync = {
+                    id: value.id,
+                    revision: crypto.randomUUID(),
+                    updatedAt: value.updatedAt,
+                    contentHash,
+                  };
+                  pendingSync.put(record, record.id);
+                } catch (error) {
+                  abort(error);
+                }
+              };
+            }
           } catch (error) {
             abort(error);
           }
@@ -265,9 +327,213 @@ export async function saveCanvas<T extends LibraryDocument>(
       },
       () => {
         const existing = sessionDocuments().get(snapshot.id);
-        cacheSessionDocument(
-          preserveDeletion(snapshot, existing ? summary(existing) : undefined),
-        );
+        const value = preserveDeletion(snapshot, existing ? summary(existing) : undefined);
+        cacheSessionDocument(value);
+        if (options.queueCloudSync === true) {
+          const record: PendingCloudSync = {
+            id: value.id,
+            revision: crypto.randomUUID(),
+            updatedAt: value.updatedAt,
+            contentHash,
+          };
+          sessionPendingSync().set(value.id, record);
+        }
+      },
+    ),
+  );
+}
+
+/** Read queued revision markers; the full document remains in the local library store. */
+export async function listPendingCloudSync(): Promise<PendingCloudSync[]> {
+  return enqueue("待读同步", () =>
+    transact<PendingCloudSync[]>(
+      "readonly",
+      ({ pendingSync }, result) => {
+        const request = pendingSync.getAll();
+        request.onsuccess = () =>
+          result(
+            (request.result as unknown[]).filter(
+              (item): item is PendingCloudSync =>
+                Boolean(
+                  item &&
+                    typeof item === "object" &&
+                    typeof (item as PendingCloudSync).id === "string" &&
+                    typeof (item as PendingCloudSync).revision === "string" &&
+                    typeof (item as PendingCloudSync).updatedAt === "string",
+                ),
+            ),
+          );
+      },
+      () => [...sessionPendingSync().values()].map((item) => structuredClone(item)),
+    ),
+  ).then((records) => records.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt)));
+}
+
+/** Queue only if this exact snapshot is still the committed local document. */
+export async function queuePendingCloudSync<T extends LibraryDocument>(
+  document: T,
+  options: { reactivatePaused?: boolean } = {},
+): Promise<string | null> {
+  checkDocument(document);
+  const checkScope = captureLocalStorageScope();
+  const snapshot = structuredClone(document);
+  const contentHash = await documentHash(snapshot);
+  checkScope();
+  return enqueue("待同步版本写入", () =>
+    transact<string | null>(
+      "readwrite",
+      ({ documents, pendingSync }, result) => {
+        const local = documents.get(snapshot.id);
+        local.onsuccess = () => {
+          if (JSON.stringify(local.result) !== JSON.stringify(snapshot)) {
+            result(null);
+            return;
+          }
+          const queued = pendingSync.get(snapshot.id);
+          queued.onsuccess = () => {
+            const previous = queued.result as PendingCloudSync | undefined;
+            if (previous?.paused && options.reactivatePaused === false) {
+              result(null);
+              return;
+            }
+            if (
+              !previous?.paused &&
+              previous?.updatedAt === snapshot.updatedAt &&
+              previous.contentHash === contentHash
+            ) {
+              result(previous.revision);
+              return;
+            }
+            const revision = crypto.randomUUID();
+            pendingSync.put(
+              { id: snapshot.id, revision, updatedAt: snapshot.updatedAt, contentHash, paused: false },
+              snapshot.id,
+            );
+            result(revision);
+          };
+        };
+      },
+      () => {
+        const local = sessionDocuments().get(snapshot.id);
+        if (JSON.stringify(local) !== JSON.stringify(snapshot)) return null;
+        const previous = sessionPendingSync().get(snapshot.id);
+        if (previous?.paused && options.reactivatePaused === false) return null;
+        if (
+          !previous?.paused &&
+          previous?.updatedAt === snapshot.updatedAt &&
+          previous.contentHash === contentHash
+        ) return previous.revision;
+        const revision = crypto.randomUUID();
+        sessionPendingSync().set(snapshot.id, {
+          id: snapshot.id,
+          revision,
+          updatedAt: snapshot.updatedAt,
+          contentHash,
+          paused: false,
+        });
+        return revision;
+      },
+    ),
+  );
+}
+
+/** Persist a local-only choice for this exact committed canvas version. */
+export async function pausePendingCloudSync<T extends LibraryDocument>(
+  document: T,
+): Promise<boolean> {
+  checkDocument(document);
+  const checkScope = captureLocalStorageScope();
+  const snapshot = structuredClone(document);
+  const contentHash = await documentHash(snapshot);
+  checkScope();
+  return enqueue("本机保留状态写入", () =>
+    transact<boolean>(
+      "readwrite",
+      ({ documents, pendingSync }, result) => {
+        const local = documents.get(snapshot.id);
+        local.onsuccess = () => {
+          if (JSON.stringify(local.result) !== JSON.stringify(snapshot)) {
+            result(false);
+            return;
+          }
+          pendingSync.put(
+            {
+              id: snapshot.id,
+              revision: crypto.randomUUID(),
+              updatedAt: snapshot.updatedAt,
+              contentHash,
+              paused: true,
+            } satisfies PendingCloudSync,
+            snapshot.id,
+          );
+          result(true);
+        };
+      },
+      () => {
+        const local = sessionDocuments().get(snapshot.id);
+        if (JSON.stringify(local) !== JSON.stringify(snapshot)) return false;
+        sessionPendingSync().set(snapshot.id, {
+          id: snapshot.id,
+          revision: crypto.randomUUID(),
+          updatedAt: snapshot.updatedAt,
+          contentHash,
+          paused: true,
+        });
+        return true;
+      },
+    ),
+  );
+}
+
+export async function getPendingCloudSync(
+  id: string,
+): Promise<PendingCloudSync | null> {
+  checkId(id);
+  return enqueue("待同步状态读取", () =>
+    transact<PendingCloudSync | null>(
+      "readonly",
+      ({ pendingSync }, result) => {
+        const request = pendingSync.get(id);
+        request.onsuccess = () => {
+          const value = request.result as PendingCloudSync | undefined;
+          result(value ? structuredClone(value) : null);
+        };
+      },
+      () => {
+        const value = sessionPendingSync().get(id);
+        return value ? structuredClone(value) : null;
+      },
+    ),
+  );
+}
+
+/** Remove only the revision that the cloud has acknowledged. */
+export async function removePendingCloudSync(
+  id: string,
+  revision?: string,
+): Promise<boolean> {
+  checkId(id);
+  return enqueue("待同步状态更新", () =>
+    transact<boolean>(
+      "readwrite",
+      ({ pendingSync }, result) => {
+        const request = pendingSync.get(id);
+        request.onsuccess = () => {
+          const record = request.result as PendingCloudSync | undefined;
+          if (!record || (revision !== undefined && record.revision !== revision)) {
+            result(false);
+            return;
+          }
+          pendingSync.delete(id);
+          result(true);
+        };
+      },
+      () => {
+        const record = sessionPendingSync().get(id);
+        if (!record || (revision !== undefined && record.revision !== revision))
+          return false;
+        sessionPendingSync().delete(id);
+        return true;
       },
     ),
   );

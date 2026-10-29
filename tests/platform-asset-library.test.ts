@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deletePlatformAsset, listPlatformAssets, platformAssetToRow, readPlatformAsset, readStoredPlatformAsset, removePlatformAsset, resolvePlatformVoiceIdentity, savePlatformAsset, setPlatformAssetLibraryMembership, uploadPlatformAsset, type PlatformAssetApi } from "../src/platform-asset-library.ts";
+import { deletePlatformAsset, listPlatformAssets, platformAssetToRow, readPlatformAsset, readStoredPlatformAsset, removePlatformAsset, resolvePlatformVoiceIdentity, savePlatformAsset, setPlatformAssetLibraryMembership, uploadDurablePlatformAsset, type PlatformAssetApi } from "../src/platform-asset-library.ts";
 import type { StoredAsset } from "../src/canvas-types.ts";
 
 const now = "2026-09-19T00:00:00.000Z";
@@ -259,11 +259,137 @@ test("authorization and conflict errors propagate without a KV fallback", async 
   await assert.rejects(readPlatformAsset(api(() => { throw denied; }).client, "asset-one"), error => error === denied);
 });
 
-test("platform uploads do not apply the old 8 MiB image product limit", async () => {
+test("small durable images use the COS direct-upload handshake", async () => {
+  const file = new File([new Uint8Array([1, 2, 3])], "small.png", { type: "image/png" });
+  const small = dto({ id: "small-image", size_bytes: file.size, content_type: file.type });
+  const a = api((path) => path === "/media/assets/upload-intents"
+    ? { asset_id: small.id, status: "pending", upload_url: "https://cos.example.test/staging", size_bytes: file.size, content_type: file.type }
+    : small);
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 200 });
+  try {
+    const uploaded = await uploadDurablePlatformAsset(a.client, { file, name: file.name, category: "other" });
+    assert.equal(uploaded.size_bytes, file.size);
+    assert.deepEqual(a.calls.map(call => [call.path, call.options?.method]), [
+      ["/media/assets/upload-intents", "POST"],
+      [`/media/assets/${small.id}/complete`, "POST"],
+    ]);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("large durable images also use the COS direct-upload handshake", async () => {
   const file = new File([new Uint8Array(9 * 1024 * 1024)], "large.png", { type: "image/png" });
-  const a = api(dto({ size_bytes: file.size, content_type: file.type }));
-  const uploaded = await uploadPlatformAsset(a.client, { file, name: file.name, category: "other" });
-  assert.equal(uploaded.size_bytes, file.size);
-  assert.equal(a.calls[0].path, "/media/assets");
-  assert.equal(a.calls[0].options?.method, "POST");
+  const direct = dto({ id: "direct-large-image", type: "image", size_bytes: file.size, content_type: file.type });
+  const a = api((path) => {
+    if (path === "/media/assets/upload-intents") return { asset_id: direct.id, status: "pending", upload_url: "https://cos.example.test/staging", size_bytes: file.size, content_type: file.type };
+    if (path === `/media/assets/${direct.id}/complete`) return direct;
+    throw new Error(`unexpected path ${path}`);
+  });
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 200 });
+  try {
+    const uploaded = await uploadDurablePlatformAsset(a.client, { file, name: file.name, category: "other", idempotencyKey: "canvas-direct-large-image" });
+    assert.equal(uploaded.id, direct.id);
+    assert.deepEqual(a.calls.map(call => [call.path, call.options?.method]), [
+      ["/media/assets/upload-intents", "POST"],
+      [`/media/assets/${direct.id}/complete`, "POST"],
+    ]);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("large and non-image uploads use the COS direct-upload handshake", async () => {
+  const file = new File([new Uint8Array(9 * 1024 * 1024)], "large.mp4", { type: "video/mp4" });
+  const direct = dto({ id: "direct-video", type: "video", size_bytes: file.size, content_type: file.type, task_id: undefined });
+  const a = api((path) => {
+    if (path === "/media/assets/upload-intents") return { asset_id: direct.id, status: "pending", upload_url: "https://cos.example.test/staging", size_bytes: file.size, content_type: file.type };
+    if (path === `/media/assets/${direct.id}/complete`) return direct;
+    throw new Error(`unexpected path ${path}`);
+  });
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 200 });
+  try {
+    const uploaded = await uploadDurablePlatformAsset(a.client, { file, name: file.name, category: "other", idempotencyKey: "canvas-direct-video" });
+    assert.equal(uploaded.id, direct.id);
+    assert.deepEqual(a.calls.map(call => [call.path, call.options?.method]), [
+      ["/media/assets/upload-intents", "POST"],
+      [`/media/assets/${direct.id}/complete`, "POST"],
+    ]);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("an upload-intent 404 propagates without replaying bytes through Gateway", async () => {
+  const file = new File([new Uint8Array([1])], "missing.png", { type: "image/png" });
+  const missing = Object.assign(new Error("asset does not exist"), { status: 404, code: "media_asset_not_found" });
+  const a = api(() => { throw missing; });
+  await assert.rejects(uploadDurablePlatformAsset(a.client, { file, idempotencyKey: "canvas-missing-asset" }), error => error === missing);
+  assert.deepEqual(a.calls.map(call => call.path), ["/media/assets/upload-intents"]);
+});
+
+test("direct upload does not fall back to multipart for a storage outage", async () => {
+  const file = new File([new Uint8Array(9 * 1024 * 1024)], "outage.mp4", { type: "video/mp4" });
+  const unavailable = Object.assign(new Error("COS unavailable"), { status: 503, code: "media_storage_unavailable" });
+  const a = api(() => { throw unavailable; });
+  await assert.rejects(uploadDurablePlatformAsset(a.client, { file, idempotencyKey: "canvas-storage-outage" }), error => error === unavailable);
+  assert.deepEqual(a.calls.map(call => call.path), ["/media/assets/upload-intents"]);
+});
+
+test("a transient completion failure keeps the uploaded intent for safe reconciliation", async () => {
+  const file = new File([new Uint8Array(9 * 1024 * 1024)], "reconcile.mp4", { type: "video/mp4" });
+  const completionFailure = Object.assign(new Error("Gateway temporarily unavailable"), { status: 503, code: "media_storage_unavailable" });
+  const a = api((path) => {
+    if (path === "/media/assets/upload-intents") return { asset_id: "direct-reconcile", status: "pending", upload_url: "https://cos.example.test/staging", size_bytes: file.size, content_type: file.type };
+    if (path === "/media/assets/direct-reconcile/complete") throw completionFailure;
+    throw new Error(`unexpected abort or multipart path ${path}`);
+  });
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 200 });
+  try {
+    await assert.rejects(uploadDurablePlatformAsset(a.client, { file, idempotencyKey: "canvas-complete-reconcile" }), error => error === completionFailure);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+  assert.deepEqual(a.calls.map(call => [call.path, call.options?.method]), [
+    ["/media/assets/upload-intents", "POST"],
+    ["/media/assets/direct-reconcile/complete", "POST"],
+  ]);
+});
+
+test("a COS transfer failure does not replay large bytes through multipart", async () => {
+  const file = new File([new Uint8Array(9 * 1024 * 1024)], "failed.mp4", { type: "video/mp4" });
+  const a = api((path) => {
+    if (path === "/media/assets/upload-intents") return { asset_id: "direct-failed", status: "pending", upload_url: "https://cos.example.test/staging", size_bytes: file.size, content_type: file.type };
+    if (path === "/media/assets/direct-failed/upload-intent") return { aborted: true };
+    throw new Error(`unexpected multipart or completion path ${path}`);
+  });
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 503 });
+  try {
+  await assert.rejects(uploadDurablePlatformAsset(a.client, { file, idempotencyKey: "canvas-cos-failure" }), { code: "APP_MEDIA_DIRECT_UPLOAD_FAILED" });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+  assert.deepEqual(a.calls.map(call => [call.path, call.options?.method]), [
+    ["/media/assets/upload-intents", "POST"],
+    ["/media/assets/direct-failed/upload-intent", "DELETE"],
+  ]);
+});
+
+test("an invalid pending upload intent is aborted so its quota reservation can be released", async () => {
+  const file = new File([new Uint8Array(9 * 1024 * 1024)], "mismatch.mp4", { type: "video/mp4" });
+  const a = api((path) => {
+    if (path === "/media/assets/upload-intents") return { asset_id: "direct-mismatch", status: "pending", upload_url: "https://cos.example.test/staging", size_bytes: file.size - 1, content_type: file.type };
+    if (path === "/media/assets/direct-mismatch/upload-intent") return { aborted: true };
+    throw new Error(`unexpected path ${path}`);
+  });
+  await assert.rejects(uploadDurablePlatformAsset(a.client, { file, idempotencyKey: "canvas-invalid-intent" }), { code: "APP_MEDIA_UPLOAD_PROTOCOL_ERROR" });
+  assert.deepEqual(a.calls.map(call => [call.path, call.options?.method]), [
+    ["/media/assets/upload-intents", "POST"],
+    ["/media/assets/direct-mismatch/upload-intent", "DELETE"],
+  ]);
 });

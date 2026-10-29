@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveCloudDocumentVersion } from "../src/cloud-version.ts";
+import { canvasContentSignature, resolveCloudDocumentVersion } from "../src/cloud-version.ts";
 import type { Document } from "../src/canvas-types.ts";
 
 const document = (updatedAt: string, text: string): Document => ({
@@ -23,7 +23,7 @@ const document = (updatedAt: string, text: string): Document => ({
   viewport: { x: 0, y: 0, zoom: 1 },
 });
 
-const signature = (value: Document) => JSON.stringify(value.nodes);
+const signature = canvasContentSignature;
 const revision = (value: Document) => JSON.stringify(value);
 
 test("identical versions are treated as synchronized", () => {
@@ -68,7 +68,7 @@ test("equal timestamps with different content remain recoverable", () => {
   );
 });
 
-test("matching content with a newer local revision still syncs the newer version", () => {
+test("matching content with a newer local revision stays synchronized", () => {
   const local = document("2026-09-17T01:05:00.000Z", "same content");
   const remote = {
     ...structuredClone(local),
@@ -77,11 +77,11 @@ test("matching content with a newer local revision still syncs the newer version
   };
   assert.equal(
     resolveCloudDocumentVersion(local, remote, signature, revision),
-    "prefer-local",
+    "same",
   );
 });
 
-test("matching content with a newer cloud revision still hydrates the newer version", () => {
+test("matching content with a newer cloud revision stays synchronized", () => {
   const local = document("2026-09-17T01:04:00.000Z", "same content");
   const remote = {
     ...structuredClone(local),
@@ -90,6 +90,57 @@ test("matching content with a newer cloud revision still hydrates the newer vers
   };
   assert.equal(
     resolveCloudDocumentVersion(local, remote, signature, revision),
-    "prefer-cloud",
+    "same",
   );
+});
+
+test("camera movement and save timestamps do not create a competing version", () => {
+  const local = document("2026-09-17T01:06:00.000Z", "same content");
+  const remote = {
+    ...structuredClone(local),
+    updatedAt: "2026-09-17T01:07:00.000Z",
+    viewport: { x: -240, y: 90, zoom: 1.6 },
+  };
+
+  assert.equal(signature(local), signature(remote));
+  assert.equal(resolveCloudDocumentVersion(local, remote, signature, revision), "same");
+});
+
+test("temporary task and media delivery changes do not create a competing version", () => {
+  const local = document("2026-09-17T01:08:00.000Z", "same content");
+  local.nodes[0] = {
+    ...local.nodes[0],
+    status: "queued",
+    error: "正在提交",
+    videoPollingPaused: false,
+    videoPollingReason: "reconciliation",
+    taskDiagnostic: { phase: "submitting", requestId: "request-1" },
+    imageThumbnail: "https://example.test/thumbnail?signature=old",
+    uploadState: "uploading",
+    uploadProgress: 20,
+  };
+  const remote = structuredClone(local);
+  remote.updatedAt = "2026-09-17T01:09:00.000Z";
+  remote.nodes[0] = {
+    ...remote.nodes[0],
+    status: "failed",
+    error: "任务暂时失败",
+    videoPollingPaused: true,
+    videoPollingReason: "user",
+    taskDiagnostic: { phase: "processing", requestId: "request-2" },
+    imageThumbnail: "https://example.test/thumbnail?signature=new",
+    uploadState: "completing",
+    uploadProgress: 95,
+  };
+
+  assert.equal(signature(local), signature(remote));
+  assert.equal(resolveCloudDocumentVersion(local, remote, signature, revision), "same");
+});
+
+test("authored content changes remain visible as a new cloud version", () => {
+  const local = document("2026-09-17T01:10:00.000Z", "local edit");
+  const remote = document("2026-09-17T01:11:00.000Z", "cloud edit");
+
+  assert.notEqual(signature(local), signature(remote));
+  assert.equal(resolveCloudDocumentVersion(local, remote, signature, revision), "prefer-cloud");
 });

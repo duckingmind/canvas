@@ -3,6 +3,8 @@
  * production request, model call, or extra package installation is needed.
  * CANVAS_PLAYWRIGHT_MODULE may point to an existing playwright/index.mjs.
  * CANVAS_VIDEO_INTERACTION_ONLY=1 runs the local node/player interaction checks.
+ * CANVAS_VIDEO_DETAIL_ONLY=1 runs the detail playback ownership checks without
+ * the longer editing and delivery fixture sections.
  * CANVAS_VIDEO_DELIVERY_ONLY=1 runs only the signed-URL delivery regression.
  */
 import assert from "node:assert/strict";
@@ -252,6 +254,21 @@ try {
   assert.equal(toolbarHitOwner, "wide-video", "the selected video toolbar stays above a later overlapping canvas layer");
   passed("the selected video toolbar remains visible and interactive above an overlapping sibling layer");
 
+  await eventually(async () => !(await mediaState("wide-video")).paused, "selected canvas video autoplay starts");
+  await useVideoTool("裁剪视频");
+  const trimWorkspace = page.getByRole("dialog", { name: "裁剪视频", exact: true });
+  await trimWorkspace.waitFor();
+  const trimPreview = trimWorkspace.locator("video");
+  await eventually(async () => (await mediaState("wide-video")).paused, "opening a video editor pauses the selected canvas preview");
+  await eventually(async () => await trimPreview.evaluate(element => element.readyState >= 2 && element.paused), "the trim preview loads paused and does not autoplay");
+  await trimWorkspace.getByRole("button", { name: "播放选中区间", exact: true }).first().click();
+  await eventually(async () => !(await trimPreview.evaluate(element => element.paused)), "the editor takes playback when its preview is started");
+  assert.equal((await mediaState("wide-video")).paused, true, "the canvas source stays paused while the editor preview plays");
+  await trimWorkspace.getByRole("button", { name: "取消", exact: true }).click();
+  await trimWorkspace.waitFor({ state: "hidden" });
+  await eventually(async () => !(await mediaState("wide-video")).paused, "closing the editor returns playback to the selected canvas node");
+  passed("selected-node playback transfers exclusively to the editor preview and returns to the canvas when editing closes");
+
   await video("wide-video").evaluate(element => element.pause());
   await page.mouse.move(25, 70);
   await eventually(async () => (await mediaState("wide-video")).paused, "leaving the selected video stops its initial hover");
@@ -345,15 +362,18 @@ try {
   passed("video surface and node caption both drag and remain undoable");
 
   await video("wide-video").click({ position: { x: 70, y: 55 } });
+  const directDownload = node("wide-video").locator(".node-toolbar").getByRole("button", { name: "下载视频", exact: true });
+  assert.equal(await directDownload.count(), 1, "selected media exposes download in the primary toolbar");
   const nodeActions = page.getByRole("button", { name: "节点操作", exact: true });
   await nodeActions.click();
   const nodeActionsMenu = page.getByRole("menu", { name: "节点操作菜单", exact: true });
   await nodeActionsMenu.waitFor();
-  for (const name of ["复制节点", "下载视频", "删除节点"]) {
+  for (const name of ["复制节点", "删除节点"]) {
     assert.equal(await nodeActionsMenu.getByRole("menuitem", { name, exact: true }).count(), 1);
   }
+  assert.equal(await nodeActionsMenu.getByRole("menuitem", { name: "下载视频", exact: true }).count(), 0, "download is no longer hidden in node actions");
   await page.keyboard.press("Escape");
-  passed("node management actions are grouped in one accessible menu");
+  passed("media downloads are exposed in the primary toolbar while node management stays in one accessible menu");
   await button("节点属性").click();
   const nodeInspector = page.locator('.inspector[aria-label="节点属性"]');
   await nodeInspector.waitFor({ state: "visible" });
@@ -393,6 +413,9 @@ try {
   passed("wide and compact players keep every visible control inside their bounds");
 
   if (!process.env.CANVAS_VIDEO_INTERACTION_ONLY) {
+  // The detail-only mode skips the long editing/replacement chain so the
+  // playback ownership contract can be debugged independently.
+  if (!process.env.CANVAS_VIDEO_DETAIL_ONLY) {
   await progress.focus(); await progress.press("End");
   for (let index = 0; index < 3; index++) await progress.press("ArrowLeft");
   await eventually(async () => !(await video("wide-video").evaluate(element => element.seeking)), "seek finishes before capture");
@@ -403,12 +426,16 @@ try {
   await videoTools.click();
   const videoToolsMenu = page.getByRole("menu", { name: "视频工具菜单", exact: true });
   await videoToolsMenu.waitFor();
-  assert.equal(await videoToolsMenu.getByRole("menuitem").count(), 12, "the menu contains editing and frame capture tools only");
-  for (const group of ["剪辑与导出", "画面", "声音"]) {
+  assert.equal(await videoToolsMenu.getByRole("menuitem").count(), 7, "the menu contains the supported editing and frame capture tools only");
+  for (const group of ["剪辑与处理", "画面", "声音"]) {
     assert.equal(await videoToolsMenu.getByRole("group", { name: group, exact: true }).count(), 1, `${group} tools are grouped for scanning`);
   }
-  for (const name of ["提取视频", "提取音频", "旋转", "镜像", "调整速度", "文字水印", "移除音轨"]) {
+  for (const name of ["提取视频", "提取音频"]) {
     assert.equal(await videoToolsMenu.getByRole("menuitem", { name, exact: true }).isEnabled(), true, `${name} is implemented locally`);
+  }
+  assert.equal(await videoToolsMenu.getByRole("menuitem", { name: "调整速度", exact: true }).count(), 0, "speed adjustment is removed from the video tools menu");
+  for (const name of ["基础调色", "旋转", "镜像", "文字水印", "移除音轨"]) {
+    assert.equal(await videoToolsMenu.getByRole("menuitem", { name, exact: true }).count(), 0, `${name} is removed from the video tools menu`);
   }
   assert.equal(await videoToolsMenu.getByRole("menuitem", { name: "格式转换", exact: true }).count(), 0, "format conversion is no longer offered in the video menu");
   for (const name of ["下载原视频", "替换视频"]) {
@@ -461,11 +488,31 @@ try {
     if (element.seeking) await new Promise(resolve => element.addEventListener("seeked", resolve, { once: true }));
   });
   const sourceBeforeAudioExtraction = await mediaState("wide-video");
+  // Hold the durable-upload handoff long enough to assert the inline cancel
+  // path deterministically even when local packet extraction is very fast.
+  const delayAudioUpload = async route => { await pause(800); await route.continue().catch(() => {}); };
+  await page.route("**/v1/media/assets/upload-intents", delayAudioUpload);
   await useVideoTool("提取音频");
   const audioExtractionDialog = page.getByRole("dialog", { name: "提取音频", exact: true });
-  await audioExtractionDialog.waitFor();
-  assert.equal(await audioExtractionDialog.getByLabel("开始时间").count(), 0, "audio extraction has no parameter form");
-  assert.equal(await audioExtractionDialog.getByLabel("输出格式").count(), 0, "audio extraction does not ask for an output format");
+  assert.equal(await audioExtractionDialog.count(), 0, "audio extraction does not open a modal");
+  const audioProcessNode = page.locator('.node.audio:has(.audio-extract-process)');
+  await audioProcessNode.waitFor();
+  assert.equal(await player("wide-video").locator(".canvas-video-process").count(), 0, "audio extraction does not overlay progress on the source video");
+  assert.equal(await audioProcessNode.getByRole("progressbar", { name: "音频提取进度", exact: true }).count(), 1, "audio extraction renders progress in the target node");
+  assert.equal(await audioProcessNode.getByRole("button", { name: "取消提取", exact: true }).count(), 1, "target audio extraction remains cancellable");
+  await audioProcessNode.getByRole("button", { name: "取消提取", exact: true }).click();
+  await eventually(async () => await audioProcessNode.count() === 0, "cancelling audio extraction removes the unfinished target node");
+  assert.equal(await page.locator('.node[data-node-id]').count(), 4, "cancelling audio extraction does not leave a result node");
+  await page.unroute("**/v1/media/assets/upload-intents", delayAudioUpload);
+  await focusCanvas(); await page.keyboard.press("ControlOrMeta+z");
+  await eventually(async () => await node(extractedVideoNode.id).count() === 0, "cancelled extraction leaves no empty undo step");
+  await page.keyboard.press("ControlOrMeta+Shift+z");
+  await eventually(async () => await node(extractedVideoNode.id).count() === 1, "redo restores the prior video extraction after cancellation");
+
+  // A second click starts the same parameter-free operation again and lets it
+  // complete, proving that cancellation leaves the source ready for retry.
+  await useVideoTool("提取音频");
+  assert.equal(await page.getByRole("dialog", { name: "提取音频", exact: true }).count(), 0, "retrying audio extraction still avoids a modal");
   await eventually(async () => (await page.locator('.node[data-node-id]').count()) >= 5, "audio extraction inserts a new canvas node");
   const sourceAfterAudioExtraction = await mediaState("wide-video");
   assert.equal(sourceAfterAudioExtraction.time, sourceBeforeAudioExtraction.time, "audio extraction restores the source playback position");
@@ -497,7 +544,19 @@ try {
   assert.ok(extractedAudioSamples.duration > 4, `audio extraction preserves the full track duration: ${extractedAudioSamples.duration}`);
   assert.ok(extractedAudioSamples.rms > 0.005, `audio extraction contains audible source samples: ${extractedAudioSamples.rms}`);
   measurements.extractedAudioSamples = extractedAudioSamples;
-  passed("audio extraction creates and selects a local audio node without a media download or parameter form");
+  const extractedAudioPlayer = node(extractedAudioNode.id).locator("[data-canvas-media-player]");
+  await extractedAudioPlayer.getByRole("button", { name: "播放", exact: true }).click();
+  await extractedAudioPlayer.locator("audio").evaluate(audio => { audio.currentTime = Math.max(0, audio.duration - 0.16); });
+  await eventually(async () => await extractedAudioPlayer.locator("audio").evaluate(audio => audio.ended), "audio playback reaches its completed state");
+  assert.equal(await extractedAudioPlayer.getByRole("button", { name: "重新播放", exact: true }).count(), 1, "the ended player identifies its action as replay");
+  await extractedAudioPlayer.getByRole("button", { name: "重新播放", exact: true }).click();
+  await eventually(async () => await extractedAudioPlayer.locator("audio").evaluate(audio => !audio.paused && audio.currentTime < 0.5), "replay restarts the audio at the beginning");
+  await extractedAudioPlayer.locator("audio").evaluate(audio => audio.pause());
+  const extractedAudioNodeLocator = node(extractedAudioNode.id);
+  await extractedAudioNodeLocator.getByRole("button", { name: "节点操作", exact: true }).click();
+  assert.equal(await page.getByRole("menu", { name: "节点操作菜单" }).getByRole("menuitem", { name: "放大预览", exact: true }).count(), 1, "the larger preview is available from the secondary actions");
+  assert.equal(await node(extractedAudioNode.id).getByRole("button", { name: "预览音频", exact: true }).count(), 0, "the toolbar does not repeat the inline player's preview action");
+  passed("audio extraction runs in the target node, remains cancellable, and creates a selected local audio node without a modal or parameter form");
 
   // Both derived nodes are regular document transactions and must participate
   // in undo/redo and reload recovery just like a manually inserted asset.
@@ -525,6 +584,10 @@ try {
   await player(extractedVideoNode.id).waitFor();
   await eventually(async () => (await mediaState(extractedVideoNode.id)).readyState >= 2, "the extracted local video can be played after reload");
   await video(extractedVideoNode.id).click({ position: { x: 70, y: 55 } });
+  await video(extractedVideoNode.id).evaluate(async element => {
+    element.pause(); element.currentTime = 1.5;
+    if (element.seeking) await new Promise(resolve => element.addEventListener("seeked", resolve, { once: true }));
+  });
   const localVideoBeforeExtraction = await mediaState(extractedVideoNode.id);
   await useVideoTool("提取视频");
   await eventually(async () => (await page.locator('.node[data-node-id]').count()) === reloadedDocument.nodes.length + 1, "re-extracting a local video inserts an independent node");
@@ -546,23 +609,12 @@ try {
   assert.equal(await node(extractedVideoNode.id).count(), 1, "undo keeps the shared cache source node");
   passed("repeated local-video extraction shares the original cached bytes without disturbing source playback or undo ownership");
 
-  await video("wide-video").click({ position: { x: 70, y: 55 } });
-  await video("wide-video").evaluate((element, time) => { element.pause(); element.currentTime = time; }, measurements.capturedTime);
-  await eventually(async () => !(await video("wide-video").evaluate(element => element.seeking)), "restore the pre-reload playhead for later frame checks");
-  await useVideoTool("文字水印");
-  const watermarkDialog = page.getByRole("dialog", { name: "文字水印", exact: true });
-  assert.equal(await watermarkDialog.getByRole("button", { name: "开始处理", exact: true }).isEnabled(), false, "watermark export requires text");
-  await watermarkDialog.getByLabel("水印文字").fill("LOCAL TEST");
-  assert.equal(await watermarkDialog.getByRole("button", { name: "开始处理", exact: true }).isEnabled(), true, "watermark export is enabled when text is provided");
-  await watermarkDialog.getByRole("button", { name: "取消", exact: true }).click();
-  await useVideoTool("调整速度");
-  const speedDialog = page.getByRole("dialog", { name: "调整速度", exact: true });
-  const processingStarted = Date.now();
-  await speedDialog.getByRole("button", { name: "开始处理", exact: true }).click();
-  await speedDialog.getByRole("button", { name: "取消处理", exact: true }).click();
-  await speedDialog.waitFor({ state: "hidden", timeout: 2000 });
-  assert.ok(Date.now() - processingStarted < 2000, "cancel exits recording instead of waiting for the export timeout");
-  passed("video tool cancellation closes the active recording immediately");
+  await video("wide-video").evaluate((element, time) => {
+    element.pause();
+    const end = Number.isFinite(element.duration) && element.duration > 0 ? Math.max(0, element.duration - 0.1) : time;
+    element.currentTime = Math.min(time, end);
+  }, measurements.capturedTime);
+  await eventually(async () => !(await video("wide-video").evaluate(element => element.seeking)), "restore the capture playhead after processing");
   await useVideoTool("截取当前帧");
   await eventually(async () => await page.locator(".node.image img.node-image").count() === 1, "captured image node is added");
   await page.locator(".node.image img.node-image").evaluate(image => image.decode());
@@ -634,14 +686,18 @@ try {
   for (const key of ["taskId", "assetId", "videoContentUrl", "taskDiagnostic"]) assert.equal(redoneVideo[key], undefined, `replacement redo does not resurrect ${key}`);
   assert.notEqual(redoneVideo.videoPoster, oldPoster);
   passed("replacement undo restores the original source and identity; redo restores only the new media");
+  }
 
   await fitCanvas();
   await video("wide-video").dblclick({ position: { x: 70, y: 55 } });
   const gallery = page.getByRole("dialog", { name: "视频预览", exact: true });
   await gallery.waitFor();
+  await eventually(async () => (await mediaState("wide-video")).paused, "opening details pauses the selected canvas video");
   const galleryPlayer = gallery.locator("[data-canvas-media-player]"), galleryVideo = galleryPlayer.locator("video");
   const galleryMediaState = () => galleryVideo.evaluate(element => ({ paused: element.paused, muted: element.muted, volume: element.volume, readyState: element.readyState }));
   await eventually(async () => { const state = await galleryMediaState(); return state.readyState >= 2 && !state.paused && !state.muted && state.volume > 0; }, "gallery starts playing with sound by default");
+  await pause(350);
+  assert.equal((await mediaState("wide-video")).paused, true, "canvas source remains paused while the detail player owns playback");
   assert.equal(await page.evaluate(() => Boolean(document.fullscreenElement)), false);
   await galleryPlayer.getByRole("button", { name: "全屏", exact: true }).click();
   await eventually(() => page.evaluate(() => Boolean(document.fullscreenElement)), "gallery enters browser fullscreen");
@@ -659,6 +715,7 @@ try {
   await eventually(() => page.evaluate(() => !document.fullscreenElement), "gallery leaves fullscreen before closing");
   await button("关闭画廊").click();
   await gallery.waitFor({ state: "hidden" });
+  await eventually(async () => !(await mediaState("wide-video")).paused, "closing details restores playback to the selected canvas video");
   passed("gallery and fullscreen default to audible playback while fullscreen transitions preserve explicit mute");
 
   await focusCanvas();
@@ -686,7 +743,7 @@ try {
   }
   }
 
-  if (!process.env.CANVAS_VIDEO_INTERACTION_ONLY) {
+  if (!process.env.CANVAS_VIDEO_INTERACTION_ONLY && !process.env.CANVAS_VIDEO_DETAIL_ONLY) {
   // Serve the browser-recorded video on a different local origin, with a
   // signature in the ordinary task/asset response. No signing API exists.
   const deliveryAssetId = "signed-video-asset", deliveryTaskId = "signed-video-task";
@@ -718,8 +775,7 @@ try {
   const beforeDownload = (await fixtureState()).requests.length;
   await node("signed-video").locator(".node-caption").click();
   const downloadedVideo = page.waitForEvent("download");
-  await button("节点操作").click();
-  await page.getByRole("menu", { name: "节点操作菜单", exact: true }).getByRole("menuitem", { name: "下载视频", exact: true }).click();
+  await node("signed-video").locator(".node-toolbar").getByRole("button", { name: "下载视频", exact: true }).click();
   const savedVideo = await downloadedVideo;
   assert.match(savedVideo.suggestedFilename(), /\.webm$/);
   assert.deepEqual(await readFile(await savedVideo.path()), Buffer.from(originalVideo.split(",")[1], "base64"));
@@ -806,6 +862,16 @@ try {
       assert(shortCalls === 0, "rendering a delivered unexpired source must not request a signature refresh");
       results.shortRemainingLifetimePlayable = true;
 
+      await freshRoot();
+      let galleryRetries = 0;
+      renderPreview(nodeFor(`${signedURL}#gallery-cors-fallback`), () => { galleryRetries++; return true; });
+      await until(() => media()?.readyState >= 2 && media()?.crossOrigin === "anonymous", "gallery starts in anonymous CORS mode");
+      Object.defineProperty(media(), "error", { configurable: true, value: { code: 4 } });
+      media().dispatchEvent(new Event("error"));
+      await until(() => media()?.getAttribute("crossorigin") === null && media()?.readyState >= 2, "gallery retries cross-origin playback without requiring CORS response headers");
+      assert(galleryRetries === 0, "CORS playback fallback must not spend the signed-URL refresh retry");
+      results.galleryCorsPlaybackFallback = true;
+
       for (const component of ["gallery", "canvas"]) {
         await freshRoot();
         let retries = 0;
@@ -828,6 +894,7 @@ try {
   }, { signedURL: delivery.content_url, assetId: deliveryAssetId });
   passed("same-id source replacement ignores a late failure from the previous gallery recovery");
   passed("gallery plays a delivered URL with less than 30 seconds remaining without treating it as expired");
+  passed("gallery falls back to direct cross-origin playback when CORS mode rejects a playable media URL");
   passed("gallery and canvas each recover automatically only once across error, loadeddata, and a later error");
   await control({ videoCorsEnabled: false });
   const withoutCors = await openDeliveryDocument("video-delivery-no-cors", {});

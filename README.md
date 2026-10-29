@@ -2,7 +2,7 @@
 
 Canvas 是一个基于 React、Vite 和 Proxy App SDK 的节点式创作工作台。它把提示词、参考素材和图片、视频、音乐任务放在同一张可恢复画布中，支持本地草稿、任务恢复、资产库和键盘/触控操作。
 
-本目录可以独立安装、类型检查、构建、校验、打包和运行测试。SDK 与 Proxy App CLI 通过公共 npm 包提供；正式平台授权与应用登记仍由平台服务负责。当前公开项目范围是 Web 应用，不包含桌面宿主或 Electron 发行包。
+Canvas 在平台工作区的 `apps/canvas` 目录中构建。SDK 使用 npm 包，Proxy App CLI 使用同一工作区 `app/cli` 的源码链接，确保构建契约和运行时注册实现保持一致；正式平台授权与应用登记仍由平台服务负责。当前公开项目范围是 Web 应用，不包含桌面宿主或 Electron 发行包。
 
 ## 快速开始
 
@@ -16,7 +16,7 @@ npm test
 npm run dev
 ```
 
-`npm run dev` 通过公共 Proxy App CLI 包启动本地开发代理和 Vite 服务，并按配置连接平台。只启动 Vite 可使用 `npm run dev:server`；测试 fixture 会自行提供临时认证端点。
+`npm run dev` 通过工作区 Proxy App CLI 启动本地开发代理和 Vite 服务，并按配置连接平台。只启动 Vite 可使用 `npm run dev:server`；测试 fixture 会自行提供临时认证端点。
 
 ## 版本规则
 
@@ -34,6 +34,7 @@ npm run dev
 | `npm run pack` | 重建、校验并生成 `dist/canvas.zip` |
 | `npm test` | 运行默认单元测试 |
 | `npm run test:e2e:creator` | 使用本机 fixture 运行一个 Playwright 创作回归 |
+| `npm run test:e2e:canvas-switch` | 验证画布切换反馈、就绪过渡和失败保留旧画布 |
 
 Playwright 回归是可选检查。首次运行前安装浏览器：
 
@@ -50,7 +51,7 @@ npm run test:e2e:creator
 canvas/
 ├── src/                 React 页面、画布领域逻辑和平台适配
 │   ├── shared/          Canvas 自带的无副作用状态/诊断 helper 和设计 token
-│   ├── agent-tools.mjs  Agent 能力声明（宿主构建时读取）
+│   ├── agent-tools.mjs  Agent 注册实现；CLI 执行它生成发布能力目录
 │   └── network-boundary.ts  浏览器请求边界
 ├── tests/               默认单元测试和可选浏览器回归
 ├── docs/                架构、交互、状态和资产库说明
@@ -67,6 +68,8 @@ canvas/
 Canvas 的业务请求通过 App Session Gateway 的 `/v1` 路径发送。浏览器端不应调用宿主管理接口，也不应把令牌写入画布文档。`src/network-boundary.ts` 对原生媒体请求执行额外检查：只允许当前 Gateway 路径、内联/Blob 资源或带已知对象签名的外部媒体，并拒绝管理路径、回环地址和私有网络地址。生产宿主仍需同时配置自己的 CSP 和网络策略。
 
 Canvas 不在本目录保存平台密钥。开发授权由本地 CLI/Relay 转交平台处理，运行用户授权由 App Session 负责；本地 fixture 使用临时账户范围和固定测试数据。
+
+云端画布文档会避开通用 KV 的单值限制：240 KiB 以内沿用单值保存，超过后自动使用不可变分块和小型清单；清单在所有分块确认后才与同步标记一起提交。分块按内容指纹复用，普通局部编辑只增加变化部分；读取会校验总字节数和 SHA-256，旧版本在两分钟宽限期内保留，之后由成功的大画布保存或列表读取触发孤儿分块回收。画布文档自身上限为 16 MiB，平台通用 KV 的 256 KiB 单值和 1 MiB 批量限制不变。账户总 KV 额度仍按平台方案执行，分块不会绕过该额度。
 
 ## 测试与验证
 

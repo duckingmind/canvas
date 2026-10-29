@@ -1,12 +1,13 @@
 import { configureGeneration, generationParameters, type AgentImageSettings, type AgentMusicSettings, type AgentVideoSettings } from './agent-settings.ts'
 import { AGENT_MEDIA_CHUNK_BYTES, AGENT_MEDIA_MAX_BYTES, bytesBase64, createImageUploads, sha256 } from './agent-media.ts'
-import type { CanvasNode, Document, Model } from './canvas-types.ts'
-import { arrangeNodes } from './geometry.ts'
+import type { CanvasNode, Document, Model, StoredAsset } from './canvas-types.ts'
+import { arrangeSmartNodes } from './geometry.ts'
 import { rebuildGroupState } from './group-interaction.ts'
 import { canReceiveNodeConnection, canStartNodeConnection } from './node-interaction.ts'
 import { canLoadVideoContent, videoTaskControls } from './video-task-state.ts'
 import { canLoadAudioContent } from './audio-source.ts'
 import { compatibleMusicModels } from './music-models.ts'
+import { canEnterMediaScheduler } from './video-models.ts'
 import { isTTSNode } from './audio-creation.ts'
 import { mediaTaskPublicState, mediaTaskState } from './shared/media-task-state.ts'
 
@@ -14,6 +15,8 @@ export type CanvasAgentAdapter = {
   getDocument(): Document
   beforeWrite(): void
   commit(change: (current: Document) => Document): void
+  /** Optional shared transaction boundary used to pause conflicting UI edits. */
+  setAgentWriteLock?(locked: boolean): void
   persist(document: Document): Promise<void>
   canWrite(): boolean
   getModels?(): Model[]
@@ -23,12 +26,14 @@ export type CanvasAgentAdapter = {
   cancelGeneration?(node: CanvasNode, key: string, signal: AbortSignal): Promise<{ status: string; cancelled: boolean }>
   readMedia?(node: CanvasNode, signal: AbortSignal): Promise<Blob>
   imageSize?(dataUrl: string): Promise<{ width: number; height: number }>
+  /** Persist an agent-uploaded image in the platform COS asset store. */
+  uploadImage?(file: File, idempotencyKey: string, signal: AbortSignal): Promise<StoredAsset>
 }
 export type CanvasAgentContext = { signal: AbortSignal }
 export type CanvasWriteArgs = { document_id: string; expected_revision: string; idempotency_key: string }
 type NodeInput = { type: 'note' | 'prompt'; title: string; text: string; x?: number; y?: number; media_type?: 'image' | 'video' | 'audio'; model_id?: string }
 type NodePatch = { node_id: string; title?: string; text?: string; x?: number; y?: number; width?: number; height?: number; model_id?: string }
-const fail = (code: string, message: string): never => { throw Object.assign(new Error(message), { code, executionStarted: false }) }
+const fail = (code: string, message: string, details: Record<string, unknown> = {}): never => { throw Object.assign(new Error(message), { code, executionStarted: false, ...details }) }
 const page = (input: { offset?: number; limit?: number }) => {
   const offset = input.offset ?? 0, limit = input.limit ?? 50
   if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) fail('CANVAS_INVALID_ARGUMENT', 'Invalid pagination')
@@ -44,7 +49,7 @@ const geometry = (input: { x?: number; y?: number; width?: number; height?: numb
     if (value !== undefined && (!Number.isFinite(value) || Math.abs(value) > 100000 || (key === 'width' || key === 'height') && (value < 40 || value > 4000))) fail('CANVAS_INVALID_ARGUMENT', `Invalid ${key}`)
   }
 }
-const hasMedia = (node: CanvasNode) => Boolean(node.image || node.localImage || node.video || node.videoContentUrl) || canLoadVideoContent(node) || canLoadAudioContent(node)
+const hasMedia = (node: CanvasNode) => Boolean(node.image || node.video || node.videoContentUrl || (node.assetId && (node.type === 'image' || node.mediaType === 'image'))) || canLoadVideoContent(node) || canLoadAudioContent(node)
 const audioMode = (node: CanvasNode) => node.audioMode ?? (node.mediaType === 'audio' || node.type === 'audio' ? node.audioTaskType === 'tts' || node.ttsSubmission ? 'tts' : node.audioTaskType === 'voice_design' || node.voiceDesignSubmission ? 'voice_design' : 'music' : null)
 const requireSupportedGeneration = (node: CanvasNode) => {
   if (node.mediaType === 'audio' && (node.audioMode === 'tts' || isTTSNode(node))) fail('CANVAS_FEATURE_UNAVAILABLE', 'Canvas does not support text-to-speech creation')
@@ -53,6 +58,25 @@ const requireSupportedGeneration = (node: CanvasNode) => {
 const errorSummary = (value?: string) => value ? value.replace(/(?:https?:\/\/|file:\/\/|blob:|data:)[^\s<>"']+/gi, '[URL omitted]').slice(0, 2000) : null
 const nodeSummary = (node: CanvasNode) => ({ id: node.id, type: node.type, title: node.title.slice(0, 200), text: node.text.slice(0, 1024), textTruncated: node.text.length > 1024, x: node.x, y: node.y, width: node.width, height: node.height, groupId: node.groupId ?? null, mediaType: node.mediaType ?? null, audioMode: audioMode(node), modelId: node.modelId ?? null, imageSettings: node.imageSettings ? JSON.parse(JSON.stringify(node.imageSettings)) : null, videoSettings: node.videoSettings ? JSON.parse(JSON.stringify(node.videoSettings)) : null, musicSettings: node.musicSettings ? JSON.parse(JSON.stringify(node.musicSettings)) : null, musicLyrics: node.musicLyrics ?? null, voicePreviewText: node.voicePreviewText ?? null, voiceId: node.voiceId ?? null, status: node.status || 'idle', taskId: node.taskId ?? null, resultOf: node.resultOf ?? null, hasMedia: hasMedia(node) })
 
+// The editor renders a completed creator task through its result cards. Keep
+// that same visibility rule when an Agent arranges a selected subset: a
+// complete visible-group selection includes hidden logical members, while a
+// partial selection temporarily becomes member-level layout input.
+const arrangementInput = (doc: Document, requested: CanvasNode[]) => {
+  const requestedIDs = new Set(requested.map(node => node.id))
+  const groupIDs = [...new Set(requested.map(node => node.groupId).filter((id): id is string => Boolean(id)))]
+  const completeGroups = new Set(groupIDs.filter(groupID => {
+    const members = doc.nodes.filter(node => node.groupId === groupID)
+    const visible = members.filter(node => !(node.type === 'prompt' && members.some(candidate => candidate.resultOf === node.id)))
+    return visible.length > 1 && visible.every(node => requestedIDs.has(node.id))
+  }))
+  const selectedIDs = new Set(requestedIDs)
+  doc.nodes.forEach(node => { if (node.groupId && completeGroups.has(node.groupId)) selectedIDs.add(node.id) })
+  return doc.nodes
+    .filter(node => selectedIDs.has(node.id))
+    .map(node => node.groupId && !completeGroups.has(node.groupId) ? { ...node, groupId: undefined } : node)
+}
+
 /** All mutations pass through the editor's existing undo/save path. */
 export function createCanvasAgent(adapter: CanvasAgentAdapter) {
   const session = crypto.randomUUID()
@@ -60,7 +84,7 @@ export function createCanvasAgent(adapter: CanvasAgentAdapter) {
   let writing = false
   const uploads = createImageUploads()
   const exports = new Map<string, { hash: string; bytes: Uint8Array; mime: string; identity: string; touched: number }>()
-  const mediaIdentity = (node: CanvasNode) => JSON.stringify([node.image, node.localImage, node.video, node.videoContentUrl, node.audio, node.localAudio, node.audioTaskType, node.assetId, node.taskId, node.resultBatchId])
+  const mediaIdentity = (node: CanvasNode) => JSON.stringify([node.image, node.video, node.videoContentUrl, node.audio, node.localAudio, node.audioTaskType, node.assetId, node.taskId, node.resultBatchId])
   const snapshot = () => {
     const doc = adapter.getDocument()
     if (doc !== previous) { previous = doc; version += 1 }
@@ -74,7 +98,11 @@ export function createCanvasAgent(adapter: CanvasAgentAdapter) {
   }
   const mutate = async (input: CanvasWriteArgs, context: CanvasAgentContext, change: (doc: Document) => Document, afterCommit?: () => void | Promise<void>) => {
     context.signal.throwIfAborted()
-    if (writing || !adapter.canWrite()) fail('CANVAS_BUSY', 'Canvas is navigating or another write is running')
+    if (writing) fail('CANVAS_BUSY', 'Canvas is navigating or another write is running')
+    // Readiness checks live at the document boundary so auth and draft
+    // recovery return their own actionable errors before any editor side effect.
+    adapter.getDocument()
+    if (!adapter.canWrite()) fail('CANVAS_BUSY', 'Canvas is navigating or another write is running')
     adapter.beforeWrite()
     const current = snapshot()
     if (input.document_id !== current.doc.id) fail('CANVAS_DOCUMENT_CHANGED', 'The active document changed; read_state again')
@@ -82,21 +110,41 @@ export function createCanvasAgent(adapter: CanvasAgentAdapter) {
     // Validate the complete operation before committing any part of a batch.
     const next = change(current.doc)
     writing = true
+    let writeLockHeld = false
     try {
       context.signal.throwIfAborted()
       adapter.commit(() => next)
-      await afterCommit?.()
+      // Capture the revision at the exact commit boundary.  An asynchronous
+      // side effect (submit/cancel) may legitimately update task diagnostics,
+      // and a user edit may arrive while it is running; neither is the
+      // revision applied by this operation.
       const applied = snapshot()
-      await adapter.persist(applied.doc)
-      return { documentId: applied.doc.id, appliedRevision: applied.revision, revision: snapshot().revision, savedLocally: true }
-    } finally { writing = false }
+      if (adapter.setAgentWriteLock) {
+        adapter.setAgentWriteLock(true)
+        writeLockHeld = true
+      }
+      await afterCommit?.()
+      // Apply queued editor changes before saving so the acknowledged local
+      // snapshot includes both the agent mutation and edits made while its
+      // asynchronous side effect was running.
+      if (writeLockHeld) {
+        adapter.setAgentWriteLock!(false)
+        writeLockHeld = false
+      }
+      const latest = snapshot()
+      await adapter.persist(latest.doc)
+      return { documentId: applied.doc.id, appliedRevision: applied.revision, revision: latest.revision, savedLocally: true }
+    } finally {
+      if (writeLockHeld) adapter.setAgentWriteLock!(false)
+      writing = false
+    }
   }
   const makeNode = (input: NodeInput, index = 0): CanvasNode => {
     if (!['note', 'prompt'].includes(input.type) || typeof input.title !== 'string' || input.title.length > 200 || typeof input.text !== 'string' || input.text.length > 20000) fail('CANVAS_INVALID_ARGUMENT', 'Invalid node type, title or text')
     geometry(input)
     if (input.media_type && !['image', 'video', 'audio'].includes(input.media_type)) fail('CANVAS_INVALID_ARGUMENT', 'Choose image, video or audio for a prompt node')
     if (input.type === 'note' && (input.media_type || input.model_id)) fail('CANVAS_INVALID_ARGUMENT', 'Only prompt nodes accept model settings')
-    if (input.model_id && !selectableModels().some(model => model.id === input.model_id && model.available !== false && (model.type || model.model_type) === (input.media_type || 'image'))) fail('CANVAS_MODEL_UNAVAILABLE', 'Choose an available model from list_models')
+    if (input.model_id && !selectableModels().some(model => model.id === input.model_id && canEnterMediaScheduler(model) && (model.type || model.model_type) === (input.media_type || 'image'))) fail('CANVAS_MODEL_UNAVAILABLE', 'Choose an available model from list_models')
     return { id: crypto.randomUUID(), type: input.type, title: input.title, text: input.text, x: input.x ?? 100 + index * 360, y: input.y ?? 100, width: 320, height: 240, color: '#fff4b8', ...(input.type === 'prompt' ? { mediaType: input.media_type || 'image', modelId: input.model_id, ...(input.model_id ? { modelSelection: 'user' as const } : {}), status: 'idle' as const } : {}) }
   }
   return {
@@ -133,7 +181,7 @@ export function createCanvasAgent(adapter: CanvasAgentAdapter) {
           geometry(patch)
           const node = nodes[index]
           if (patch.text !== undefined && !['note', 'prompt'].includes(node.type)) fail('CANVAS_INVALID_ARGUMENT', 'Generated media text is immutable')
-          if (patch.model_id !== undefined && (node.type !== 'prompt' || !selectableModels().some(model => model.id === patch.model_id && model.available !== false && (model.type || model.model_type) === (node.mediaType || 'image')))) fail('CANVAS_MODEL_UNAVAILABLE', 'Choose a compatible model from list_models')
+          if (patch.model_id !== undefined && (node.type !== 'prompt' || !selectableModels().some(model => model.id === patch.model_id && canEnterMediaScheduler(model) && (model.type || model.model_type) === (node.mediaType || 'image')))) fail('CANVAS_MODEL_UNAVAILABLE', 'Choose a compatible model from list_models')
           const { node_id, model_id, ...fields } = patch
           return [node_id, { ...node, ...fields, ...(model_id !== undefined ? { modelId: model_id, modelSelection: 'user' as const } : {}) }] as const
         }))
@@ -156,7 +204,13 @@ export function createCanvasAgent(adapter: CanvasAgentAdapter) {
         if (!canStartNodeConnection(source) || !canReceiveNodeConnection(target)) fail('CANVAS_INVALID_CONNECTION', 'Connection must join an eligible source and an editable target')
         if (doc.edges.some(edge => edge.from === source.id && edge.to === target.id)) fail('CANVAS_INVALID_CONNECTION', 'Connection already exists')
         const seen = new Set<string>(), queue = [target.id]
-        while (queue.length) { const id = queue.pop()!; if (id === source.id) fail('CANVAS_INVALID_CONNECTION', 'Connection would create a cycle'); if (seen.has(id)) continue; seen.add(id); for (const edge of doc.edges) if (edge.from === id) queue.push(edge.to) }
+        while (queue.length) {
+          const id = queue.pop()!
+          if (id === source.id) fail('CANVAS_INVALID_CONNECTION', 'Connection would create a cycle')
+          if (seen.has(id)) continue
+          seen.add(id)
+          for (const edge of doc.edges) if (edge.from === id) queue.push(edge.to)
+        }
         return { ...doc, edges: [...doc.edges, { id: edgeId, from: source.id, to: target.id }] }
       })
       return { ...result, edgeId }
@@ -170,15 +224,19 @@ export function createCanvasAgent(adapter: CanvasAgentAdapter) {
     },
     arrange_nodes(input: CanvasWriteArgs & { node_ids: string[] }, context: CanvasAgentContext) {
       return mutate(input, context, doc => {
-        const nodes = nodesByIds(doc, input.node_ids); idle(nodes)
-        const positions = new Map(arrangeNodes(nodes, doc.edges).map(node => [node.id, node]))
-        return { ...doc, ...rebuildGroupState(doc.nodes.map(node => positions.get(node.id) || node)) }
+        const requested = nodesByIds(doc, input.node_ids)
+        const nodes = arrangementInput(doc, requested); idle(nodes)
+        const positions = new Map(arrangeSmartNodes(nodes, doc.edges).map(node => [node.id, node]))
+        return { ...doc, ...rebuildGroupState(doc.nodes.map(node => {
+          const position = positions.get(node.id)
+          return position ? { ...node, x: position.x, y: position.y } : node
+        })) }
       })
     },
     save_document(input: CanvasWriteArgs, context: CanvasAgentContext) { return mutate(input, context, doc => doc) },
     list_models(input: { offset?: number; limit?: number } = {}) {
       const { offset, limit } = page(input), models = selectableModels()
-      return { models: models.slice(offset, offset + limit).map(model => ({ id: model.id!, name: model.name ?? null, type: model.type || model.model_type || null, available: model.available !== false, supportedInputModes: model.supported_input_modes ?? [], supportedOperations: model.supported_operations ?? [], maxInputImages: model.max_input_images ?? null, parameters: generationParameters(model) })), nextOffset: offset + limit < models.length ? offset + limit : null }
+      return { models: models.slice(offset, offset + limit).map(model => ({ id: model.id!, name: model.name ?? null, type: model.type || model.model_type || null, available: canEnterMediaScheduler(model), supportedInputModes: model.supported_input_modes ?? [], supportedOperations: model.supported_operations ?? [], maxInputImages: model.max_input_images ?? null, parameters: generationParameters(model) })), nextOffset: offset + limit < models.length ? offset + limit : null }
     },
     read_tasks(input: { offset?: number; limit?: number } = {}) {
       const { doc, revision } = snapshot(), { offset, limit } = page(input), tasks = doc.nodes.filter(node => node.type === 'prompt' && (node.status && node.status !== 'idle' || node.taskId || node.submission || node.videoSubmission || node.musicSubmission || node.voiceDesignSubmission || node.ttsSubmission))
@@ -213,14 +271,32 @@ export function createCanvasAgent(adapter: CanvasAgentAdapter) {
     },
     async import_image(input: CanvasWriteArgs & { upload_id: string; title: string; x?: number; y?: number }, context: CanvasAgentContext) {
       context.signal.throwIfAborted()
-      if (!adapter.imageSize) fail('CANVAS_MEDIA_UNAVAILABLE', 'Image decoding is unavailable')
+      if (!adapter.imageSize || !adapter.uploadImage) fail('CANVAS_MEDIA_UNAVAILABLE', 'COS image upload is unavailable')
+      const imageSize = adapter.imageSize!
+      const uploadImage = adapter.uploadImage!
       const staged = uploads.read(input.upload_id, input.document_id)
-      const size = await adapter.imageSize!(staged.dataUrl)
-      geometry({ ...input, ...size })
-      const node: CanvasNode = { id: crypto.randomUUID(), type: 'image', title: input.title, text: '', x: input.x ?? 100, y: input.y ?? 100, ...size, color: '#fff4b8', image: staged.dataUrl }
-      const result = await mutate(input, context, doc => ({ ...doc, nodes: [...doc.nodes, node] }))
-      uploads.remove(input.upload_id)
-      return { ...result, nodeId: node.id }
+      const extension = staged.mime.split('/', 2)[1]?.replace(/[^a-z0-9]+/gi, '') || 'png'
+      const file = new File([staged.bytes], `${input.title || 'canvas-image'}.${extension}`, { type: staged.mime })
+      const previewURL = URL.createObjectURL(file)
+      try {
+        const size = await imageSize(previewURL)
+        geometry({ ...input, ...size })
+        context.signal.throwIfAborted()
+        const asset = await uploadImage(file, `canvas-agent-${input.idempotency_key}`.slice(0, 128), context.signal)
+        context.signal.throwIfAborted()
+        if (!asset || asset.type !== 'image' || typeof asset.id !== 'string' || !asset.id.trim() || typeof asset.url !== 'string' || !/^https?:\/\//i.test(asset.url))
+          fail('CANVAS_MEDIA_UNAVAILABLE', 'COS did not return a durable image URL')
+        const node: CanvasNode = {
+          id: crypto.randomUUID(), type: 'image', title: input.title, text: '',
+          x: input.x ?? 100, y: input.y ?? 100, ...size, color: '#fff4b8',
+          image: asset.url, assetId: asset.id, status: 'completed',
+        }
+        const result = await mutate(input, context, doc => ({ ...doc, nodes: [...doc.nodes, node] }))
+        return { ...result, nodeId: node.id }
+      } finally {
+        URL.revokeObjectURL(previewURL)
+        uploads.remove(input.upload_id)
+      }
     },
     async read_media(input: { node_id: string; byte_offset?: number; expected_hash?: string }, context: CanvasAgentContext) {
       context.signal.throwIfAborted()
@@ -266,9 +342,11 @@ export function createCanvasAgent(adapter: CanvasAgentAdapter) {
         requireSupportedGeneration(node)
         const observation = { status: node.taskDiagnostic?.status || node.status, code: node.taskDiagnostic?.code, phase: node.taskDiagnostic?.phase, assetStatus: node.taskDiagnostic?.assetStatus, supplierConfirmationState: node.taskDiagnostic?.supplierConfirmation?.state }
         const lifecycle = mediaTaskState(observation), publicState = mediaTaskPublicState(observation)
-        const audioAllowsCancel = node.mediaType === 'audio' && ['queued', 'running'].includes(publicState) && !lifecycle.isTerminal && !lifecycle.requiresReconciliation
+        const audioAllowsCancel = node.mediaType === 'audio' && publicState === 'queued' && !lifecycle.isTerminal && !lifecycle.requiresReconciliation
         const canCancel = node.mediaType === 'video' ? videoTaskControls(node).canCancel : audioAllowsCancel
-        if (node.type !== 'prompt' || !node.taskId || !['running', 'queued'].includes(node.status || '') || !canCancel || !adapter.cancelGeneration) fail('CANVAS_TASK_NOT_CANCELLABLE', 'Cancellation requires a confirmed unresolved media task with a task ID; image task cancellation is not supported')
+        const rawStatus = String(observation.status || '').trim().toLowerCase()
+        const queuedBeforeDispatch = ['created', 'quoted', 'funds_reserved', 'pending', 'queued'].includes(rawStatus)
+        if (node.type !== 'prompt' || !node.taskId || !queuedBeforeDispatch || !canCancel || !adapter.cancelGeneration) fail('CANVAS_TASK_NOT_CANCELLABLE', 'Only queued media tasks can be cancelled; tasks that have started executing are not cancellable')
         return doc
       }, async () => { cancellation = await adapter.cancelGeneration!(node, input.idempotency_key, context.signal) })
       return { ...result, nodeId: node.id, cancellationRequested: true, ...cancellation }

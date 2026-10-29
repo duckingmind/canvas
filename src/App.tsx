@@ -2,13 +2,14 @@ import { storageDocument } from "./cloud-document.ts";
 export { storageDocument } from "./cloud-document.ts";
 import { beforeLocalAccountChange, captureLocalStorageScope } from "./local-storage-scope.ts";
 import React from "react";
-import { registerCanvasCapabilities } from "./agent-registration";
+import type { AgentHandler } from "@ducking-mind/proxy-app-sdk";
 import { createCanvasAgent, type CanvasAgentAdapter } from "./agent-capabilities";
 import { boundedMediaBlob, mediaFailure, AGENT_MEDIA_MAX_BYTES } from "./agent-media";
-import { flushSync } from "react-dom";
-import { agent, type AppProfile, type AppSdkError } from "@ducking-mind/proxy-app-sdk";
+import { createPortal, flushSync } from "react-dom";
+import { agent, MAX_APPLICATION_MEDIA_ASSET_BYTES, type AppProfile, type AppSdkError } from "@ducking-mind/proxy-app-sdk";
 import {
   ArrowDownToLine,
+  BookmarkPlus,
   Check,
   ChevronDown,
   Copy,
@@ -36,7 +37,6 @@ import {
   Redo2,
   Upload,
   X,
-  Layers,
   Layers2,
   SlidersHorizontal,
   Scan,
@@ -54,8 +54,10 @@ import {
   Image as ImageIcon,
   ImageOff,
   CircleAlert,
+  Library,
 } from "lucide-react";
-import { clampZoom, displayGridStep, fitViewport, zoomAt, zoomIndicatorPosition, minimapBounds, arrangeNodes, connectorPath, connectorPortSide, magneticPortDistance, magneticRadiusForZoom, nearestMagneticPort, dragThreshold, wheelViewport, pinchViewport, isRectInViewport, MAX_ZOOM, MIN_ZOOM, type PortSide } from "./geometry";
+import { clampZoom, displayGridStep, fitViewport, zoomAt, zoomIndicatorPosition, minimapBounds, arrangeSmartNodes, arrangeGroupMembers, layoutUnitCount, connectorPath, connectorPortSide, magneticPortDistance, magneticRadiusForZoom, nearestMagneticPort, dragThreshold, wheelViewport, pinchViewport, isRectInViewport, MAX_ZOOM, MIN_ZOOM, type PortSide } from "./geometry";
+import { applyPopoverPosition, observePopoverPosition, visiblePopoverBounds } from "./popover-position";
 import { ViewportMotion, type ViewportMotionMode } from "./viewport-motion";
 import { generateImage, ImageGenerationError } from "./generation";
 import { resolveImageSettings } from "./image-models";
@@ -70,21 +72,19 @@ import { packageCanvasAudio } from "./audio-backup";
 import { isLocalVideoKey, LOCAL_VIDEO_MAX_BYTES, storeLocalVideo, readLocalVideo, deleteLocalVideo } from "./video-cache";
 import { packageCanvasVideo } from "./video-backup";
 import { readMusicReferenceAudioBase64, readMusicReferenceAudioDuration, validateMusicReferenceAudio } from "./music-reference-audio";
-import { localMediaDataUrl } from "./local-media-reference";
 import { audioCreationInputs, audioCreationSignature, isLocalAudioKey, isTTSNode, isVoiceDesignNode, normalizeMusicReference, normalizeMusicSubmission, normalizeTTSSettings, normalizeTTSSubmission, normalizeVoiceDesignSubmission } from "./audio-creation";
 import { generateMusicLyrics } from "./music-lyrics";
 import { mediaTaskPublicState } from "./shared/media-task-state.ts";
 import type { VoiceDesignSubmission } from "./canvas-types";
 import type { VideoReference, VideoReferenceInput } from "./video-generation";
 import { readVideoSourceBlob, resolveVideoSource, videoSourceNeedsRefresh, type ResolvedVideoSource } from "./video-source";
-import { canCreateNewCanvasTask, canLoadVideoContent, canvasTaskRetryPolicy, canvasTaskState, isTaskCancelled, pendingTaskLabel, videoTaskSnapshotPatch } from "./video-task-state";
+import { canCreateNewCanvasTask, canLoadVideoContent, canRetryMissedSubmission, canvasTaskRetryPolicy, canvasTaskState, isSubmissionLookupMiss, isTaskCancelled, pendingTaskLabel, submissionRetryStartedDiagnostic, videoTaskSnapshotPatch } from "./video-task-state";
 import { extractVideoPoster } from "./video-poster";
-import { completedVideoMedia, replaceVideoNodeMedia, sameVideoNodeSource, VideoAutoRecoveryGuard, VideoNodeSourceGuard, videoAutoRecoveryKey, type VideoNodeSourceToken } from "./video-node-media";
+import { canReuseVideoContent, completedVideoMedia, replaceVideoNodeMedia, sameVideoNodeSource, VideoAutoRecoveryGuard, VideoNodeSourceGuard, videoAutoRecoveryKey, type VideoNodeSourceToken } from "./video-node-media";
 import { fitVideoNodeSize, videoAspectRatio } from "./video-layout";
+import { fitImageNodeSize, imageAspectRatioFromDimensions, imageAspectRatioFromSettings, imageNodeSizeFromSettings, type ImageNodeSize } from "./image-layout";
 import { formatVideoTime, isVideoPlayerGlobalShortcut, type CapturedVideoFrame } from "./video-player";
-import { cacheRemoteImage, getCachedRemoteImage, readCachedImage, storeInlineImages, restoreLocalImages } from "./image-cache";
 import { immutableImageUrlIdentity, isTemporaryMediaUrl, mediaUrlNeedsRefresh } from "./media-url-cache.ts";
-import { readHostCachedImage } from "./host-image-cache";
 import { recoverImageDelivery, recoveredImageOriginal } from "./image-delivery";
 import {
   ImageRecoveryGuard,
@@ -100,35 +100,40 @@ import HandDrawModal from "./HandDrawModal";
 import MediaPreview from "./MediaPreview";
 import { imageOriginalURL, imagePreviewURL, isCosImageURL } from "./image-variants";
 import ImageTools, { type ImageToolOutput } from "./ImageTools";
+import type { CharacterTurnaroundRequest } from "./CharacterTurnaroundEditor";
 import VideoTools from "./VideoTools";
 import MediaToolMenu, { type MediaToolMenuGroup } from "./MediaToolMenu";
-import { videoOutputExtension, type VideoEditOptions } from "./video-editing";
+import { videoEditOperationParams, videoEditOutputDuration, videoOutputExtension, type VideoEditOptions } from "./video-editing";
 import AudioTools from "./AudioTools";
 import { exportAudioEdit, MAX_AUDIO_EDIT_INPUT_BYTES } from "./audio-editing";
 import { decodeAudioWaveform, MAX_AUDIO_WAVEFORM_DURATION_SECONDS, MAX_AUDIO_WAVEFORM_INPUT_BYTES } from "./audio-waveform-browser";
 import { isDurableAssetUrl } from "./asset-library";
-import { mediaNavigation } from "./media-navigation";
+import { createMediaNavigationContext, mediaNavigation, mediaNavigationFromContext, removeMediaNavigationSnapshots, type MediaNavigationContext } from "./media-navigation";
+import { isCompletedMediaValue, shouldKeepMediaEdge } from "./canvas-connections.ts";
 import { touchRetainedMediaNode } from "./media-retention";
 import { mediaTaskUserFailure } from "./shared/media-diagnostics.ts";
 import { isComposingKey, zoomShortcutDirection } from "./keyboard";
 import CanvasVideo, { type VideoProcessRequest } from "./CanvasVideo";
 import CanvasMediaPlayer from "./CanvasMediaPlayer";
+import { finiteMediaDuration } from "./canvas-media-player-state";
 import { audioSourceIdentity, canLoadAudioContent } from "./audio-source";
 import { useAudioSources } from "./useAudioSources";
 import { alignmentGuides } from "./alignment-guides";
 import { createCanvasNotificationGate } from "./canvas-notifications";
 import { useTransientNotice } from "./useTransientNotice";
 import { cloudSyncFeedback, initialCloudSyncFeedback } from "./cloud-sync-feedback";
-import { creationInputSignature, placeCreatorPanel } from "./creation-state";
+import { copiedMediaFields, copiedMediaIdentity, createEditableCanvasTaskCopy, creationInputSignature, placeCreatorPanel } from "./creation-state";
 import { resolveCanvasNodeRole } from "./creator-node-role";
 import { platformFailure } from "./platform-status";
 import { normalizePlatformProfile } from "./platform-profile";
 import { diagnosticErrorFields, recordCanvasDiagnostic } from "./client-diagnostics.ts";
-import { resolveCloudDocumentVersion } from "./cloud-version";
+import { canvasContentSignature } from "./cloud-version";
+import { advanceCloudBaseAfterConfirmedSave, mergeCloudDocuments, planCloudDocumentMerge } from "./cloud-merge";
 import { usePlatformAccess } from "./PlatformGate";
 import { client } from "./platform-client";
 import { fetchCanvasResource, setCanvasGatewayURL } from "./network-boundary.ts";
 import { composePrompt, composePromptWithIndex, createWorkflowIndex, findFreePosition, isWorkflowTextReference } from "./workflow";
+import { promptSegmentsText, readablePromptText } from "./prompt-segments";
 import {
   normalizeVideoSubmission,
   resolveTaskId,
@@ -147,6 +152,7 @@ import {
 } from "./node-interaction";
 import {
   frameForGroupNodes,
+  inheritGeneratedGroupIds,
   rebuildGroupState as rebuildGroupStateFromNodes,
   regroupNodes,
   selectionForGroupMember,
@@ -167,9 +173,9 @@ import type {
   Viewport,
 } from "./canvas-types";
 import type { CanvasEditorHandle } from "./editor-contract";
-import { writeDraft, readDraft, isSessionOnlyStorage, markSessionSynced } from "./draft-store";
+import { writeDraft, readDraft, removeDraft, isSessionOnlyStorage, hasPendingSessionChanges, markSessionSynced } from "./draft-store";
 import { reconcileHistoryNodes, restoreGeometry } from "./history";
-import { saveCanvas } from "./library-store";
+import { getPendingCloudSync, pausePendingCloudSync, queuePendingCloudSync, removePendingCloudSync, saveCanvas } from "./library-store";
 import { PresenceLayer } from "./motion";
 import { useDockPanelPosition } from "./useDockPanelPosition";
 import CanvasSettingsPanel from "./CanvasSettingsPanel";
@@ -180,16 +186,22 @@ import AssetSaveModal from "./AssetSaveModal";
 import { useAssetLibrary } from "./useAssetLibrary";
 import { usePromptMentionAssets, type PromptMentionAssetCandidate } from "./usePromptMentionAssets";
 import { nodeFromLibraryAsset, reusableNodeKind } from "./asset-nodes";
-import { readPlatformAsset, uploadPlatformAsset } from "./platform-asset-library";
+import { readPlatformAsset, uploadDurablePlatformAsset } from "./platform-asset-library";
+import { hasStableMediaIdentity, hasStableMediaInput, requireStableMediaIdentity } from "./media-identity.ts";
+import type { MediaUploadRuntimeState } from "./media-upload-state";
 import { loadCanvasPreferences, resetCanvasPreferences, saveCanvasPreferences, type CanvasPreferences } from "./canvas-preferences";
+import { CANVAS_NODE_CLIPBOARD_TYPE, parseCanvasNodeClipboard, readCanvasClipboard, refreshCanvasClipboardNodes, remapCopiedNodeReferences, serializeCanvasNodes } from "./canvas-clipboard";
+import { imageCopySource, isImageCopySource } from "./image-copy.ts";
 import {
   captureDocumentStorageSession,
+  acceptCanvasDocumentState,
+  peekCanvasDocument,
   readCanvasDocument,
   saveCanvasDocument,
+  watchCanvasDocumentChanges,
 } from "./document-storage";
+import { compactAudioPromptSize, DEFAULT_AUDIO_NODE_SIZE, isLegacyAudioNodeSize } from "./audio-layout";
 export { client } from "./platform-client";
-
-const DEFAULT_AUDIO_NODE_SIZE = { width: 360, height: 132 } as const;
 
 async function imageDataBlob(source: string): Promise<Blob> {
   const response = await fetchCanvasResource(source, undefined, { gatewayURL: client.session()?.gateway_url });
@@ -197,6 +209,17 @@ async function imageDataBlob(source: string): Promise<Blob> {
   const blob = await response.blob();
   if (!blob.type.startsWith("image/") || !blob.size) throw new Error("图片内容无效");
   return blob;
+}
+
+/** Convert an in-memory image operation result into an upload input. The data
+ * URL is never stored on a node; it exists only until the COS upload starts. */
+async function imageDataFile(dataUrl: string, name: string): Promise<File> {
+  const blob = await imageDataBlob(dataUrl);
+  const subtype = (blob.type.split("/", 2)[1] || "png").split(";", 1)[0]
+    .replace(/[^a-z0-9]+/gi, "") || "png";
+  return new File([blob], `${name}.${subtype === "jpeg" ? "jpg" : subtype}`, {
+    type: blob.type || "image/png",
+  });
 }
 
 async function imageBlobAsPNG(blob: Blob): Promise<Blob> {
@@ -364,8 +387,6 @@ const viewportChanged = (previous: Viewport, next: Viewport) =>
 // minimum screen affordance.
 const MAGNETIC_ENTER_RADIUS = 44;
 const MAGNETIC_EXIT_RADIUS = 60;
-const IMAGE_NODE_MAX_WIDTH = 360;
-const IMAGE_NODE_MAX_HEIGHT = 600;
 const ZOOM_RULER_TICKS = Array.from({ length: 25 }, (_, index) => index);
 const ZOOM_FEEDBACK_DURATION = 850;
 const now = () => new Date().toISOString();
@@ -407,25 +428,8 @@ function hasFilePayload(dataTransfer: DataTransfer | null | undefined) {
   return Array.from(dataTransfer.items || []).some((item) => item.kind === "file");
 }
 
-function fitImageNodeSize(naturalWidth: number, naturalHeight: number) {
-  const ratio = Number.isFinite(naturalWidth) && naturalWidth > 0 && Number.isFinite(naturalHeight) && naturalHeight > 0
-    ? naturalHeight / naturalWidth
-    : 1;
-  let width = IMAGE_NODE_MAX_WIDTH;
-  let height = width * ratio;
-  if (height > IMAGE_NODE_MAX_HEIGHT) {
-    height = IMAGE_NODE_MAX_HEIGHT;
-    width = height / ratio;
-  }
-  return {
-    width: Math.round(Math.max(120, width)),
-    height: Math.round(Math.max(120, height)),
-  };
-}
-
-type ImageNodeSize = { width: number; height: number };
 const IMAGE_NODE_SIZE_CACHE_LIMIT = 128;
-const imageNodeSizeRequests = new Map<string, Promise<ImageNodeSize>>();
+const imageNodeSizeRequests = new Map<string, Promise<ImageNodeSize | undefined>>();
 const imageNodeSizeCache = new Map<string, ImageNodeSize>();
 
 function imageNodeSizeCacheKey(src: string): string | undefined {
@@ -444,7 +448,7 @@ function rememberImageNodeSize(key: string, size: ImageNodeSize): void {
   }
 }
 
-function readImageNodeSize(src: string): Promise<ImageNodeSize> {
+function readImageNodeSize(src: string): Promise<ImageNodeSize | undefined> {
   const key = imageNodeSizeCacheKey(src);
   if (key) {
     const cached = imageNodeSizeCache.get(key);
@@ -456,17 +460,17 @@ function readImageNodeSize(src: string): Promise<ImageNodeSize> {
     const existing = imageNodeSizeRequests.get(key);
     if (existing) return existing;
   }
-  const request = new Promise<ImageNodeSize>((resolve) => {
+  const request = new Promise<ImageNodeSize | undefined>((resolve) => {
     const image = new Image();
     image.onload = () => {
       const size = fitImageNodeSize(image.naturalWidth, image.naturalHeight);
       if (key) rememberImageNodeSize(key, size);
       resolve(size);
     };
-    // Keep the historical safe fallback for callers that need layout to
-    // continue, but do not retain a failed URL forever. A later refresh can
-    // retry the source instead of being stuck with a 1×1 measurement.
-    image.onerror = () => resolve(fitImageNodeSize(1, 1));
+    // A failed request is not evidence that the source is square. Callers
+    // choose an explicit, provenance-based fallback where one is available.
+    // Do not retain failures; a refreshed signed URL can be measured later.
+    image.onerror = () => resolve(undefined);
     image.src = src;
   });
   if (key) {
@@ -544,14 +548,18 @@ export function normalize(value: unknown): Document {
             : "note";
       const {
         image: rawImage,
+        localImage: _localImage,
         video: rawVideo,
         audio: rawAudio,
+        uploadState: _uploadState,
+        uploadProgress: _uploadProgress,
+        uploadError: _uploadError,
         videoTaskId: _legacyVideoTaskId,
         video_task_id: _legacyVideoTaskIdSnake,
         ...rest
       } = node;
       const hasStoredMedia =
-        ((type === "image" || type === "prompt") && typeof rawImage === "string" && rawImage.length > 0) ||
+        ((type === "image" || type === "prompt") && isServerImageURL(rawImage)) ||
         ((type === "video" || type === "prompt") && typeof rawVideo === "string" && rawVideo.length > 0) ||
         ((type === "video" || type === "prompt") && isLocalVideoKey(node.localVideo)) ||
         ((type === "video" || type === "prompt") && typeof node.videoContentUrl === "string" && node.videoContentUrl.length > 0) ||
@@ -584,12 +592,19 @@ export function normalize(value: unknown): Document {
         : hasTaskSnapshot
           ? hasStoredMedia ? "completed" as const : "queued" as const
           : undefined;
-      const mediaWidth = type === "prompt" && hasStoredMedia && legacyTaskSize
-        ? node.mediaType === "video" || typeof rawVideo === "string" || typeof node.videoContentUrl === "string" ? 420 : 360
-        : Number.isFinite(node.width) ? node.width : W;
-      const mediaHeight = type === "prompt" && hasStoredMedia && legacyTaskSize
-        ? node.mediaType === "video" || typeof rawVideo === "string" || typeof node.videoContentUrl === "string" ? 260 : 360
-        : Number.isFinite(node.height) ? node.height : H;
+      const legacyAudioSize = (type === "audio" || (type === "prompt" && node.mediaType === "audio"))
+        ? compactAudioPromptSize(Number(node.width), Number(node.height), hasStoredMedia)
+        : undefined;
+      const mediaWidth = legacyAudioSize
+        ? legacyAudioSize.width
+        : type === "prompt" && hasStoredMedia && legacyTaskSize
+          ? node.mediaType === "video" || typeof rawVideo === "string" || typeof node.videoContentUrl === "string" ? 420 : 360
+          : Number.isFinite(node.width) ? node.width : W;
+      const mediaHeight = legacyAudioSize
+        ? legacyAudioSize.height
+        : type === "prompt" && hasStoredMedia && legacyTaskSize
+          ? node.mediaType === "video" || typeof rawVideo === "string" || typeof node.videoContentUrl === "string" ? 260 : 360
+          : Number.isFinite(node.height) ? node.height : H;
       return {
         ...rest,
         id,
@@ -598,13 +613,15 @@ export function normalize(value: unknown): Document {
           typeof node.title === "string"
             ? node.title.slice(0, 160)
             : "未命名节点",
-        text: typeof node.text === "string" ? node.text.slice(0, 50000) : "",
+        text: type === "prompt"
+          ? readablePromptText(node.text, node.promptSegments, node.audioMode === "tts" ? 50000 : 20000)
+          : typeof node.text === "string" ? node.text.slice(0, 50000) : "",
         x: Number.isFinite(node.x) ? node.x : 80,
         y: Number.isFinite(node.y) ? node.y : 80,
         width: Math.min(1600, Math.max(120, mediaWidth)),
         height: Math.min(1200, Math.max(80, mediaHeight)),
         color: typeof node.color === "string" ? node.color : COLORS[0],
-        ...((type === "image" || type === "prompt") && typeof rawImage === "string"
+        ...((type === "image" || type === "prompt") && isServerImageURL(rawImage)
           ? { image: rawImage }
           : {}),
         ...((type === "video" || type === "prompt") && typeof rawVideo === "string" && !rawVideo.startsWith("blob:")
@@ -616,14 +633,21 @@ export function normalize(value: unknown): Document {
         videoContentUrlExpiresAt: typeof node.videoContentUrlExpiresAt === "string" ? node.videoContentUrlExpiresAt : undefined,
         videoPoster: typeof node.videoPoster === "string" && node.videoPoster.startsWith("data:image/") ? node.videoPoster : undefined,
         imageThumbnail: typeof node.imageThumbnail === "string" && /^https?:\/\//i.test(node.imageThumbnail) ? node.imageThumbnail : undefined,
+        imageAspectRatio: typeof node.imageAspectRatio === "string" ? node.imageAspectRatio.slice(0, 40) : undefined,
+        uploadState: ["preparing", "uploading", "completing", "failed"].includes(node.uploadState || "")
+          ? node.uploadState
+          : undefined,
+        uploadProgress: Number.isFinite(node.uploadProgress)
+          ? Math.max(0, Math.min(100, Number(node.uploadProgress)))
+          : undefined,
+        uploadError: typeof node.uploadError === "string" ? node.uploadError.slice(0, 500) : undefined,
         localVideoPoster: typeof node.localVideoPoster === "string" ? node.localVideoPoster : undefined,
         embeddedReferences: Array.isArray(node.embeddedReferences)
-          ? node.embeddedReferences.filter((ref): ref is { id: string; title: string; image?: string; imageThumbnail?: string; localImage?: string; video?: string; localVideo?: string; audio?: string; localAudio?: string; videoContentUrl?: string; videoContentUrlExpiresAt?: string; mediaType?: MediaType; assetId?: string } => Boolean(ref && typeof ref === "object" && typeof ref.id === "string" && typeof ref.title === "string" && (typeof ref.image === "string" || typeof ref.localImage === "string" || typeof ref.video === "string" || isLocalVideoKey(ref.localVideo) || typeof ref.audio === "string" || isLocalAudioKey(ref.localAudio) || typeof ref.videoContentUrl === "string" || typeof ref.assetId === "string"))).map((ref) => ({
+          ? node.embeddedReferences.filter((ref): ref is { id: string; title: string; image?: string; imageThumbnail?: string; video?: string; localVideo?: string; audio?: string; localAudio?: string; videoContentUrl?: string; videoContentUrlExpiresAt?: string; mediaType?: MediaType; assetId?: string } => Boolean(ref && typeof ref === "object" && typeof ref.id === "string" && typeof ref.title === "string" && (isServerImageURL(ref.image) || typeof ref.video === "string" || isLocalVideoKey(ref.localVideo) || typeof ref.audio === "string" || isLocalAudioKey(ref.localAudio) || typeof ref.videoContentUrl === "string" || typeof ref.assetId === "string"))).map((ref) => ({
               id: ref.id.slice(0, 120),
               title: ref.title.slice(0, 160),
-              ...(ref.image ? { image: ref.image } : {}),
+              ...(isServerImageURL(ref.image) ? { image: ref.image } : {}),
               ...(ref.imageThumbnail ? { imageThumbnail: ref.imageThumbnail } : {}),
-              ...(ref.localImage ? { localImage: ref.localImage } : {}),
               ...(ref.video ? { video: ref.video } : {}),
               ...(isLocalVideoKey(ref.localVideo) ? { localVideo: ref.localVideo } : {}),
               ...(ref.audio ? { audio: ref.audio } : {}),
@@ -653,8 +677,9 @@ export function normalize(value: unknown): Document {
         error: typeof node.error === "string" ? node.error : undefined,
         modelId: typeof node.modelId === "string" ? node.modelId : undefined,
         modelSelection: node.modelSelection === "user" || node.modelSelection === "default" ? node.modelSelection : undefined,
-        mediaType:
-          type === "audio" || node.mediaType === "audio"
+        mediaType: type === "note" && !hasStoredMedia && !hasTaskSnapshot && !hasVideoSnapshot
+          ? undefined
+          : type === "audio" || node.mediaType === "audio"
             ? "audio"
             : node.mediaType === "video" ||
                 (node.mediaType !== "image" && hasVideoSnapshot)
@@ -680,11 +705,7 @@ export function normalize(value: unknown): Document {
                 model: node.submission.model,
                 prompt: node.submission.prompt,
                 images: node.submission.images.map((ref) => ({
-                  image: typeof ref?.image === "string" ? ref.image : undefined,
-                  localImage:
-                    typeof ref?.localImage === "string"
-                      ? ref.localImage
-                      : undefined,
+                  image: isServerImageURL(ref?.image) ? ref.image : undefined,
                   assetId: typeof ref?.assetId === "string" ? ref.assetId : undefined,
                 })),
                 ...(Number.isFinite(node.submission.count) ? { count: node.submission.count } : {}),
@@ -721,9 +742,15 @@ export function normalize(value: unknown): Document {
           : undefined,
         continuationOf: typeof node.continuationOf === "string" ? node.continuationOf : undefined,
         groupId: typeof node.groupId === "string" && node.groupId.length <= 120 ? node.groupId : undefined,
+        groupMembershipOverride: node.groupMembershipOverride === true,
         status: normalizedStatus,
       };
-    });
+    })
+    // One-click audio extraction creates its target before the browser has
+    // produced bytes. Such a running placeholder is transient; if a canvas
+    // is reopened after an interrupted extraction, discard it instead of
+    // restoring an unusable audio node.
+    .filter(node => !(node.operationId === "extract-audio" && node.status === "running" && !node.audio && !node.localAudio && !node.assetId));
   // Inline @ references are durable only when they point at an image value
   // that still exists in the normalized document. Drop stale IDs while
   // loading a document so the editor cannot render a ghost chip or submit a
@@ -732,22 +759,29 @@ export function normalize(value: unknown): Document {
     nodes
       .filter((node) => Boolean(
         (node.type === "image" || (node.type === "prompt" && (node.mediaType || "image") === "image")) &&
-        (node.image || node.localImage || node.assetId || node.taskId),
+        (isServerImageURL(node.image) || node.assetId || node.taskId),
       ))
       .map((node) => node.id),
   );
   const cleanedNodes = nodes.map((node) => {
     if (!node.promptSegments) return node;
+    const textMirrorsSegments = node.type === "prompt" && node.text === promptSegmentsText(node.promptSegments);
     const embeddedIds = new Set((node.embeddedReferences || []).map((reference) => reference.id));
     const promptSegments = node.promptSegments.filter((segment) =>
       segment.type !== "reference" || referenceImageIds.has(segment.referenceId) || embeddedIds.has(segment.referenceId),
     );
     return promptSegments.length === node.promptSegments.length
       ? node
-      : { ...node, promptSegments: promptSegments.length ? promptSegments : undefined };
+      : {
+          ...node,
+          ...(textMirrorsSegments ? { text: promptSegmentsText(promptSegments) } : {}),
+          promptSegments: promptSegments.length ? promptSegments : undefined,
+        };
   });
   const safeNodes = Array.isArray(source.nodes) ? cleanedNodes : clone(initial).nodes;
   const edgeIds = new Set<string>();
+  // Collapse duplicate endpoints while loading. Legacy edge fields are read
+  // only at this boundary and are never copied into the normalized document.
   const edgePairs = new Set<string>();
   const edges = Array.isArray(source.edges)
     ? source.edges
@@ -755,7 +789,7 @@ export function normalize(value: unknown): Document {
           Boolean(edge && typeof edge === "object"),
         )
         .map((raw, index) => {
-          const edge = raw as Edge & { source?: string; target?: string };
+          const edge = raw as Edge & { source?: string; target?: string; kind?: unknown };
           const from = edge.from || edge.source || "",
             to = edge.to || edge.target || "",
             requestedId = edge.id || `edge-${index}`;
@@ -775,29 +809,29 @@ export function normalize(value: unknown): Document {
         })
         .filter((edge): edge is Edge => Boolean(edge))
     : [];
-  // Media nodes are produced values or source assets, so they never accept
-  // incoming workflow edges. Keep the creator -> generated-result edge for
-  // legacy multi-output canvases, while dropping stale image -> image/video
-  // links that made the graph appear to connect unrelated cards.
+  // Generated-result lineage is carried by `resultOf`; every persisted edge
+  // now has the same workflow/reference meaning. Keep only the media validity
+  // check so stale or incompatible legacy links are not revived as inputs.
   const validEdges = edges.filter((edge) => {
     const target = safeNodes.find((node) => node.id === edge.to);
-    if (!target || (target.type !== "image" && target.type !== "video")) return true;
+    if (!target || !["image", "video", "audio"].includes(target.type)) return true;
     const sourceNode = safeNodes.find((node) => node.id === edge.from);
-    if (target.resultOf) return sourceNode?.type === "prompt" && edge.from === target.resultOf;
-    // Older canvases may not have resultOf or stable result titles. An
-    // outgoing prompt -> media edge with actual content is unambiguously a
-    // generated result; reference images point in the opposite direction.
-    return Boolean(sourceNode?.type === "prompt" && (
-      hasMediaContent(target) ||
-      target.title.startsWith(`${sourceNode.title} · 结果`) ||
-      target.title === `${sourceNode.title} · 视频结果`
-    ));
-  });
+    return shouldKeepMediaEdge(
+      edge,
+      sourceNode,
+      target,
+      node => hasMediaContent(node),
+    );
+  }).map(({ id, from, to }) => ({ id, from, to }));
   const repairedNodes = repairGeneratedLayout(
     inheritGeneratedGroupIds(safeNodes),
     validEdges,
   );
-  const groups = normalizeGroupFrames(repairedNodes, source.groups);
+  // Normalize membership as well as frame geometry on load so legacy
+  // single-member groups cannot survive as invisible, stale assignments.
+  const normalizedGroupState = rebuildGroupStateFromNodes(repairedNodes);
+  const normalizedNodes = normalizedGroupState.nodes;
+  const groups = normalizedGroupState.groups;
   const viewport = source.viewport || initial.viewport;
   return {
     id:
@@ -813,7 +847,7 @@ export function normalize(value: unknown): Document {
         : typeof source.title === "string" && source.title
           ? source.title
           : "未命名画布",
-    nodes: repairedNodes,
+    nodes: normalizedNodes,
     edges: validEdges,
     groups,
     viewport: {
@@ -824,8 +858,29 @@ export function normalize(value: unknown): Document {
     updatedAt: source.updatedAt || now(),
   };
 }
+
+/**
+ * Legacy canvas exports stored connection metadata alongside the endpoint
+ * fields (`kind`, or `source`/`target`). The loader accepts those shapes for
+ * one migration boundary, but a normalized document must be written back
+ * without them so old connection types cannot reappear after a reload.
+ */
+function hasLegacyConnectionFields(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const edges = (value as { edges?: unknown }).edges;
+  return Array.isArray(edges) && edges.some((edge) => Boolean(
+    edge && typeof edge === "object" &&
+    (Object.hasOwn(edge, "kind") || Object.hasOwn(edge, "source") || Object.hasOwn(edge, "target")),
+  ));
+}
+
 function isCachedDisplayImage(value: unknown) {
   return typeof value === "string" && /^data:image\//i.test(value);
+}
+
+/** Image values that can survive a reload must come from the server/COS. */
+function isServerImageURL(value: unknown): value is string {
+  return typeof value === "string" && /^(?:https?:\/\/|\/)/i.test(value.trim());
 }
 
 function comparableDocument(value: Document) {
@@ -876,17 +931,8 @@ export function documentRevisionSignature(value: Document) {
 
 function errorText(error: unknown) {
   const value = error as Partial<AppSdkError> & {
-    code?: string;
-    error_code?: string;
-    error?: { code?: string; message?: string };
-    details?: { message?: string; error?: { message?: string } };
+    details?: { code?: string; message?: string; error?: { code?: string; message?: string } };
   };
-  const details = value.details as { code?: string; error?: { code?: string } } | undefined;
-  const code = String(
-    value.code || value.error_code || value.error?.code || details?.code || details?.error?.code || "",
-  ).toUpperCase();
-  if (code === "MEDIA_STORAGE_QUOTA_EXCEEDED")
-    return "可用媒体空间不足。请在设置中删除不需要的 Canvas 媒体后重试；取消收藏不会释放空间。";
   return (
     value.message ||
     value.details?.message ||
@@ -894,20 +940,31 @@ function errorText(error: unknown) {
     "平台连接失败，请稍后重试。"
   );
 }
-function errorCode(error: unknown) {
-  const value = error as Partial<AppSdkError> & {
-    code?: string;
-    error_code?: string;
-    error?: { code?: string };
-    details?: { code?: string; error?: { code?: string } };
-  };
-  return String(
-    value.code || value.error_code || value.error?.code || value.details?.code || value.details?.error?.code || "",
-  ).toUpperCase();
-}
-function isStorageQuotaError(error: unknown) {
-  const code = errorCode(error);
-  return code === "MEDIA_STORAGE_QUOTA_EXCEEDED" || code === "MEDIA_STORAGE_QUOTA_FULL";
+function cloudSyncErrorText(error: unknown) {
+  const value = error as Partial<AppSdkError> & Record<string, unknown>;
+  const asRecord = (item: unknown): Record<string, unknown> =>
+    item && typeof item === "object" && !Array.isArray(item) ? item as Record<string, unknown> : {};
+  const details = asRecord(value.details);
+  const nestedError = asRecord(value.error);
+  const detailError = asRecord(details.error);
+  const code = [value.code, value.error_code, nestedError.code, nestedError.error_code,
+    details.code, details.error_code, detailError.code, detailError.error_code]
+    .find((candidate): candidate is string => typeof candidate === "string") || "";
+  switch (code) {
+    case "APP_STORAGE_CONFLICT":
+      return "云端画布已有新版本，当前修改已保留。请重新加载云端版本后合并。";
+    case "APP_STORAGE_QUOTA_EXCEEDED":
+      return "云端应用空间已满，画布已保存在本机。请清理应用数据后重试。";
+    case "APP_STORAGE_VALUE_TOO_LARGE":
+    case "PAYLOAD_TOO_LARGE":
+      return "云端保存请求过大，请重试；如果仍然失败，请减少画布中的文本或节点数量。";
+    case "CANVAS_STORAGE_CHUNK_MISSING":
+      return "云端画布分块缺失，暂时无法恢复。请重试；如果仍然失败，请从备份导入。";
+    case "CANVAS_STORAGE_CHUNK_CORRUPT":
+      return "云端画布分块校验失败，暂时无法恢复。请重试；如果仍然失败，请从备份导入。";
+    default:
+      return errorText(error);
+  }
 }
 function formatBytes(value: number) {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -919,14 +976,44 @@ const savedStatus = (synced: boolean) => isSessionOnlyStorage()
   ? synced ? "已保存到云端" : "尚未同步 · 仅当前页面保留"
   : synced ? "已保存到本机与云端" : "已保存到本机";
 const syncFailureStatus = (localSaved = true) => isSessionOnlyStorage()
-  ? "云端保存失败 · 请导出备份后再关闭"
-  : localSaved ? "已保存本机 · 云端同步失败" : "保存未完成 · 请导出备份";
+  ? "云端状态待确认 · 请先导出备份"
+  : localSaved ? "本机已保存 · 云端待同步" : "保存状态待确认 · 建议导出备份";
+const documentSaveRevision = (value: Pick<Document, "id" | "updatedAt">) =>
+  JSON.stringify([value.id, value.updatedAt]);
+const isSameDocumentRevision = (left: Pick<Document, "id" | "updatedAt">, right: Pick<Document, "id" | "updatedAt">) =>
+  left.id === right.id && left.updatedAt === right.updatedAt;
+const isCanvasVersionConflict = (error: unknown) => {
+  const value = error as { code?: unknown; message?: unknown };
+  return value?.code === "APP_STORAGE_CONFLICT" ||
+    (typeof value?.message === "string" && /云端有不同版本|其他页面更新|重新加载云端版本/.test(value.message));
+};
+type SaveProgress = { phase: "idle" | "local" | "cloud"; revision: string };
+const idleSaveProgress: SaveProgress = { phase: "idle", revision: "" };
 
 type ImageLoadState = {
   source: string;
   status: "loading" | "recovering" | "failed";
   attempt: number;
   message?: string;
+};
+
+type PendingImageUpload = {
+  input: File;
+  documentId: string;
+  nodeId: string;
+  width: number;
+  height: number;
+  destination: { at: Point; sourceId?: string };
+};
+
+type ImageImportNodeMetadata = {
+  title?: string;
+  text?: string;
+  resultOf?: string;
+  resultIndex?: number;
+  operationId?: string;
+  operationParams?: Record<string, string | number | boolean>;
+  groupId?: string;
 };
 
 type ImageRecoveryResult = {
@@ -943,16 +1030,17 @@ type StoredAssetPage = {
 
 // Keep ordering per canvas. A slow upload for one document must not block an
 // unrelated canvas opened in the same tab. KV revisions protect each document.
-const cloudSaveQueues = new Map<string, { promise: Promise<void>; checkSession: () => void }>();
+const cloudSaveQueues = new Map<string, { promise: Promise<unknown>; checkSession: () => void }>();
 export function syncCloudDocument(
   value: Document,
   local: Promise<unknown> = Promise.resolve(),
   expected?: Document,
-) {
+  options: { respectPaused?: boolean } = { respectPaused: true },
+): Promise<Document | null> {
   const snapshot = clone(value);
   void local.catch(() => {});
   const checkSession = captureDocumentStorageSession(client.storage);
-  let previous = Promise.resolve();
+  let previous: Promise<unknown> = Promise.resolve();
   const queued = cloudSaveQueues.get(snapshot.id);
   if (queued) {
     // A timed-out request from the previous account must not block saves in
@@ -965,7 +1053,24 @@ export function syncCloudDocument(
       checkSession();
       await local;
       checkSession();
-      const prepared = storageDocument(await storeInlineImages(snapshot));
+      const pendingRevision = await queuePendingCloudSync(snapshot, {
+        reactivatePaused: !options.respectPaused,
+      });
+      checkSession();
+      if (!pendingRevision) return null;
+      const stillPending = async () => {
+        const current = await getPendingCloudSync(snapshot.id);
+        checkSession();
+        return current?.revision === pendingRevision && !current.paused;
+      };
+      if (!(await stillPending())) return null;
+      checkSession();
+      if (!(await stillPending())) return null;
+      // Sync is a projection boundary only. Stable media identity is enforced
+      // by generation/import/processing before a completed node is committed;
+      // syncing never uploads browser caches or rejects a legacy draft because
+      // it still contains a temporary URL.
+      const prepared = storageDocument(snapshot);
       checkSession();
       await saveCanvasDocument(
         client.storage,
@@ -978,7 +1083,42 @@ export function syncCloudDocument(
         } } : undefined,
       );
       checkSession();
-      markSessionSynced(snapshot.id, JSON.stringify(snapshot));
+      await removePendingCloudSync(snapshot.id, pendingRevision).catch(() => false);
+      checkSession();
+      markSessionSynced(snapshot.id, JSON.stringify(prepared));
+      return prepared;
+    });
+  const job = { promise: next, checkSession };
+  cloudSaveQueues.set(snapshot.id, job);
+  void next.then(
+    () => {
+      if (cloudSaveQueues.get(snapshot.id) === job) cloudSaveQueues.delete(snapshot.id);
+    },
+    () => {
+      if (cloudSaveQueues.get(snapshot.id) === job) cloudSaveQueues.delete(snapshot.id);
+    },
+  );
+  return next;
+}
+
+export function pauseCloudDocumentSync(
+  value: Document,
+  local: Promise<unknown> = Promise.resolve(),
+): Promise<boolean> {
+  const snapshot = clone(value);
+  const checkSession = captureDocumentStorageSession(client.storage);
+  let previous: Promise<unknown> = Promise.resolve();
+  const queued = cloudSaveQueues.get(snapshot.id);
+  if (queued) {
+    try { queued.checkSession(); previous = queued.promise; } catch { /* obsolete session */ }
+  }
+  const next = previous
+    .catch(() => {})
+    .then(async () => {
+      checkSession();
+      await local;
+      checkSession();
+      return pausePendingCloudSync(snapshot);
     });
   const job = { promise: next, checkSession };
   cloudSaveQueues.set(snapshot.id, job);
@@ -1079,7 +1219,7 @@ const hasRetainableMedia = (node: CanvasNode) =>
 // imported image while reference-picking; video results are intentionally
 // excluded even when an old record happens to carry an image field.
 const isCanvasReferenceImage = (node: CanvasNode) => Boolean(
-  (node.image || node.localImage) && (
+  node.image && (
     node.type === "image" ||
     (node.type === "prompt" && (node.mediaType || "image") === "image")
   ),
@@ -1099,14 +1239,27 @@ const isCanvasReferenceAudio = (node: CanvasNode) => Boolean(
   ),
 );
 
+const hasStableCanvasMediaIdentity = (node: Pick<CanvasNode, "assetId" | "taskId" | "image" | "video" | "videoContentUrl" | "audio">) =>
+  hasStableMediaIdentity({
+    assetId: node.assetId,
+    taskId: node.taskId,
+    url: node.image || node.video || node.videoContentUrl || node.audio,
+  });
+
+const hasStableCanvasMediaInput = (node: Pick<CanvasNode, "assetId" | "image" | "video" | "videoContentUrl" | "audio">) =>
+  hasStableMediaInput({
+    assetId: node.assetId,
+    url: node.image || node.video || node.videoContentUrl || node.audio,
+  });
+
 const hasUsableCanvasReferenceImage = (node: CanvasNode) =>
-  isCanvasReferenceImage(node) && Boolean(node.image);
+  isCanvasReferenceImage(node) && Boolean(node.image) && hasStableCanvasMediaInput(node);
 
 const hasUsableCanvasReferenceVideo = (node: CanvasNode) =>
-  isCanvasReferenceVideo(node) && Boolean(node.video || node.localVideo || node.videoContentUrl || node.assetId);
+  isCanvasReferenceVideo(node) && Boolean(node.video || node.localVideo || node.videoContentUrl || node.assetId) && hasStableCanvasMediaInput(node);
 
 const hasUsableCanvasReferenceAudio = (node: CanvasNode) =>
-  isCanvasReferenceAudio(node) && Boolean(node.audio || node.localAudio);
+  isCanvasReferenceAudio(node) && Boolean(node.audio || node.localAudio) && hasStableCanvasMediaInput(node);
 
 const canUseCanvasReferenceFor = (source: CanvasNode, target: CanvasNode | undefined) =>
   hasUsableCanvasReferenceImage(source) || Boolean(
@@ -1119,7 +1272,6 @@ const sameCanvasReferenceValue = (source: CanvasNode, reference: {
   audio?: string; localAudio?: string; videoContentUrl?: string; assetId?: string;
 }) => reference.nodeId === source.id ||
   Boolean(source.image && reference.image === source.image) ||
-  Boolean(source.localImage && reference.localImage === source.localImage) ||
   Boolean(source.video && reference.video === source.video) ||
   Boolean(source.localVideo && reference.localVideo === source.localVideo) ||
   Boolean(source.videoContentUrl && reference.videoContentUrl === source.videoContentUrl) ||
@@ -1166,7 +1318,19 @@ function nodeInteraction(
         ? hasGeneratedResult(node, nodes, edges)
         : false,
     ...context,
+    allowCompletedMediaInput: context.allowCompletedMediaInput ?? Boolean(
+      (node.type === "prompt" || node.type === "image" || node.type === "video" || node.type === "audio") &&
+      (hasMediaContent(node) || isCompletedMediaValue(node)),
+    ),
   });
+}
+
+function edgeForNodes(source: CanvasNode, target: CanvasNode): Edge {
+  return {
+    id: uid("edge"),
+    from: source.id,
+    to: target.id,
+  };
 }
 
 /**
@@ -1178,10 +1342,15 @@ function isGeneratedResult(
   sourceId: string,
   target: CanvasNode,
   edges: Edge[],
+  sourceType?: CanvasNode["type"],
   sourceTitle?: string,
 ) {
   if (target.type !== "image" && target.type !== "video") return false;
   if (target.resultOf === sourceId) return true;
+  // Before resultOf was persisted, only prompt creators had an ambiguous
+  // direct output edge. A media-to-media workflow edge can also be an
+  // intentional reference/continuation, so do not collapse it as a result.
+  if (sourceType !== "prompt") return false;
   if (target.resultOf || !sourceTitle) return false;
   const connected = edges.some((edge) => edge.from === sourceId && edge.to === target.id);
   if (!connected) return false;
@@ -1240,13 +1409,14 @@ function generatedResultsFor(
   const connectedIds = new Set((cache.outgoing.get(sourceId) || []).map((edge) => edge.to));
   const results = nodes
     .filter((target) => {
-      if (isGeneratedResult(sourceId, target, edges, source?.title)) return true;
+      if (isGeneratedResult(sourceId, target, edges, source?.type, source?.title)) return true;
       if (batchId && target.resultBatchId === batchId && hasMediaContent(target)) return true;
       // A few early canvas versions persisted the prompt -> result edge but
       // omitted both resultOf and the generated title. Direction plus actual
       // media content is enough to identify the output and never matches a
       // reference image (references point into the prompt).
       return (
+        source?.type === "prompt" &&
         (target.type === "image" || target.type === "video") &&
         hasMediaContent(target) &&
         connectedIds.has(target.id)
@@ -1370,7 +1540,10 @@ function visibleCanvasEdges(nodes: CanvasNode[], edges: Edge[]) {
   }
   const visibleEdges = result.filter(
     (edge, index, all) =>
-      all.findIndex((candidate) => candidate.from === edge.from && candidate.to === edge.to) === index,
+      all.findIndex((candidate) =>
+        candidate.from === edge.from &&
+        candidate.to === edge.to,
+      ) === index,
   );
   cache.visibleEdges = visibleEdges;
   return visibleEdges;
@@ -1461,26 +1634,6 @@ function uniqueResultEdges(
  * that relationship while loading old documents and keep the operation
  * idempotent for subsequent saves.
  */
-function inheritGeneratedGroupIds(nodes: CanvasNode[]) {
-  const byId = new Map(nodes.map((node) => [node.id, node]));
-  return nodes.map((node) => {
-    const sourceId = node.resultOf || node.continuationOf;
-    if (!sourceId) return node;
-    const source = byId.get(sourceId);
-    const generatedBatchGroup = Boolean(
-      node.groupId &&
-        (node.groupId.startsWith("image-batch-") ||
-          node.groupId.startsWith("video-batch-")),
-    );
-    const shouldInherit = Boolean(
-      source?.groupId &&
-        (!node.groupId || generatedBatchGroup || Boolean(node.resultOf)),
-    );
-    if (!source?.groupId || !shouldInherit || source.groupId === node.groupId) return node;
-    return { ...node, groupId: source.groupId };
-  });
-}
-
 function isGeneratedBatchGroup(groupId: string, nodes: CanvasNode[]) {
   return (
     (groupId.startsWith("image-batch-") || groupId.startsWith("video-batch-")) &&
@@ -1545,6 +1698,37 @@ function expandGroupFrames(nodes: CanvasNode[], groups: GroupFrame[] | undefined
   );
 }
 
+/**
+ * Resolve the nodes an arrange command is allowed to move. A complete group
+ * selection expands to its hidden logical members and remains a composite
+ * layout unit. A partial Shift-selection keeps its scope and temporarily
+ * removes the group marker so unselected siblings never move with it.
+ */
+function layoutSourceNodes(
+  nodes: CanvasNode[],
+  selectedIds: readonly string[],
+  scope: "all" | "selected",
+) {
+  if (scope === "all") return nodes;
+  const selected = new Set(selectedIds);
+  const completeGroups = new Set(
+    nodes
+      .map((node) => node.groupId)
+      .filter((id): id is string => Boolean(id))
+      .filter((groupId) => {
+        const members = visibleGroupMembers(nodes, groupId);
+        return members.length > 1 && members.every((node) => selected.has(node.id));
+      }),
+  );
+  return nodes
+    .filter((node) => selected.has(node.id) || Boolean(node.groupId && completeGroups.has(node.groupId)))
+    .map((node) =>
+      node.groupId && !completeGroups.has(node.groupId)
+        ? { ...node, groupId: undefined }
+        : node,
+    );
+}
+
 function pointInsideFrame(node: CanvasNode, frame: GroupFrame) {
   const centerX = node.x + node.width / 2;
   const centerY = node.y + node.height / 2;
@@ -1556,7 +1740,13 @@ function restoreDraggedNodes(current: CanvasNode[], before: CanvasNode[], ids: s
   const previous = new Map(before.map((node) => [node.id, node]));
   return current.map((node) => {
     const old = targets.has(node.id) ? previous.get(node.id) : undefined;
-    return old ? { ...node, x: old.x, y: old.y, groupId: old.groupId } : node;
+    return old ? {
+      ...node,
+      x: old.x,
+      y: old.y,
+      groupId: old.groupId,
+      groupMembershipOverride: old.groupMembershipOverride,
+    } : node;
   });
 }
 
@@ -1578,7 +1768,7 @@ function reconcileGroupMembership(
     const groupId = candidates[0]?.id;
     return node.groupId === groupId
       ? node
-      : { ...node, groupId };
+      : { ...node, groupId, groupMembershipOverride: true };
   });
   return rebuildGroupStateFromNodes(nextNodes, GROUP_PADDING);
 }
@@ -1597,94 +1787,6 @@ type Picker = {
   edgeId?: string;
   dock?: boolean;
 } | null;
-
-function LayoutPopover({
-  scope,
-  count,
-  rows,
-  sort,
-  onRowsChange,
-  onSortChange,
-  onFlow,
-  onGrid,
-  onCustom,
-}: {
-  scope: "all" | "selected";
-  count: number;
-  rows: number;
-  sort: "position" | "time" | "name" | "custom";
-  onRowsChange: (rows: number) => void;
-  onSortChange: (sort: "position" | "time" | "name" | "custom") => void;
-  onFlow: () => void;
-  onGrid: () => void;
-  onCustom: () => void;
-}) {
-  const popover = React.useRef<HTMLDivElement>(null);
-  React.useLayoutEffect(() => {
-    const element = popover.current;
-    const anchor = element?.parentElement;
-    const board = element?.closest<HTMLElement>(".canvas-board");
-    if (!element || !anchor || !board) return;
-    const place = () => {
-      const anchorRect = anchor.getBoundingClientRect();
-      const boardRect = board.getBoundingClientRect();
-      const width = element.offsetWidth;
-      const height = element.offsetHeight;
-      const gap = 10;
-      const min = boardRect.left + 12;
-      const max = Math.max(min, boardRect.right - width - 12);
-      const desired = anchorRect.left + anchorRect.width / 2 - width / 2;
-      const left = Math.max(min, Math.min(max, desired));
-      element.style.left = `${left - anchorRect.left}px`;
-      element.style.transform = "none";
-      const spaceAbove = anchorRect.top - boardRect.top;
-      const spaceBelow = boardRect.bottom - anchorRect.bottom;
-      const below = spaceAbove < height + gap && spaceBelow > spaceAbove;
-      element.classList.toggle("is-below", below);
-      element.style.setProperty("--layout-menu-arrow", `${anchorRect.left + anchorRect.width / 2 - left}px`);
-    };
-    place();
-    const observer = new ResizeObserver(place);
-    observer.observe(board);
-    window.addEventListener("resize", place);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", place);
-    };
-  }, []);
-  return (
-    <div ref={popover} className="popover layout-menu" role="dialog" aria-label="整理布局">
-      <div className="layout-menu-modes">
-        <button className="layout-mode" disabled={count < 2} onClick={onFlow}>
-          <span className="layout-mode-icon layout-flow-icon"><i /><i /><i /></span>
-          <strong>顺着连线</strong>
-          <small>按工作流方向排列节点</small>
-        </button>
-        <button className="layout-mode" disabled={count < 2} onClick={onGrid}>
-          <span className="layout-mode-icon layout-grid-icon"><i /><i /><i /><i /></span>
-          <strong>自动网格</strong>
-          <small>按规则整理为整齐网格</small>
-        </button>
-      </div>
-      <div className="layout-menu-section">
-        <div className="layout-menu-label"><span>排序方式</span><span>{scope === "selected" ? "已选节点" : "全部节点"}</span></div>
-        <div className="layout-sort" role="radiogroup" aria-label="网格排序方式">
-          {([["position", "位置"], ["time", "时间"], ["name", "名称"]] as const).map(([value, label]) => (
-            <button key={value} role="radio" aria-checked={sort === value} className={sort === value ? "active" : ""} onClick={() => onSortChange(value)}>{label}{value === "position" && <span aria-hidden="true">↑</span>}</button>
-          ))}
-        </div>
-        <div className="layout-menu-label"><span>行数</span><strong>{rows} 行 × {Math.max(1, Math.ceil(count / rows))} 列</strong></div>
-        <input aria-label="网格行数" type="range" min="1" max={Math.min(6, Math.max(1, count))} step="1" value={Math.min(rows, Math.max(1, count))} onChange={(event) => onRowsChange(Number(event.target.value))} />
-      </div>
-      {count < 2 && <p className="layout-empty-hint" role="status">至少需要 2 个节点才能整理布局。</p>}
-      <button className="layout-custom" disabled={count < 2} onClick={onCustom}>
-        <span className="layout-custom-icon">⌗</span>
-        <span><strong>自定义排序</strong><small>按当前选择顺序排列节点</small></span>
-        <span aria-hidden="true">›</span>
-      </button>
-    </div>
-  );
-}
 
 function Field({
   value,
@@ -1752,10 +1854,13 @@ type EditorProps = {
   initialDocument: Document;
   libraryOpen: boolean;
   onToggleLibrary: () => void;
+  onReady: (documentId: string) => void;
+  isSwitchingCanvas?: boolean;
   onCanvasInteraction?: () => void;
   onSaved: (document: Document) => void;
   onCloudSynced?: (document: Document) => void;
   registerEditor: (handler: CanvasEditorHandle | null) => void;
+  registerAgentHandlers: (handlers: Record<string, AgentHandler> | null) => void;
 };
 
 type KeyboardContext = {
@@ -1786,7 +1891,7 @@ type KeyboardContext = {
   redo: () => void;
   duplicate: () => void;
   copyNodes: () => void;
-  pasteNodes: () => void;
+  pasteNodes: () => boolean;
   groupSelection: () => void;
   ungroupSelection: () => void;
   setSelected: React.Dispatch<React.SetStateAction<string[]>>;
@@ -1814,10 +1919,13 @@ export default function App({
   initialDocument,
   libraryOpen,
   onToggleLibrary,
+  onReady,
+  isSwitchingCanvas = false,
   onCanvasInteraction,
   onSaved,
   onCloudSynced,
   registerEditor,
+  registerAgentHandlers,
 }: EditorProps) {
   const {
     ready: platformReady,
@@ -1835,6 +1943,8 @@ export default function App({
   const [doc, setDoc] = React.useState<Document>(() => clone(initialDocument));
   const docRef = React.useRef(doc);
   docRef.current = doc;
+  const agentWriteLockRef = React.useRef(false);
+  const queuedAgentEdits = React.useRef<Array<(value: Document) => Document>>([]);
   // Geometry-only frames deliberately do not advance this revision. Derived
   // workflow state can then stay stable while a node is being dragged, while
   // content, edge, or node membership edits still invalidate it explicitly.
@@ -1883,7 +1993,7 @@ export default function App({
   const [drawer, setDrawer] = React.useState<
     "layers" | "assets" | "tasks" | null
   >(null);
-  const [assetView, setAssetView] = React.useState<"canvas" | "library">("canvas");
+  const [assetView, setAssetView] = React.useState<"canvas" | "library">("library");
   const assetReferenceTarget = React.useRef<{ nodeId: string; documentId: string; kind?: "audio" }>();
   React.useEffect(() => {
     // Keep the creator target while moving between the canvas-assets tab and
@@ -1922,14 +2032,56 @@ export default function App({
   const [voiceCatalogError, setVoiceCatalogError] = React.useState("");
   const [cloudError, setCloudError] = React.useState("");
   const [cloudSync, dispatchCloudSync] = React.useReducer(cloudSyncFeedback, initialCloudSyncFeedback);
+  const cloudSyncRef = React.useRef(cloudSync);
+  cloudSyncRef.current = cloudSync;
   const cloudSyncAttempt = React.useRef(0);
+  const [saveProgress, setSaveProgress] = React.useState<SaveProgress>(idleSaveProgress);
+  const saveProgressAttempt = React.useRef(0);
+  const saveProgressRef = React.useRef<SaveProgress>(idleSaveProgress);
+  const updateSaveProgress = React.useCallback((progress: SaveProgress) => {
+    saveProgressRef.current = progress;
+    setSaveProgress(progress);
+  }, []);
+  const [manualSavePending, setManualSavePending] = React.useState(false);
+  const manualSaveInFlight = React.useRef(false);
+  const retryCloudSyncRef = React.useRef<() => void>(() => {});
   const [cloudCandidate, setCloudCandidate] = React.useState<Document | null>(
     null,
   );
+  const [cloudMergePending, setCloudMergePending] = React.useState(false);
+  const [cloudMergeError, setCloudMergeError] = React.useState("");
+  const cloudMergeRecoveryRef = React.useRef<{ candidateSignature: string } | null>(null);
+  const cloudBaseRef = React.useRef<Document | null>(null);
+  const rememberCloudBase = async (value: Document | null) => {
+    const snapshot = value ? clone(value) : null;
+    cloudBaseRef.current = snapshot;
+    if (snapshot)
+      await writeDraft(`cloud-base:${snapshot.id}`, snapshot).catch(() => {});
+    else
+      await removeDraft(`cloud-base:${initialDocument.id}`).catch(() => {});
+  };
+  const cloudReconcileRef = React.useRef(false);
+  // A platform refresh can finish after a newer save, collaboration merge, or
+  // explicit reload. Ignore its document decision so a stale read cannot
+  // reopen a prompt that the newer operation already resolved.
+  const cloudResolutionEpoch = React.useRef(0);
   const [recovery, setRecovery] = React.useState<Document | null>(null);
   const [exportError, setExportError] = React.useState("");
-  const lastLocalSave = React.useRef(initialDocument.updatedAt);
-  const saveStatus = cloudSync.error ? syncFailureStatus(lastLocalSave.current === doc.updatedAt) : status;
+  const lastLocalSave = React.useRef(new Map<string, string>());
+  const isLocallySaved = (value: Pick<Document, "id" | "updatedAt">) =>
+    lastLocalSave.current.get(value.id) === documentSaveRevision(value);
+  const currentCloudRevision = documentSaveRevision(doc);
+  const currentCloudSyncing = cloudSync.syncing && cloudSync.syncingRevision === currentCloudRevision;
+  const currentSaveProgress = saveProgress.revision === currentCloudRevision ? saveProgress.phase : "idle";
+  const saveBusy = manualSavePending || currentSaveProgress !== "idle" || currentCloudSyncing;
+  const currentCloudSyncError = cloudSync.errorRevision === currentCloudRevision && !saveBusy ? cloudSync.error : "";
+  const saveStatus = currentSaveProgress === "local"
+    ? "正在保存到本机…"
+    : currentSaveProgress === "cloud" || currentCloudSyncing
+      ? "正在同步云端…"
+      : currentCloudSyncError
+        ? syncFailureStatus(isLocallySaved(doc))
+        : status;
   const alive = React.useRef(true);
   const leaving = React.useRef(false);
   const [navigating, setNavigating] = React.useState(false);
@@ -1962,14 +2114,6 @@ export default function App({
     clearZoomDraft();
   };
   const [toolMenu, setToolMenu] = React.useState(false);
-  const [layoutMenu, setLayoutMenu] = React.useState(false);
-  // Keep the layout menu attached to the control that opened it. The same
-  // action is available in the canvas utilities and in the selection toolbar;
-  // rendering it only in the utilities made it appear detached (and clipped)
-  // when opened from a selection.
-  const [layoutMenuAnchor, setLayoutMenuAnchor] = React.useState<"utility" | "selection">("utility");
-  const [layoutRows, setLayoutRows] = React.useState(3);
-  const [layoutSort, setLayoutSort] = React.useState<"position" | "time" | "name" | "custom">("position");
   const toolMenuAnchor = React.useRef<HTMLDivElement>(null);
   const toolMenuPanel = React.useRef<HTMLDivElement>(null);
   const toolMenuId = React.useId();
@@ -1978,22 +2122,25 @@ export default function App({
     const panel = toolMenuPanel.current;
     const anchor = toolMenuAnchor.current;
     if (!panel || !anchor) return;
+    const editor = anchor.closest<HTMLElement>(".canvas-workbench-editor");
     const place = () => {
-      const rect = anchor.getBoundingClientRect();
-      const editor = anchor.closest(".canvas-workbench-editor")?.getBoundingClientRect();
-      const center = rect.left + rect.width / 2;
-      const width = panel.offsetWidth;
-      const left = Math.max((editor?.left || 0) + 8,
-        Math.min(center - width / 2, (editor?.right || innerWidth) - width - 8));
-      panel.style.left = `${left - rect.left}px`;
-      panel.style.setProperty("--tool-menu-arrow", `${center - left}px`);
+      applyPopoverPosition({
+        panel,
+        anchor,
+        bounds: visiblePopoverBounds(editor?.getBoundingClientRect()),
+        preferredPlacement: "above",
+        align: "center",
+        gap: 10,
+        edgePadding: 8,
+        arrowInset: 12,
+        arrowVariable: "--tool-menu-arrow",
+        placementClass: "is-below",
+      });
     };
     place();
-    const resize = new ResizeObserver(place);
-    resize.observe(anchor.closest(".canvas-workbench-editor") || anchor);
-    window.addEventListener("resize", place);
+    const stopObserving = observePopoverPosition(anchor, panel, editor, place);
     (panel.querySelector<HTMLElement>('[aria-checked="true"]') || panel.querySelector<HTMLElement>("button"))?.focus({ preventScroll: true });
-    return () => { resize.disconnect(); window.removeEventListener("resize", place); };
+    return stopObserving;
   }, [toolMenu]);
   const [canvasPreferences, setCanvasPreferences] = React.useState<CanvasPreferences>(() => loadCanvasPreferences());
   const updateCanvasPreferences = React.useCallback((patch: Partial<CanvasPreferences>) => {
@@ -2016,15 +2163,30 @@ export default function App({
   const storageRequestRevision = React.useRef<number | null>(null);
   const storageRequestSequence = React.useRef(0);
   const announcedSettingsErrors = React.useRef(new Map<string, string>());
+  const announcedCreationError = React.useRef("");
+  React.useEffect(() => {
+    if (!creationError) {
+      announcedCreationError.current = "";
+      return;
+    }
+    const key = `${creationError.id}\0${creationError.message}`;
+    if (announcedCreationError.current === key) return;
+    announcedCreationError.current = key;
+    setMessage(creationError.message);
+  }, [creationError, setMessage]);
   React.useEffect(() => {
     const notices: Array<[string, string, { label: string; run: () => void }?]> = [
       ["connection", connectionError],
       ["video-catalog", videoCatalogError],
       ["music-catalog", musicCatalogError],
       ["voice-catalog", voiceCatalogError],
+      ["profile", platformProfileError],
       ["cloud", cloudError],
       ["storage", storageActionError, { label: "重试", run: () => void loadStorage() }],
-      ["sync", cloudSync.error || "", { label: "重试云端同步", run: () => void persist(docRef.current, true).catch(() => {}) }],
+      ["sync", currentCloudSyncError, {
+        label: "重试云端同步",
+        run: () => retryCloudSyncRef.current(),
+      }],
       ["export", exportError, { label: "仅导出可用内容", run: () => downloadDocument(docRef.current, true) }],
     ];
     for (const [key, text, action] of notices) {
@@ -2036,8 +2198,16 @@ export default function App({
       announcedSettingsErrors.current.set(key, text);
       setMessage(text, action);
     }
-  }, [cloudError, cloudSync.error, connectionError, exportError, setMessage, storageActionError, videoCatalogError, musicCatalogError, voiceCatalogError]);
+  }, [cloudError, currentCloudSyncError, connectionError, exportError, platformProfileError, setMessage, storageActionError, videoCatalogError, musicCatalogError, voiceCatalogError]);
   const [preview, setPreview] = React.useState<CanvasNode | null>(null);
+  const previewNavigationContext = React.useRef<{ previewId: string; context: MediaNavigationContext<CanvasNode> } | null>(null);
+  const closePreview = () => {
+    // Clear the context in the same event as the preview state. A passive
+    // effect from an earlier close must not erase a gallery opened immediately
+    // afterward.
+    previewNavigationContext.current = null;
+    setPreview(null);
+  };
   const audioSources = useAudioSources({
     document: doc, getDocument: () => docRef.current, ready: platformReady && draftReady,
     api: client.api,
@@ -2079,6 +2249,20 @@ export default function App({
       if (selected.length === 1 && selected[0] === node.id || preview?.id === node.id) void audioSources.load(node);
     }
   }, [doc, selected, preview?.id, audioSources.load, audioSources.errors, audioSources.urls, audioSources.loading]);
+  const notifiedAudioErrors = React.useRef(new Map<string, string>());
+  React.useEffect(() => {
+    for (const [id, message] of Object.entries(audioSources.errors)) {
+      if (!message) continue;
+      const node = doc.nodes.find(value => value.id === id);
+      if (!node || !selected.includes(id) || preview?.id === id) continue;
+      if (notifiedAudioErrors.current.get(id) === message) continue;
+      notifiedAudioErrors.current.set(id, message);
+      setMessage(message, { label: "重试加载", run: () => { void audioSources.load(node, true); } });
+    }
+    for (const id of [...notifiedAudioErrors.current.keys()]) {
+      if (!audioSources.errors[id] || !doc.nodes.some(node => node.id === id)) notifiedAudioErrors.current.delete(id);
+    }
+  }, [audioSources.errors, audioSources.load, doc.nodes, preview?.id, selected, setMessage]);
   const previewAudio = preview && (preview.type === "audio" || preview.mediaType === "audio") ? preview : undefined;
   const selectedAudio = selected.length === 1 ? doc.nodes.find(node => node.id === selected[0] && (node.type === "audio" || node.mediaType === "audio")) : undefined;
   const waveformTargetId = previewAudio?.id || selectedAudio?.id;
@@ -2114,23 +2298,40 @@ export default function App({
   const galleryFocusRestorePending = React.useRef(false);
   const taskFeedbackContext = React.useRef({ selected, inspectorMode, overlay, preview });
   taskFeedbackContext.current = { selected, inspectorMode, overlay, preview };
-  // A completion toast adds no value while the user is still looking at the
-  // task's creation panel: the inline result state is already visible there.
-  // Keep consuming the event in the notification gate so a muted/suppressed
-  // result is not replayed when the panel closes later.
+  // A completion toast adds no value while the user is already looking at the
+  // result, either in the media preview or on the canvas. Keep consuming the
+  // event in the notification gate so a muted/suppressed result is not
+  // replayed when the preview or panel closes later.
   const completionNoticeContext = (
     resultNodes: Array<Pick<CanvasNode, "id" | "x" | "y" | "width" | "height">>,
     selectedNodeIds?: string[],
   ) => {
     const context = taskFeedbackContext.current;
     const selectedIds = selectedNodeIds ?? context.selected;
+    const previewingResult = Boolean(context.preview && resultNodes.some(node => node.id === context.preview?.id));
     return {
-      userViewingResult: !context.overlay && !context.preview && resultNodes.some(node =>
-        selectedIds.includes(node.id) && isRectInViewport(node, docRef.current.viewport, boardSize),
+      userViewingResult: previewingResult || (
+        !context.overlay && !context.preview && resultNodes.some(node =>
+          selectedIds.includes(node.id) && isRectInViewport(node, docRef.current.viewport, boardSize),
+        )
       ),
     };
   };
   const [imageLoadStates, setImageLoadStates] = React.useState<Record<string, ImageLoadState>>({});
+  // Keep the source that was actually decoded so a refreshed URL does not
+  // briefly reuse the previous image's ready state.
+  const loadedImageSources = React.useRef(new Map<string, string>());
+  const [mediaUploadStates, setMediaUploadStates] = React.useState<Record<string, MediaUploadRuntimeState>>({});
+  // Progress callbacks can arrive between React renders. Keep the latest
+  // state outside the render closure so a rejection preserves the measured
+  // upload position instead of falling back to the previous render's value.
+  const mediaUploadStatesRef = React.useRef<Record<string, MediaUploadRuntimeState>>({});
+  const updateMediaUploadStates = React.useCallback((change: (current: Record<string, MediaUploadRuntimeState>) => Record<string, MediaUploadRuntimeState>) => {
+    const next = change(mediaUploadStatesRef.current);
+    mediaUploadStatesRef.current = next;
+    setMediaUploadStates(next);
+  }, []);
+  const mediaUploadFiles = React.useRef(new Map<string, PendingImageUpload>());
   // Keep a small LRU window of successfully loaded media mounted across
   // viewport culling. Visible and selected nodes are pinned independently;
   // this bounded window avoids mounting every media node visited over time.
@@ -2157,13 +2358,17 @@ export default function App({
   const [videoCaptureRequests, setVideoCaptureRequests] = React.useState<Record<string, number>>({});
   const [videoCaptureReadyIds, setVideoCaptureReadyIds] = React.useState<Set<string>>(() => new Set());
   const [videoPlaybackStates, setVideoPlaybackStates] = React.useState<Record<string, { duration: number; time: number; ready: boolean }>>({});
+  const [videoToolPlaybackLocks, setVideoToolPlaybackLocks] = React.useState<Set<string>>(() => new Set());
   const [videoProcessRequests, setVideoProcessRequests] = React.useState<Record<string, VideoProcessRequest>>({});
   const videoProcessJobs = React.useRef(new Map<string, VideoProcessRequest>());
   const videoProcessAbortControllers = React.useRef(new Map<string, AbortController>());
+  const videoProcessHistorySignatures = React.useRef(new Map<string, string>());
+  const rollbackVideoProcessHistory = React.useRef<(targetId: string, baselineSignature: string, cleanSignature: string) => void>(() => {});
   const saveVideoProcessResultRef = React.useRef<((blob: Blob, request: VideoProcessRequest, signal: AbortSignal) => Promise<void>)>();
   const videoProcessSequence = React.useRef(0);
   const [videoProcessBusyIds, setVideoProcessBusyIds] = React.useState<Set<string>>(() => new Set());
   const [videoProcessProgress, setVideoProcessProgress] = React.useState<Record<string, number>>({});
+  const [videoProcessStatus, setVideoProcessStatus] = React.useState<Record<string, string>>({});
   const [videoProcessErrors, setVideoProcessErrors] = React.useState<Record<string, string>>({});
   const [videoProcessCancels, setVideoProcessCancels] = React.useState<Record<string, number>>({});
   const onVideoCaptureReadyChange = React.useCallback((nodeId: string, ready: boolean) => {
@@ -2182,30 +2387,131 @@ export default function App({
       return { ...current, [nodeId]: next };
     });
   }, []);
+  const onVideoToolPlaybackLockChange = React.useCallback((nodeId: string, locked: boolean) => {
+    setVideoToolPlaybackLocks(current => {
+      if (current.has(nodeId) === locked) return current;
+      const next = new Set(current);
+      if (locked) next.add(nodeId);
+      else next.delete(nodeId);
+      return next;
+    });
+  }, []);
   const startVideoProcess = React.useCallback((nodeId: string, options: VideoEditOptions) => {
     const node = docRef.current.nodes.find(item => item.id === nodeId);
     if (!alive.current || leaving.current || pendingRemovalNodes.current.has(nodeId) || !node || !canLoadVideoContent(node) || videoProcessJobs.current.has(nodeId)) return;
-    const request: VideoProcessRequest = { id: ++videoProcessSequence.current, options: { ...options }, source: videoSources.current.capture(docRef.current.id, node) };
+    const targetNodeId = options.operation === "extract-audio" ? uid("audio") : undefined;
+    const request: VideoProcessRequest = { id: ++videoProcessSequence.current, options: { ...options }, source: videoSources.current.capture(docRef.current.id, node), targetNodeId };
+    if (targetNodeId) {
+      videoProcessHistorySignatures.current.set(targetNodeId, documentSignature(docRef.current));
+      const size = DEFAULT_AUDIO_NODE_SIZE;
+      const target: CanvasNode = {
+        id: targetNodeId,
+        type: "audio",
+        mediaType: "audio",
+        title: `${displayNodeTitle(node)} · 提取音频`.slice(0, 160),
+        text: `提取自「${displayNodeTitle(node)}」`,
+        ...size,
+        ...findFreePosition(docRef.current.nodes, { x: node.x + node.width + 40, y: node.y, ...size }),
+        color: node.color,
+        groupId: node.groupId,
+        status: "running",
+        resultOf: node.id,
+        operationId: "extract-audio",
+        operationParams: { sourceNodeId: node.id, startTime: options.startTime, endTime: options.endTime },
+        audioMode: "recording",
+      };
+      commit(value => {
+        const nodes = [...value.nodes, target];
+        return {
+          ...value,
+          nodes,
+          edges: [...value.edges, { id: uid("edge"), from: node.id, to: target.id }],
+          groups: expandGroupFrames(nodes, value.groups),
+        };
+      });
+      setSelected([target.id]);
+      setSelectedEdge(null);
+      setInspectorOpen(false);
+      reveal([node, target]);
+    }
     videoProcessJobs.current.set(nodeId, request);
     setVideoProcessErrors(current => { if (!(nodeId in current)) return current; const next = { ...current }; delete next[nodeId]; return next; });
-    setVideoProcessBusyIds(current => new Set(current).add(nodeId));
-    setVideoProcessProgress(current => ({ ...current, [nodeId]: 0 }));
+    setVideoProcessBusyIds(current => new Set([...current, nodeId, ...(targetNodeId ? [targetNodeId] : [])]));
+    const progressNodeId = targetNodeId || nodeId;
+    setVideoProcessProgress(current => ({ ...current, [progressNodeId]: 0 }));
+    if (targetNodeId) setVideoProcessStatus(current => ({ ...current, [targetNodeId]: "正在准备音频提取…" }));
     if (options.operation === "extract-video") {
       const controller = new AbortController();
       videoProcessAbortControllers.current.set(nodeId, controller);
-      setVideoProcessProgress(current => ({ ...current, [nodeId]: 10 }));
+      setVideoProcessStatus(current => ({ ...current, [nodeId]: "正在准备视频资源…" }));
       void (async () => {
         try {
+          // Let React paint the busy dialog and pause the selected player
+          // before the shared-source fast path completes in the same turn.
+          await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+          controller.signal.throwIfAborted();
           const source = docRef.current.nodes.find(item => item.id === nodeId);
           if (!source || !videoSources.current.isCurrent(request.source, docRef.current.id, source)) throw new DOMException("原视频或画布已变化，提取已停止。", "AbortError");
           const delivery = runtimeVideoSources.current.get(nodeId);
           const deliveryNode = delivery && videoSources.current.isCurrent(request.source, docRef.current.id, source)
             ? { ...source, video: delivery.url, videoContentUrl: delivery.url, assetId: source.assetId || delivery.assetId, videoContentUrlExpiresAt: delivery.urlExpiresAt }
             : source;
-          const blob = await readVideoSourceBlob(client.api, deliveryNode, { signal: controller.signal, maxBytes: LOCAL_VIDEO_MAX_BYTES });
+          if (canReuseVideoContent(source) && hasStableMediaIdentity({
+            assetId: source.assetId,
+            taskId: source.taskId,
+            url: source.videoContentUrl || source.video,
+          })) {
+            controller.signal.throwIfAborted();
+            const current = docRef.current.nodes.find(item => item.id === nodeId);
+            if (!current || !videoSources.current.isCurrent(request.source, docRef.current.id, current)) throw new DOMException("原视频或画布已变化，提取已停止。", "AbortError");
+            const size = fitVideoNodeSize(current.width, current.height);
+            const node: CanvasNode = {
+              id: uid("video"), type: "video", mediaType: "video",
+              title: `${displayNodeTitle(current)} · 提取视频`.slice(0, 160),
+              text: `提取自「${displayNodeTitle(current)}」`,
+              ...size,
+              ...findFreePosition(docRef.current.nodes, { x: current.x + current.width + 40, y: current.y, ...size }),
+              color: current.color, groupId: current.groupId, status: "completed", resultOf: current.id,
+              ...(current.localVideo ? { localVideo: current.localVideo } : {}),
+              ...(deliveryNode.video ? { video: deliveryNode.video } : current.video ? { video: current.video } : {}),
+              ...(deliveryNode.videoContentUrl ? { videoContentUrl: deliveryNode.videoContentUrl } : {}),
+              ...(deliveryNode.videoContentUrlExpiresAt ? { videoContentUrlExpiresAt: deliveryNode.videoContentUrlExpiresAt } : {}),
+              ...(deliveryNode.assetId ? { assetId: deliveryNode.assetId } : {}),
+              ...(current.taskId ? { taskId: current.taskId } : {}),
+              ...(current.videoDuration ? { videoDuration: current.videoDuration } : {}),
+              operationId: "extract-video",
+              operationParams: { sourceNodeId: current.id, startTime: options.startTime, endTime: options.endTime, reusedSource: true },
+            };
+            commit(value => {
+              const nodes = [...value.nodes, node];
+              return {
+                ...value,
+                nodes,
+                edges: [...value.edges, { id: uid("edge"), from: current.id, to: node.id }],
+                groups: expandGroupFrames(nodes, value.groups),
+              };
+            });
+            setSelected([node.id]); setSelectedEdge(null); setInspectorOpen(false);
+            reveal([current, node]);
+            clearVideoProcess(nodeId, request);
+            setMessage("已复用原视频资源并添加为新节点。", undefined, 3000);
+            return;
+          }
+          const blob = await readVideoSourceBlob(client.api, deliveryNode, {
+            signal: controller.signal,
+            maxBytes: LOCAL_VIDEO_MAX_BYTES,
+            onProgress: ({ loadedBytes, totalBytes }) => {
+              if (videoProcessJobs.current.get(nodeId) !== request) return;
+              const loaded = (loadedBytes / (1024 * 1024)).toFixed(1);
+              const total = totalBytes ? ` / ${(totalBytes / (1024 * 1024)).toFixed(1)} MB` : " MB";
+              setVideoProcessStatus(current => ({ ...current, [nodeId]: `正在读取视频 · ${loaded}${total}` }));
+              setVideoProcessProgress(current => ({ ...current, [nodeId]: totalBytes ? Math.min(55, loadedBytes / totalBytes * 55) : 0 }));
+            },
+          });
           controller.signal.throwIfAborted();
           if (videoProcessJobs.current.get(nodeId) !== request) throw new DOMException("提取已停止。", "AbortError");
-          setVideoProcessProgress(current => ({ ...current, [nodeId]: 90 }));
+          setVideoProcessStatus(current => ({ ...current, [nodeId]: "正在保存视频并创建节点…" }));
+          setVideoProcessProgress(current => ({ ...current, [nodeId]: 0 }));
           if (!saveVideoProcessResultRef.current) throw new Error("视频提取暂不可用，请重试。");
           await saveVideoProcessResultRef.current(blob, request, controller.signal);
         } catch (error) {
@@ -2224,22 +2530,92 @@ export default function App({
     setVideoProcessRequests(current => ({ ...current, [nodeId]: request }));
   }, []);
   const clearVideoProcess = React.useCallback((nodeId: string, request?: VideoProcessRequest) => {
-    if (request && videoProcessJobs.current.get(nodeId) !== request) return;
-    videoProcessAbortControllers.current.get(nodeId)?.abort();
-    videoProcessAbortControllers.current.delete(nodeId);
-    videoProcessJobs.current.delete(nodeId);
-    setVideoProcessRequests(current => { if (!current[nodeId]) return current; const next = { ...current }; delete next[nodeId]; return next; });
-    setVideoProcessBusyIds(current => { if (!current.has(nodeId)) return current; const next = new Set(current); next.delete(nodeId); return next; });
-    setVideoProcessProgress(current => { if (!(nodeId in current)) return current; const next = { ...current }; delete next[nodeId]; return next; });
-    setVideoProcessErrors(current => { if (!(nodeId in current)) return current; const next = { ...current }; delete next[nodeId]; return next; });
+    const activeSourceId = videoProcessJobs.current.has(nodeId)
+      ? nodeId
+      : [...videoProcessJobs.current.entries()].find(([, active]) => active.targetNodeId === nodeId)?.[0];
+    const activeRequest = request || (activeSourceId ? videoProcessJobs.current.get(activeSourceId) : undefined);
+    const sourceId = activeSourceId || nodeId;
+    if (request && videoProcessJobs.current.get(sourceId) !== request) return;
+    const targetId = activeRequest?.targetNodeId;
+    if (targetId && docRef.current.nodes.some(node => node.id === targetId && node.status === "completed")) {
+      videoProcessHistorySignatures.current.delete(targetId);
+    }
+    videoProcessAbortControllers.current.get(sourceId)?.abort();
+    if (!request && targetId && activeRequest?.options.operation === "extract-audio" && !videoProcessAbortControllers.current.has(sourceId)) {
+      setVideoProcessCancels(current => ({ ...current, [sourceId]: (current[sourceId] || 0) + 1 }));
+    }
+    videoProcessAbortControllers.current.delete(sourceId);
+    videoProcessJobs.current.delete(sourceId);
+    setVideoProcessRequests(current => { if (!current[sourceId]) return current; const next = { ...current }; delete next[sourceId]; return next; });
+    setVideoProcessBusyIds(current => {
+      if (!current.has(sourceId) && (!targetId || !current.has(targetId))) return current;
+      const next = new Set(current);
+      next.delete(sourceId);
+      if (targetId) next.delete(targetId);
+      return next;
+    });
+    setVideoProcessProgress(current => {
+      const ids = [sourceId, targetId].filter((id): id is string => Boolean(id));
+      if (!ids.some(id => id in current)) return current;
+      const next = { ...current };
+      ids.forEach(id => delete next[id]);
+      return next;
+    });
+    setVideoProcessStatus(current => {
+      const ids = [sourceId, targetId].filter((id): id is string => Boolean(id));
+      if (!ids.some(id => id in current)) return current;
+      const next = { ...current };
+      ids.forEach(id => delete next[id]);
+      return next;
+    });
+    setVideoProcessErrors(current => {
+      const ids = [sourceId, targetId].filter((id): id is string => Boolean(id));
+      if (!ids.some(id => id in current)) return current;
+      const next = { ...current };
+      ids.forEach(id => delete next[id]);
+      return next;
+    });
+    if (activeRequest?.options.operation === "extract-audio") removePendingAudioProcessNode(activeRequest);
   }, []);
   const cancelVideoProcess = React.useCallback((nodeId: string) => {
-    const controller = videoProcessAbortControllers.current.get(nodeId);
+    const sourceId = videoProcessJobs.current.has(nodeId)
+      ? nodeId
+      : [...videoProcessJobs.current.entries()].find(([, request]) => request.targetNodeId === nodeId)?.[0];
+    if (!sourceId) return;
+    const controller = videoProcessAbortControllers.current.get(sourceId);
     if (controller) controller.abort();
-    else setVideoProcessCancels(current => ({ ...current, [nodeId]: (current[nodeId] || 0) + 1 }));
+    else setVideoProcessCancels(current => ({ ...current, [sourceId]: (current[sourceId] || 0) + 1 }));
   }, []);
   const clearVideoProcessError = React.useCallback((nodeId: string) => {
     setVideoProcessErrors(current => { if (!(nodeId in current)) return current; const next = { ...current }; delete next[nodeId]; return next; });
+  }, []);
+  const removePendingAudioProcessNode = React.useCallback((request: VideoProcessRequest) => {
+    const targetId = request.targetNodeId;
+    if (!targetId) return;
+    const baselineSignature = videoProcessHistorySignatures.current.get(targetId);
+    const currentTarget = docRef.current.nodes.find(node => node.id === targetId);
+    if (currentTarget?.status === "completed") {
+      videoProcessHistorySignatures.current.delete(targetId);
+      return;
+    }
+    if (!currentTarget || currentTarget.status !== "running") {
+      if (baselineSignature) rollbackVideoProcessHistory.current(targetId, baselineSignature, documentSignature(docRef.current));
+      videoProcessHistorySignatures.current.delete(targetId);
+      return;
+    }
+    const remaining = docRef.current.nodes.filter(node => node.id !== targetId);
+    const result = rebuildGroupStateFromNodes(remaining);
+    const cleanDocument = {
+      ...docRef.current,
+      ...result,
+      edges: docRef.current.edges.filter(edge => edge.from !== targetId && edge.to !== targetId),
+      updatedAt: now(),
+    };
+    if (baselineSignature) rollbackVideoProcessHistory.current(targetId, baselineSignature, documentSignature(cleanDocument));
+    videoProcessHistorySignatures.current.delete(targetId);
+    dirty.current = true;
+    replaceDoc(cleanDocument);
+    setSelected(current => current.filter(id => id !== targetId));
   }, []);
   const [videoLoadingIds, setVideoLoadingIds] = React.useState<string[]>([]);
   const [videoLoadErrors, setVideoLoadErrors] = React.useState<Record<string, string>>({});
@@ -2272,7 +2648,22 @@ export default function App({
       return next;
     });
   }, []);
-  const previewNavigation = React.useMemo(() => preview ? mediaNavigation(doc.nodes, doc.edges, preview) : null, [doc.nodes, doc.edges, preview]);
+  const previewNavigation = React.useMemo(() => {
+    if (!preview) return null;
+    const activeContext = previewNavigationContext.current;
+    return activeContext?.previewId === preview.id
+      ? mediaNavigationFromContext(doc.nodes, preview, activeContext.context)
+      : mediaNavigation(doc.nodes, doc.edges, preview);
+  }, [doc.nodes, doc.edges, preview]);
+  React.useEffect(() => {
+    if (!preview) return;
+    if (previewNavigationContext.current?.previewId === preview.id) return;
+    const currentDocument = docRef.current;
+    previewNavigationContext.current = {
+      previewId: preview.id,
+      context: createMediaNavigationContext(mediaNavigation(currentDocument.nodes, currentDocument.edges, preview)),
+    };
+  }, [preview?.id]);
   const displayImageSource = React.useCallback((source?: string) => {
     const original = imageOriginalURL(source);
     if (!original) return original;
@@ -2296,52 +2687,24 @@ export default function App({
   }, []);
   const resolveImageToolSource = async (node: CanvasNode) => {
     const source = node.image;
-    if (!source && node.localImage) {
-      const local = await readCachedImage(node.localImage).catch(() => null);
-      if (local) return local;
-    }
     if (!source) return undefined;
-    if (/^data:image\//i.test(source)) return source;
+    // Image tools operate on the durable COS/platform delivery. A Data URL or
+    // browser-local object is an in-memory intermediate, never a recovery path.
+    if (!/^https?:\/\//i.test(source)) return undefined;
     const original = imageOriginalURL(source) || source;
-    const cached = getCachedRemoteImage(source) || getCachedRemoteImage(original);
-    if (cached) return cached;
-    if (!/^https?:\/\//i.test(original)) return source;
-    // Tool operations export a canvas. Warm the existing content-addressed
-    // cache first so COS signed URLs do not become a tainted canvas source.
-    const localImage = await cacheRemoteImage(original).catch(() => null);
-    if (!localImage) return original;
-    const local = await readCachedImage(localImage).catch(() => null);
-    if (!local) return original;
-    return local;
+    // Image tools must read the current Gateway/COS delivery directly. A
+    // browser cache or host cache is not a durable image source and must not
+    // become an implicit fallback for an edit operation.
+    return original;
   };
   /**
-   * Resolve bytes for an explicit download. Canvas cards may still display a
-   * stale signed URL because their local cache already has the image. Prefer
-   * those durable bytes, then refresh reusable media by its stable asset ID
-   * before falling back to the URL stored in the document.
+   * Resolve bytes for an explicit download from the durable COS/platform
+   * delivery. Browser-local image keys and inline data are never download
+   * fallbacks.
    */
   const resolveImageDownloadSource = async (node: CanvasNode) => {
     let source = node.image;
-    if (source && /^(?:data|blob):/i.test(source)) return source;
-    if (!source && node.localImage) {
-      const local = await readCachedImage(node.localImage).catch(() => null);
-      if (local) return local;
-    }
 
-    // Desktop/opaque-iframe hosts can retain the original bytes outside the
-    // page's IndexedDB. Reuse that cache before requesting a new signed URL.
-    if (node.assetId || node.taskId) {
-      const hostCached = await readHostCachedImage({
-        assetId: node.assetId,
-        taskId: node.taskId,
-        resultIndex: node.resultIndex,
-      }).catch(() => undefined);
-      if (hostCached?.image) return hostCached.image;
-    }
-
-    // Inline and runtime blob sources are already complete; refreshing an
-    // optional platform asset for them would only introduce another failure
-    // path for a download that can be fulfilled locally.
     if (node.assetId) {
       try {
         const asset = await readPlatformAsset(client.api, node.assetId);
@@ -2351,21 +2714,9 @@ export default function App({
         // index is temporarily unavailable.
       }
     }
-    if (!source) return undefined;
+    if (!source || !/^https?:\/\//i.test(source)) return undefined;
 
-    const original = imageOriginalURL(source) || source;
-    const cached = getCachedRemoteImage(source) || getCachedRemoteImage(original);
-    if (cached) return cached;
-    if (!/^https?:\/\//i.test(original)) return original;
-
-    // Resolve through the content-addressed cache first. This both avoids
-    // downloading the same image twice and repairs an expired signed URL when
-    // the browser already has the bytes locally.
-    const localImage = await cacheRemoteImage(original).catch(() => null);
-    if (!localImage) return original;
-    const local = await readCachedImage(localImage).catch(() => null);
-    if (!local) return original;
-    return local;
+    return imageOriginalURL(source) || source;
   };
   const selectPreview = (node: CanvasNode, options: { preserveInspector?: boolean } = {}) => {
     cancelDeferredCreator();
@@ -2377,13 +2728,37 @@ export default function App({
     if (!options.preserveInspector) setInspectorOpen(false);
     // Signed delivery URLs are runtime data; stable task/asset identities are
     // sufficient to restore them through the existing detail APIs.
-    const delivery = runtimeVideoSources.current.get(node.id);
-    setPreview(delivery ? { ...node, video: delivery.url, videoContentUrl: delivery.url, videoContentUrlExpiresAt: delivery.urlExpiresAt } : node);
+    const currentDocument = docRef.current;
+    const currentNode = currentDocument.nodes.find((candidate) => candidate.id === node.id) || node;
+    previewNavigationContext.current = {
+      previewId: currentNode.id,
+      context: createMediaNavigationContext(mediaNavigation(currentDocument.nodes, currentDocument.edges, currentNode)),
+    };
+    const delivery = runtimeVideoSources.current.get(currentNode.id);
+    setPreview(delivery ? { ...currentNode, video: delivery.url, videoContentUrl: delivery.url, videoContentUrlExpiresAt: delivery.urlExpiresAt } : currentNode);
   };
   const selectGalleryPreview = (node: CanvasNode, options: { preserveInspector?: boolean } = {}) => {
     const active = document.activeElement as HTMLElement | null;
     galleryFocusRestorePending.current = Boolean(active?.closest(".media-preview-stage,.media-preview-gallery"));
-    selectPreview(node, options);
+    cancelDeferredCreator();
+    setExportError("");
+    if (!options.preserveInspector) setInspectorOpen(false);
+    const currentDocument = docRef.current;
+    const currentNode = currentDocument.nodes.find((candidate) => candidate.id === node.id) || node;
+    // Preserve the gallery IDs captured when it opened. Re-deriving here from
+    // a refreshed node snapshot can lose batch metadata and trap navigation
+    // on the selected item only.
+    const activeNavigationContext = previewNavigationContext.current;
+    if (activeNavigationContext && activeNavigationContext.previewId === preview?.id)
+      activeNavigationContext.previewId = node.id;
+    else {
+      previewNavigationContext.current = {
+        previewId: currentNode.id,
+        context: createMediaNavigationContext(mediaNavigation(currentDocument.nodes, currentDocument.edges, currentNode)),
+      };
+    }
+    const delivery = runtimeVideoSources.current.get(currentNode.id);
+    setPreview(delivery ? { ...currentNode, video: delivery.url, videoContentUrl: delivery.url, videoContentUrlExpiresAt: delivery.urlExpiresAt } : currentNode);
   };
   const loadVideoNode = React.useCallback(async (node: CanvasNode, forceRefresh = false) => {
     const current = docRef.current.nodes.find(candidate => candidate.id === node.id);
@@ -2525,6 +2900,13 @@ export default function App({
   }, [clearVideoNodeRuntime, clearVideoProcess, doc.id, doc.nodes]);
   React.useEffect(() => {
     const nodeIds = new Set(doc.nodes.map((node) => node.id));
+    const imageSources = new Map(doc.nodes.map((node) => [
+      node.id,
+      displayImageThumbnail(node.image, node.imageThumbnail),
+    ]));
+    for (const [id, source] of loadedImageSources.current) {
+      if (!imageSources.has(id) || imageSources.get(id) !== source) loadedImageSources.current.delete(id);
+    }
     setImageLoadStates((states) => {
       const removed = Object.keys(states).filter((id) => !nodeIds.has(id));
       if (!removed.length) return states;
@@ -2535,7 +2917,7 @@ export default function App({
       });
       return next;
     });
-  }, [doc.nodes]);
+  }, [doc.nodes, displayImageThumbnail]);
   React.useEffect(() => {
     // Retain only media that still belongs to the current document. A node
     // can lose its source after an edit, and keeping that id pinned would
@@ -2606,6 +2988,22 @@ export default function App({
     void request.then(clear, clear);
     return request;
   }, [loadVideoNode]);
+  const notifiedVideoErrors = React.useRef(new Map<string, string>());
+  React.useEffect(() => {
+    for (const [id, message] of Object.entries(videoLoadErrors)) {
+      if (!message) continue;
+      const node = doc.nodes.find(value => value.id === id);
+      // Viewport warmups are opportunistic; only announce failures for a
+      // selected node. The gallery owns notices while it is open.
+      if (!node || !selected.includes(id) || preview?.id === id) continue;
+      if (notifiedVideoErrors.current.get(id) === message) continue;
+      notifiedVideoErrors.current.set(id, message);
+      setMessage(message, { label: "重试加载", run: () => { void retryVideoNode(id); } });
+    }
+    for (const id of [...notifiedVideoErrors.current.keys()]) {
+      if (!videoLoadErrors[id] || !doc.nodes.some(node => node.id === id)) notifiedVideoErrors.current.delete(id);
+    }
+  }, [doc.nodes, preview?.id, retryVideoNode, selected, setMessage, videoLoadErrors]);
   const autoRetryVideoNode = React.useCallback((nodeId: string, recoveryKey: string) => {
     if (!videoAutoRecovery.current.tryRecover(nodeId, recoveryKey)) return Promise.resolve(false);
     return retryVideoNode(nodeId);
@@ -2672,6 +3070,38 @@ export default function App({
   const previousNearConnection = React.useRef<NearConnection | null>(null);
   const nearConnectionExitTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [past, setPast] = React.useState<Document[]>([]);
+  rollbackVideoProcessHistory.current = (targetId, baselineSignature, cleanSignature) => {
+    setPast(current => {
+      let baselineIndex = -1;
+      for (let index = current.length - 1; index >= 0; index--) {
+        if (documentSignature(current[index]!) === baselineSignature) {
+          baselineIndex = index;
+          break;
+        }
+      }
+      let changed = false;
+      const next = current.map(snapshot => {
+        if (!snapshot.nodes.some(node => node.id === targetId)) return snapshot;
+        changed = true;
+        const nodes = snapshot.nodes.filter(node => node.id !== targetId);
+        const rebuilt = rebuildGroupStateFromNodes(nodes, GROUP_PADDING);
+        return {
+          ...snapshot,
+          ...rebuilt,
+          edges: snapshot.edges.filter(edge => edge.from !== targetId && edge.to !== targetId),
+        };
+      });
+      if (baselineIndex >= 0 && cleanSignature === baselineSignature) {
+        next.splice(baselineIndex, 1);
+        changed = true;
+      }
+      return changed ? next : current;
+    });
+    setFuture(current => {
+      const next = current.filter(snapshot => !snapshot.nodes.some(node => node.id === targetId));
+      return next.length === current.length ? current : next;
+    });
+  };
   const [future, setFuture] = React.useState<Document[]>([]);
   const [boardSize, setBoardSize] = React.useState({
     width: window.innerWidth,
@@ -2689,9 +3119,19 @@ export default function App({
     embeddedReference?: boolean;
     documentId?: string;
     videoReplacement?: VideoNodeSourceToken;
+    uploadNodeId?: string;
+    nodeMetadata?: ImageImportNodeMetadata;
+    sourceGuard?: () => boolean;
   } | null>(null);
   const nodeClipboard = React.useRef<CanvasNode[]>([]);
+  const nodeClipboardDocumentId = React.useRef<string | undefined>();
+  // The system clipboard carries a readable fallback for cross-tab paste;
+  // matching it lets the canvas distinguish its own node copy from ordinary
+  // text without blocking native paste in editors.
+  const nodeClipboardText = React.useRef("");
+  const nodeClipboardPreferredUntil = React.useRef(0);
   const modal = React.useRef<HTMLDivElement>(null);
+  const cloudVersionModal = React.useRef<HTMLDivElement>(null);
   const dockDrawer = React.useRef<HTMLElement>(null);
   const dockPicker = React.useRef<HTMLDivElement>(null);
   useDockPanelPosition(dockPicker, appShell, picker?.dock ? "添加节点" : null);
@@ -2702,20 +3142,26 @@ export default function App({
     const panel = shell?.querySelector<HTMLElement>(".zoom-menu");
     if (!shell || !trigger || !panel) return;
     const place = () => {
-      const shellBounds = shell.getBoundingClientRect();
-      const dock = trigger.closest<HTMLElement>(".canvas-utilities")!.getBoundingClientRect();
-      panel.style.setProperty("--zoom-menu-max-height", `${Math.max(64, dock.top - shellBounds.top - 36)}px`);
-      const a = trigger.getBoundingClientRect();
-      const b = panel.getBoundingClientRect();
-      panel.style.setProperty("--dock-arrow-x", `${Math.max(16, Math.min(b.width - 16, a.left + a.width / 2 - b.left))}px`);
+      const position = applyPopoverPosition({
+        panel,
+        anchor: trigger,
+        bounds: visiblePopoverBounds(shell.getBoundingClientRect()),
+        preferredPlacement: "above",
+        align: "end",
+        gap: 12,
+        edgePadding: 8,
+        arrowInset: 16,
+        arrowVariable: "--dock-arrow-x",
+      });
+      // Keep the menu's inner scroller inside the same vertical budget while
+      // leaving the shared positioner in charge of the outer panel bounds.
+      panel.style.setProperty("--zoom-menu-max-height", `${Math.max(1, position.maxHeight - 14)}px`);
     };
     place();
     panel.focus({ preventScroll: true });
-    const observer = new ResizeObserver(place);
-    observer.observe(shell);
-    observer.observe(trigger);
+    const stopObserving = observePopoverPosition(trigger, panel, shell, place);
     return () => {
-      observer.disconnect();
+      stopObserving();
       if (panel.contains(document.activeElement)) trigger.focus({ preventScroll: true });
     };
   }, [zoomMenu]);
@@ -2725,7 +3171,7 @@ export default function App({
   const overlayPresentation = React.useRef(false);
   if (overlay || preview) overlayPresentation.current = floatingOverlay;
   useDockPanelPosition(modal, appShell, floatingOverlay ? overlay === "settings" ? "自定义画布" : "快捷键与帮助" : null);
-  useDockPanelPosition(dockDrawer, appShell, (drawer === "layers" || drawer === "assets") ? "素材与图层" : null);
+  useDockPanelPosition(dockDrawer, appShell, (drawer === "layers" || drawer === "assets") ? drawer === "layers" ? "图层" : assetView === "library" ? "资产库" : "画布素材" : null);
 
   const dirty = React.useRef(false);
   const saveTimer = React.useRef<number | null>(null);
@@ -3192,7 +3638,7 @@ export default function App({
     ],
     [exitingGroupFrames, groupFrames, renderedGroupFrameIds],
   );
-  const aspectRepairing = React.useRef(new Set<string>());
+  const aspectRepairing = React.useRef(new Map<string, string>());
   React.useEffect(() => {
     // Aspect repair is an automatic migration. Wait until platform hydration
     // has selected the working document so it cannot manufacture a version
@@ -3202,47 +3648,100 @@ export default function App({
     // Image nodes are always rendered at the source aspect ratio. Repair old
     // square/default cards as well as any completed prompt whose dimensions no
     // longer match its bitmap; the resize handle below preserves this ratio.
-    const candidates = doc.nodes.filter((node) =>
-      Boolean(node.image) &&
-      (node.type === "image" || node.type === "prompt") &&
+    const nodesById = new Map(doc.nodes.map((node) => [node.id, node]));
+    const knownImageSize = (node: CanvasNode) => {
+      const ownSize = imageNodeSizeFromSettings({
+        aspectRatio: node.imageAspectRatio || node.submission?.aspectRatio || node.imageSettings?.aspectRatio,
+        size: node.submission?.size || node.imageSettings?.size,
+      });
+      if (ownSize) return ownSize;
+      // Legacy result nodes did not persist their source ratio. Recover it
+      // from their creator only when both belong to the same saved batch.
+      const creator = node.resultOf ? nodesById.get(node.resultOf) : undefined;
+      if (!creator || !node.resultBatchId || creator.resultBatchId !== node.resultBatchId) return undefined;
+      return imageNodeSizeFromSettings({
+        aspectRatio: creator.submission?.aspectRatio || creator.imageSettings?.aspectRatio,
+        size: creator.submission?.size || creator.imageSettings?.size,
+      });
+    };
+    const candidates = doc.nodes.filter((node) => {
+      if (!node.image || (node.type !== "image" && node.type !== "prompt")) return false;
       // Geometry probing creates an image request even when the node is far
       // outside the current canvas. Probe only the buffered viewport; the
       // browser's thumbnail onLoad callback still repairs a node when it is
       // actually brought into view.
-      (isRectInViewport(node, doc.viewport, boardSize, viewportRenderMargin) ||
-        selected.includes(node.id) || preview?.id === node.id) &&
-      // A COS original is not a valid geometry probe for a card. Wait for the
-      // signed thumbnail to arrive through task/asset recovery instead of
-      // downloading the full-resolution object just to measure it.
-      (!isCosImageURL(node.image) || Boolean(node.imageThumbnail)) &&
-      !aspectRepairing.current.has(node.id),
-    );
+      if (!(isRectInViewport(node, doc.viewport, boardSize, viewportRenderMargin) ||
+        selected.includes(node.id) || preview?.id === node.id)) return false;
+      // Never fetch a full-resolution COS original just to measure it. A
+      // persisted or generation-derived ratio can repair the frame without
+      // waiting for a signed preview.
+      if (isCosImageURL(node.image) && !node.imageThumbnail && !knownImageSize(node)) return false;
+      return aspectRepairing.current.get(node.id) !== node.image;
+    });
     if (!candidates.length) return;
-    candidates.forEach((node) => aspectRepairing.current.add(node.id));
+    candidates.forEach((node) => aspectRepairing.current.set(node.id, node.image!));
     let cancelled = false;
-    void Promise.all(candidates.map(async (node) => [node.id, await readImageNodeSize(node.imageThumbnail || node.image!)] as const)).then((sizes) => {
+    void Promise.all(candidates.map(async (node) => {
+      const hint = knownImageSize(node);
+      const measured = isCosImageURL(node.image) && !node.imageThumbnail
+        ? undefined
+        : await readImageNodeSize(node.imageThumbnail || node.image!);
+      // Prefer the generation settings if a signed thumbnail cannot be
+      // decoded. Never turn a transient image failure into a square node.
+      const size = measured || hint;
+      // Only a decoded bitmap can establish a legacy node's actual source
+      // ratio. A generation hint is intentionally provisional and should not
+      // replace a more precise ratio already stored on the node.
+      return size ? { id: node.id, source: node.image!, size, measured: Boolean(measured) } : undefined;
+    })).then((sizes) => {
       if (cancelled) return;
-      const byId = new Map(sizes);
-      const nodes = docRef.current.nodes.map((node) => {
-        const size = byId.get(node.id);
-        if (!size) return node;
+      const byId = new Map(sizes.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+        .map(({ id, source, size, measured }) => [id, { source, size, measured }]));
+      const current = docRef.current;
+      const nodes = current.nodes.map((node) => {
+        const result = byId.get(node.id);
+        if (!result || node.image !== result.source) return node;
+        const { size } = result;
         const sourceRatio = size.height / Math.max(1, size.width);
         const nodeRatio = node.height / Math.max(1, node.width);
-        return Math.abs(sourceRatio - nodeRatio) > 0.02
-          ? { ...node, width: size.width, height: size.height }
+        const ratioMismatch = Math.abs(sourceRatio - nodeRatio) > 0.02;
+        const measuredAspectRatio = result.measured && !node.imageAspectRatio
+          ? imageAspectRatioFromDimensions(size.width, size.height)
+          : undefined;
+        return ratioMismatch || measuredAspectRatio
+          ? {
+              ...node,
+              ...(ratioMismatch ? { width: size.width, height: size.height } : {}),
+              ...(measuredAspectRatio && node.imageAspectRatio !== measuredAspectRatio
+                ? { imageAspectRatio: measuredAspectRatio }
+                : {}),
+            }
           : node;
       });
-      if (nodes.some((node, index) => node.width !== docRef.current.nodes[index].width || node.height !== docRef.current.nodes[index].height)) {
+      if (nodes.some((node, index) =>
+        node.width !== current.nodes[index].width ||
+        node.height !== current.nodes[index].height ||
+        node.imageAspectRatio !== current.nodes[index].imageAspectRatio,
+      )) {
         dirty.current = true;
         replaceDoc({
-          ...docRef.current,
+          ...current,
           nodes,
-          groups: expandGroupFrames(nodes, docRef.current.groups),
+          groups: expandGroupFrames(nodes, current.groups),
           updatedAt: now(),
         });
       }
+    }).finally(() => {
+      candidates.forEach((node) => {
+        if (aspectRepairing.current.get(node.id) === node.image) aspectRepairing.current.delete(node.id);
+      });
     });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      candidates.forEach((node) => {
+        if (aspectRepairing.current.get(node.id) === node.image) aspectRepairing.current.delete(node.id);
+      });
+    };
   }, [boardSize, doc.nodes, doc.viewport, draftReady, platformReady, authState, platformLoading, preview?.id, selected, viewportRenderMargin]);
   React.useEffect(() => {
     const hidden = new Set(
@@ -3273,10 +3772,16 @@ export default function App({
       clearVideoNodeRuntime(id);
       imageRecoveryRequests.current.delete(id);
       imageRecoveryGuard.current.reset(id);
+      mediaUploadFiles.current.delete(id);
     });
     setActiveIds((current) => current.some((id) => removed.has(id))
       ? current.filter((id) => !removed.has(id)) : current);
-    setPreview((current) => current && removed.has(current.id) ? null : current);
+    updateMediaUploadStates((current) => {
+      if (!Object.keys(current).some(id => removed.has(id))) return current;
+      const next = { ...current };
+      removed.forEach(id => delete next[id]);
+      return next;
+    });
   };
   const replaceDoc = (
     next: Document,
@@ -3290,6 +3795,10 @@ export default function App({
     // Geometry/content edits replace the array and still take the complete
     // cleanup path so deleted nodes cannot keep writing late results.
     const current = docRef.current;
+    // A canvas switch invalidates the open media snapshot entirely. For same-
+    // canvas snapshot replacement, keep the detail anchored to its captured
+    // node until the user closes it or explicitly deletes that node.
+    if (current.id !== next.id) closePreview();
     const graphChanged = current.nodes !== next.nodes || current.edges !== next.edges;
     if (graphChanged && !nodesStructureUnchanged) {
       setWorkflowRevision((revision) => revision + 1);
@@ -3313,7 +3822,7 @@ export default function App({
     docRef.current = next;
     setDoc(next);
   };
-  const commit = (change: (value: Document) => Document) => {
+  const commitNow = (change: (value: Document) => Document) => {
     const current = docRef.current,
       next = change(current);
     if (next === current || JSON.stringify(next) === JSON.stringify(current))
@@ -3322,6 +3831,22 @@ export default function App({
     setPast((items) => [...items.slice(-49), clone(current)]);
     setFuture([]);
     replaceDoc({ ...next, updatedAt: now() });
+  };
+  const commit = (change: (value: Document) => Document) => {
+    // Agent side effects (provider submission/cancellation) can outlive the
+    // synchronous document commit. Queue interactive edits during that
+    // window and apply them in order when the transaction releases the lock.
+    if (agentWriteLockRef.current) {
+      queuedAgentEdits.current.push(change);
+      return;
+    }
+    commitNow(change);
+  };
+  const setAgentWriteLock = (locked: boolean) => {
+    agentWriteLockRef.current = locked;
+    if (locked) return;
+    const queued = queuedAgentEdits.current.splice(0);
+    queued.forEach((change) => commitNow(change));
   };
   const [viewportMotion] = React.useState(() => new ViewportMotion({
     read: () => docRef.current.viewport,
@@ -3489,11 +4014,19 @@ export default function App({
       nodes: value.nodes.map((node) => {
         if (!ids.includes(node.id)) return node;
         const next = { ...node, ...patch };
-        if ("image" in patch && patch.image !== node.image && !("localImage" in patch)) delete next.localImage;
-        if ("image" in patch && patch.image !== node.image && !("imageThumbnail" in patch)) delete next.imageThumbnail;
+        const imageSourceChanged = "image" in patch && patch.image !== node.image;
+        if (imageSourceChanged && !("localImage" in patch)) delete next.localImage;
+        if (imageSourceChanged && !("imageThumbnail" in patch)) delete next.imageThumbnail;
+        if (imageSourceChanged && !("imageAspectRatio" in patch)) {
+          const previousIdentity = node.image ? immutableImageUrlIdentity(node.image) : undefined;
+          const nextIdentity = typeof patch.image === "string" ? immutableImageUrlIdentity(patch.image) : undefined;
+          if (!node.image || !patch.image || !previousIdentity || previousIdentity !== nextIdentity)
+            delete next.imageAspectRatio;
+        }
         if (patch.type && patch.type !== "image") {
           delete next.image;
           delete next.imageThumbnail;
+          delete next.imageAspectRatio;
           delete next.localImage;
         }
         return next;
@@ -3506,63 +4039,148 @@ export default function App({
       ...docRef.current,
       nodes: docRef.current.nodes.map((node) =>
         node.id === id
-          ? {
-              ...node,
-              ...patch,
-              ...("image" in patch && patch.image !== node.image && !("imageThumbnail" in patch) ? { imageThumbnail: undefined } : {}),
-            }
+          ? (() => {
+              const next = {
+                ...node,
+                ...patch,
+                ...("image" in patch && patch.image !== node.image && !("imageThumbnail" in patch) ? { imageThumbnail: undefined } : {}),
+              };
+              // Migrate only known legacy defaults. A custom resize is user
+              // data and must remain unchanged.
+              if (
+                (node.type === "audio" || (node.type === "prompt" && node.mediaType === "audio")) &&
+                patch.status === "completed" &&
+                Boolean(patch.audio || patch.localAudio || patch.assetId) &&
+                isLegacyAudioNodeSize(node.width, node.height)
+              ) {
+                next.width = DEFAULT_AUDIO_NODE_SIZE.width;
+                next.height = DEFAULT_AUDIO_NODE_SIZE.height;
+              }
+              return next;
+            })()
           : node,
       ),
       updatedAt: now(),
     });
   };
-  const syncSnapshot = React.useCallback(async (snapshot: Document, local = Promise.resolve()) => {
+  const syncSnapshot = React.useCallback(async (
+    snapshot: Document,
+    local?: Promise<unknown>,
+    progressAttempt?: number,
+    respectPaused = true,
+  ) => {
     const attempt = ++cloudSyncAttempt.current;
-    dispatchCloudSync({ type: "start", attempt });
-    if (docRef.current.updatedAt === snapshot.updatedAt) setStatus("正在同步云端…");
+    const saveAttempt = progressAttempt ?? ++saveProgressAttempt.current;
+    const baseAtSaveStart = cloudBaseRef.current?.id === snapshot.id
+      ? clone(cloudBaseRef.current)
+      : null;
+    if (progressAttempt === undefined) {
+      updateSaveProgress({ phase: "cloud", revision: documentSaveRevision(snapshot) });
+    }
     try {
-      await syncCloudDocument(snapshot, local);
+      if (local) await local;
+      if (attempt !== cloudSyncAttempt.current) return;
+      if (saveAttempt === saveProgressAttempt.current)
+        updateSaveProgress({ phase: "cloud", revision: documentSaveRevision(snapshot) });
+      dispatchCloudSync({ type: "start", attempt, revision: documentSaveRevision(snapshot) });
+      if (docRef.current.id === snapshot.id && docRef.current.updatedAt === snapshot.updatedAt)
+        setStatus("正在同步云端…");
+      let synced: Document | null = null;
+      try {
+        synced = await syncCloudDocument(snapshot, Promise.resolve(), undefined, { respectPaused });
+        if (!synced) {
+          if (alive.current) dispatchCloudSync({ type: "success", attempt });
+          return;
+        }
+      } catch (error) {
+        if (alive.current) {
+          dispatchCloudSync({
+            type: "failure",
+            attempt,
+            revision: documentSaveRevision(snapshot),
+            error: cloudSyncErrorText(error),
+          });
+          const failure = platformFailure(error);
+          if (failure.kind === "login") requireAuthentication(failure.message);
+        }
+        throw error;
+      }
       // The editor may have been unmounted while a queued cloud write was in
       // flight. The workspace still needs the acknowledgement to update the
       // library card for this document, while editor-local state must remain
       // scoped to the mounted instance.
       if (alive.current) dispatchCloudSync({ type: "success", attempt });
-      onCloudSynced?.(snapshot);
+      onCloudSynced?.(synced);
       if (!alive.current) return;
-      if (attempt === cloudSyncAttempt.current && docRef.current.updatedAt === snapshot.updatedAt)
-        setStatus(savedStatus(true));
-    } catch (error) {
-      if (alive.current) {
-        dispatchCloudSync({ type: "failure", attempt, error: errorText(error) });
-        const failure = platformFailure(error);
-        if (failure.kind === "login") requireAuthentication(failure.message);
+      cloudResolutionEpoch.current += 1;
+      if (docRef.current.id === synced.id) {
+        const currentBase = cloudBaseRef.current?.id === synced.id
+          ? cloudBaseRef.current
+          : null;
+        const advancedBase = advanceCloudBaseAfterConfirmedSave(
+          currentBase,
+          baseAtSaveStart,
+          normalize(synced),
+        );
+        if (advancedBase) await rememberCloudBase(advancedBase);
       }
-      throw error;
+      if (attempt === cloudSyncAttempt.current && docRef.current.id === synced.id && docRef.current.updatedAt === synced.updatedAt)
+        setStatus(savedStatus(true));
+    } finally {
+      if (saveAttempt === saveProgressAttempt.current) {
+        updateSaveProgress(idleSaveProgress);
+      }
     }
-  }, []);
+  }, [updateSaveProgress]);
   const checkLocalAccount = React.useRef(captureLocalStorageScope()).current;
-  const persist = (value: Document, sync = syncEnabled && hydrated) => {
+  const persist = (
+    value: Document,
+    sync = syncEnabled && hydrated,
+    respectPaused = true,
+  ) => {
     checkLocalAccount();
     const snapshot = clone(value);
+    // Upload media is a visual placeholder only. Its URL may be a page-scoped
+    // Blob or the source COS object being copied, but neither is the new
+    // asset's identity. Do not persist it as a local or cloud fallback; the
+    // successful upload commit will enqueue a second snapshot with the
+    // durable COS URL and asset identity.
+    snapshot.nodes = snapshot.nodes.map((node) => {
+      if (node.uploadState) {
+        const next = { ...node };
+        delete next.image;
+        delete next.imageThumbnail;
+        delete next.assetId;
+        return next;
+      }
+      return node;
+    });
+    const saveAttempt = ++saveProgressAttempt.current;
+    const shouldSync = sync && platformReadyRef.current;
+    updateSaveProgress({ phase: "local", revision: documentSaveRevision(snapshot) });
     // Cloud latency must never hold later local drafts behind a network request.
-    const local = saveCanvas(snapshot).then(() => {
-      lastLocalSave.current = snapshot.updatedAt;
+    const queueCloud = shouldSync;
+    const local = saveCanvas(snapshot, queueCloud ? { queueCloudSync: true } : undefined).then(() => {
+      lastLocalSave.current.set(snapshot.id, documentSaveRevision(snapshot));
       // A save can finish after a newer edit. Only clear the unsaved marker
       // when this exact snapshot is still current; otherwise before-unload and
       // cloud hydration must continue to treat the newer edit as dirty.
-      if (
-        docRef.current.id === snapshot.id &&
-        docRef.current.updatedAt === snapshot.updatedAt
-      ) {
+      if (isSameDocumentRevision(docRef.current, snapshot))
         dirty.current = false;
-      }
       onSaved(snapshot);
+      if (saveAttempt === saveProgressAttempt.current && !shouldSync) {
+        updateSaveProgress(idleSaveProgress);
+      }
+    }, (error) => {
+      if (saveAttempt === saveProgressAttempt.current) {
+        updateSaveProgress(idleSaveProgress);
+      }
+      throw error;
     });
-    if (!sync || !platformReadyRef.current) return local;
-    // Keep the complete snapshot here. syncCloudDocument owns the single
-    // conversion pipeline: cache inline assets first, then strip temporary
-    // values before publishing the platform DTO.
-    return syncSnapshot(snapshot, local);
+    if (!shouldSync) return local;
+    // Keep the complete local snapshot here. syncCloudDocument later creates
+    // a projection for the cloud DTO without mutating this local draft.
+    return syncSnapshot(snapshot, local, saveAttempt, respectPaused);
   };
   const preserveAccountDraft = React.useRef<() => Promise<void>>(async () => {});
   preserveAccountDraft.current = async () => {
@@ -3573,10 +4191,11 @@ export default function App({
   };
   React.useEffect(() => beforeLocalAccountChange(() => preserveAccountDraft.current()), []);
   const scheduleCloudSync = React.useCallback((snapshot: Document) => {
-    if (!syncEnabled || !hydrated || !platformReadyRef.current) return;
+    if (!syncStateRef.current.syncEnabled || !syncStateRef.current.hydrated || !platformReadyRef.current) return;
     if (cloudSaveTimer.current !== null) window.clearTimeout(cloudSaveTimer.current);
     cloudSaveTimer.current = window.setTimeout(() => {
       cloudSaveTimer.current = null;
+      if (!syncStateRef.current.syncEnabled || !syncStateRef.current.hydrated) return;
       // A newer edit or a canvas switch supersedes this delayed snapshot.
       // Skipping it avoids an old autosave racing the explicit leave save.
       if (
@@ -3584,9 +4203,9 @@ export default function App({
         docRef.current.updatedAt !== snapshot.updatedAt
       ) return;
       // Failure stays in the save indicator and settings, without repeated toasts.
-      void syncSnapshot(clone(snapshot)).catch(() => {});
+      void syncSnapshot(clone(snapshot), undefined, undefined, true).catch(() => {});
     }, 2200);
-  }, [hydrated, syncEnabled, syncSnapshot]);
+  }, [syncSnapshot]);
   const requireAuthentication = (message: string) => {
     setAuthState("required");
     setHydrated(false);
@@ -3598,16 +4217,14 @@ export default function App({
     await writeDraft(`recovery:${initialDocument.id}`, value);
     setRecovery(clone(value));
   };
-  const refreshPlatform = async (
-    loadDocument = false,
-    local: Document | null = null,
-  ) => {
+  const refreshPlatform = async (loadDocument = false) => {
     if (!platformReadyRef.current) return;
     if (platformRequest.current) {
       platformRefreshQueued.current = true;
       return;
     }
     platformRequest.current = true;
+    const cloudResolutionEpochAtStart = cloudResolutionEpoch.current;
     imageRecoveryEpoch.current += 1;
     imageRecoveryRequests.current.clear();
     imageRecoveryGuard.current.resetAll();
@@ -3622,7 +4239,13 @@ export default function App({
     try {
       // Session creation already performs the authorization check and
       // returns the account scope. Avoid issuing a second status request.
-      const session = await client.platform.createSession();
+      // PlatformGate has already admitted and validated the session before
+      // Workspace mounts. Reusing it here prevents the initial document read
+      // from racing a second session rotation that would revoke its bearer.
+      const admittedSession = loadDocument ? client.session() : null;
+      const session = admittedSession?.access_token && admittedSession.account_scope
+        ? admittedSession
+        : await client.platform.createSession();
       if (!alive.current || !platformReadyRef.current) return;
       if (!session.account_scope) {
         setAuthState("required");
@@ -3638,13 +4261,14 @@ export default function App({
         return;
       }
       setAuthState("connected");
-      const [catalog, videoCatalog, musicCatalog, voiceCatalog, saved, profile] = await Promise.allSettled([
+      const [catalog, videoCatalog, musicCatalog, voiceCatalog, saved, profile, pending] = await Promise.allSettled([
         client.api.request("/images/models"),
         client.api.request("/videos/models"),
         client.api.request("/music/models"),
         client.api.request("/voice-design/models"),
         readCanvasDocument(client.storage, initialDocument.id),
         client.user.getProfile(),
+        getPendingCloudSync(initialDocument.id),
       ]);
       if (!alive.current || !platformReadyRef.current) return;
       const normalizedProfile = profile.status === "fulfilled"
@@ -3693,7 +4317,7 @@ export default function App({
         const failure = platformFailure(saved.reason);
         if (failure.kind === "login") setAuthState("required");
         setCloudError(
-          `云端画布加载失败：${failure.message} ${isSessionOnlyStorage() ? "当前内容仅在此页面保留，请重试或导出备份。" : "本机画布仍可编辑和保存。"}`,
+          `云端画布加载失败：${failure.kind === "login" ? failure.message : cloudSyncErrorText(saved.reason)} ${isSessionOnlyStorage() ? "当前内容仅在此页面保留，请重试或导出备份。" : "本机画布仍可编辑和保存。"}`,
         );
       }
       const authorizationFailure = [catalog, videoCatalog, musicCatalog, voiceCatalog, saved, profile]
@@ -3710,61 +4334,184 @@ export default function App({
         requireAuthentication(authorizationFailure.message);
         return;
       }
+      // A newer cloud acknowledgement or explicit merge may have completed
+      // while the catalog/profile requests were still in flight. Keep their
+      // results, but do not let this stale document read change sync state.
+      if (cloudResolutionEpoch.current !== cloudResolutionEpochAtStart) {
+        setHydrated(saved.status === "fulfilled");
+        return;
+      }
       if (saved.status === "fulfilled" && saved.value) {
-        const restored = await restoreLocalImages(
-          normalize({ ...(saved.value as object), id: initialDocument.id }),
-        );
+        // Cloud documents contain only durable COS/platform identities. Do not
+        // hydrate image bytes from IndexedDB or a host cache while opening it.
+        const restored = normalize({ ...(saved.value as object), id: initialDocument.id });
+        const needsConnectionMigration = hasLegacyConnectionFields(saved.value);
+        const migrateConnections = (value: Document = restored) => {
+          if (!needsConnectionMigration) return;
+          // The document read established the storage CAS baseline. Re-save
+          // only the normalized snapshot so legacy edge metadata is removed
+          // from the cloud record after a successful, conflict-safe load.
+          void syncSnapshot(clone(value), undefined, undefined, true).catch(() => {});
+        };
         if (!alive.current || !platformReadyRef.current) return;
         const current = normalize({ ...docRef.current, id: initialDocument.id });
-        const resolution = resolveCloudDocumentVersion(
-          current,
-          restored,
-          documentSignature,
-          documentRevisionSignature,
-        );
-        const initialLoadCanHydrate = loadDocument && !local && !dirty.current;
-        if (
-          resolution === "prefer-cloud" ||
-          (initialLoadCanHydrate && resolution === "same")
-        ) {
-          if (resolution === "prefer-cloud") await rememberVersion(current);
+        const previousCloudBase = cloudBaseRef.current?.id === initialDocument.id
+          ? clone(cloudBaseRef.current)
+          : null;
+        // Always ask the merge planner first. With a retained ancestor it can
+        // distinguish independent edits from overlap; without one it remains
+        // conservative and only auto-merges values that are provably safe.
+        const basePlan = planCloudDocumentMerge(previousCloudBase, current, restored);
+        // Workspace opens its last locally cached document as
+        // initialDocument. When there is no local edit or queued outbox
+        // revision, the cloud copy is authoritative and can be adopted in the
+        // background. A new-version prompt is reserved for a real overlap
+        // while this editor has local work to preserve.
+        const pendingWrite = pending.status === "fulfilled" ? pending.value : null;
+        const cleanLocalCanHydrate = !dirty.current && !pendingWrite;
+        if (pendingWrite?.paused && basePlan.kind === "conflict") {
+          setSyncEnabled(false);
+          setCloudCandidate(restored);
+          await rememberCloudBase(previousCloudBase);
+          setStatus(savedStatus(false));
+          setOverlay("restore");
+        } else if (cleanLocalCanHydrate) {
+          if (canvasContentSignature(current) !== canvasContentSignature(restored))
+            await rememberVersion(current);
+          await rememberCloudBase(restored);
+          if (documentRevisionSignature(docRef.current) !== documentRevisionSignature(current)) {
+            await rememberCloudBase(previousCloudBase);
+            setSyncEnabled(true);
+            setCloudCandidate(null);
+            setOverlay((currentOverlay) => currentOverlay === "restore" ? null : currentOverlay);
+            setStatus(savedStatus(false));
+            platformRefreshQueued.current = true;
+            setHydrated(cloudHydrated);
+            return;
+          }
           replaceDoc(restored);
           setSyncEnabled(true);
           setCloudCandidate(null);
+          setOverlay((currentOverlay) => currentOverlay === "restore" ? null : currentOverlay);
           await saveCanvas(restored);
           markSessionSynced(restored.id, JSON.stringify(restored));
           onCloudSynced?.(restored);
-          lastLocalSave.current = restored.updatedAt;
+          lastLocalSave.current.set(restored.id, documentSaveRevision(restored));
           dirty.current = false;
           dispatchCloudSync({ type: "success", attempt: cloudSyncAttempt.current });
           setStatus(savedStatus(true));
-        } else if (resolution === "same") {
+          migrateConnections();
+        } else if (basePlan.kind === "same") {
           const sameRevision =
             documentRevisionSignature(current) ===
             documentRevisionSignature(restored);
-          if (sameRevision) {
+          const sameContent = canvasContentSignature(current) === canvasContentSignature(restored);
+          if (sameRevision || sameContent) {
+            if (pendingWrite && !pendingWrite.paused)
+              await removePendingCloudSync(restored.id, pendingWrite.revision);
             markSessionSynced(restored.id, JSON.stringify(restored));
             dispatchCloudSync({ type: "success", attempt: cloudSyncAttempt.current });
             onCloudSynced?.(restored);
           }
-          setStatus(savedStatus(sameRevision));
-          setSyncEnabled(true);
+          setStatus(savedStatus(sameRevision || sameContent));
+          setSyncEnabled(!pendingWrite?.paused);
           setCloudCandidate(null);
-        } else if (resolution === "prefer-local") {
-          setSyncEnabled(true);
-          setCloudCandidate(null);
-          setStatus("正在同步云端…");
-          void syncSnapshot(clone(current)).catch(() => {});
-        } else {
+          await rememberCloudBase(restored);
+          setOverlay((currentOverlay) => currentOverlay === "restore" ? null : currentOverlay);
+          migrateConnections(current);
+        } else if (basePlan.kind === "conflict") {
+          // Only divergent authored values reach the reload flow. Timestamp
+          // ordering and transport/CAS failures are not evidence of a content
+          // conflict.
           setSyncEnabled(false);
           setCloudCandidate(restored);
+          await rememberCloudBase(previousCloudBase);
           setStatus(savedStatus(false));
+          setOverlay("restore");
+        } else if (basePlan.kind === "local-only") {
+          // The cloud is still at the known common ancestor. A newer local
+          // edit waiting to sync is not a competing cloud version and should
+          // not interrupt the user with a reload prompt.
+          await rememberCloudBase(restored);
+          setSyncEnabled(!pendingWrite?.paused);
+          setCloudCandidate(null);
+          setOverlay((currentOverlay) => currentOverlay === "restore" ? null : currentOverlay);
+          setStatus(savedStatus(false));
+          void persist(current, !pendingWrite?.paused).catch(() => {});
+        } else if (basePlan.kind === "remote-only" || basePlan.kind === "merge") {
+          // A clean remote update or a field-level merge is safe to apply in
+          // place. Preserve the pre-merge local snapshot for recovery, then
+          // publish the merged document so every collaborator observes the
+          // same resolved version. Re-check the editor before replacing it in
+          // case the user edited while this refresh was reading the cloud.
+          if (documentRevisionSignature(docRef.current) !== documentRevisionSignature(current)) {
+            await rememberCloudBase(previousCloudBase);
+            setSyncEnabled(!pendingWrite?.paused);
+            setCloudCandidate(null);
+            setOverlay((currentOverlay) => currentOverlay === "restore" ? null : currentOverlay);
+            setStatus(savedStatus(false));
+            if (!pendingWrite?.paused) platformRefreshQueued.current = true;
+          } else {
+            const next = normalize(basePlan.document);
+            if (basePlan.kind === "remote-only") next.updatedAt = restored.updatedAt;
+            if (canvasContentSignature(current) !== canvasContentSignature(next))
+              await rememberVersion(current);
+            if (documentRevisionSignature(docRef.current) !== documentRevisionSignature(current)) {
+              await rememberCloudBase(previousCloudBase);
+              setSyncEnabled(!pendingWrite?.paused);
+              setCloudCandidate(null);
+              setOverlay((currentOverlay) => currentOverlay === "restore" ? null : currentOverlay);
+              setStatus(savedStatus(false));
+              if (!pendingWrite?.paused) platformRefreshQueued.current = true;
+            } else {
+              replaceDoc(next);
+              dirty.current = false;
+              try {
+                await persist(next, basePlan.kind === "merge" && !pendingWrite?.paused, false);
+              } catch (error) {
+                if (!isCanvasVersionConflict(error)) throw error;
+                // The cloud advanced between the read and merge write. Keep
+                // the combined local snapshot and let the watcher re-read
+                // that new marker against the previous common ancestor.
+                await rememberCloudBase(previousCloudBase);
+                setSyncEnabled(!pendingWrite?.paused);
+                setCloudCandidate(null);
+                setOverlay((currentOverlay) => currentOverlay === "restore" ? null : currentOverlay);
+                setStatus(savedStatus(false));
+                setHydrated(cloudHydrated);
+                return;
+              }
+              await rememberCloudBase(basePlan.kind === "remote-only" || pendingWrite?.paused
+                ? restored
+                : next);
+              setSyncEnabled(!pendingWrite?.paused);
+              setCloudCandidate(null);
+              setOverlay((currentOverlay) => currentOverlay === "restore" ? null : currentOverlay);
+              setStatus(savedStatus(!pendingWrite?.paused));
+              if (basePlan.kind === "remote-only") {
+                if (pendingWrite && !pendingWrite.paused)
+                  await removePendingCloudSync(restored.id, pendingWrite.revision);
+                onCloudSynced?.(restored);
+              } else if (!pendingWrite?.paused) onCloudSynced?.(next);
+            }
+          }
         }
       } else if (saved.status === "fulfilled") {
-        setSyncEnabled(true);
-        setCloudCandidate(null);
-        const current = normalize({ ...docRef.current, id: initialDocument.id });
-        void syncSnapshot(clone(current)).catch(() => {});
+        if (pending.status === "fulfilled" && pending.value?.paused) {
+          setSyncEnabled(false);
+          setCloudCandidate(null);
+          setStatus(savedStatus(false));
+        } else {
+          setSyncEnabled(true);
+          setCloudCandidate(null);
+          await rememberCloudBase(null);
+          const current = normalize({ ...docRef.current, id: initialDocument.id });
+          // A local document can still contain legacy inline bytes that the
+          // normalized editor state intentionally omits. Save that exact
+          // normalized snapshot first so the cloud queue does not reject it
+          // as a stale local revision.
+          void persist(current, false).then(() => syncSnapshot(clone(current))).catch(() => {});
+        }
       }
       // Image URL recovery may mutate the local document. Do not expose the
       // recovery effects until the remote document has been restored, matched,
@@ -3793,6 +4540,19 @@ export default function App({
         } else setPlatformLoading(false);
       }
     }
+  };
+  retryCloudSyncRef.current = () => {
+    if (saveProgressRef.current.phase !== "idle" && saveProgressRef.current.revision === documentSaveRevision(docRef.current)) return;
+    setMessage("");
+    if (!platformReadyRef.current) {
+      setMessage("平台连接未就绪，请重新连接后再同步。");
+      return;
+    }
+    if (!syncStateRef.current.hydrated || !syncStateRef.current.syncEnabled) {
+      void refreshPlatform();
+      return;
+    }
+    void persist(docRef.current, true).catch(() => {});
   };
   const loadStorage = React.useCallback((force = false): Promise<boolean> => {
     if (authState !== "connected" || !platformReadyRef.current) return Promise.resolve(false);
@@ -3853,6 +4613,14 @@ export default function App({
     sessionKey: platformRevision,
     documentId: doc.id,
     onNotify: setMessage,
+    onSaved: asset => setMessage(`已保存“${asset.name}”到资产库，可在其他画布复用。`, {
+      label: "打开资产库",
+      run: () => {
+        assetReferenceTarget.current = undefined;
+        setAssetView("library");
+        setDrawer("assets");
+      },
+    }),
     onInsert: async (asset, preview) => {
       const documentId = docRef.current.id;
       const referenceTarget = assetReferenceTarget.current;
@@ -3865,7 +4633,7 @@ export default function App({
       const imageProbe = asset.kind === "image"
         ? preview.thumbnailUrl || (asset.source.type === "platform" ? undefined : preview.url)
         : undefined;
-      const size = asset.kind === "image" && imageProbe ? await readImageNodeSize(imageProbe)
+      const size = asset.kind === "image" && imageProbe ? (await readImageNodeSize(imageProbe)) || fitImageNodeSize(480, 480)
         : asset.kind === "image" ? fitImageNodeSize(480, 480)
         : asset.kind === "video" ? { width: 360, height: 240 }
           : asset.kind === "audio" ? DEFAULT_AUDIO_NODE_SIZE : { width: W, height: H };
@@ -3892,6 +4660,7 @@ export default function App({
       const node: CanvasNode = {
         ...content, id: uid(content.type), color: COLORS[asset.kind === "prompt" ? 0 : asset.kind === "audio" ? 3 : 1],
         ...size, ...findFreePosition(docRef.current.nodes, { x: at.x - (target ? 0 : size.width / 2), y: at.y - (target ? 0 : size.height / 2), ...size }),
+          ...(asset.kind === "image" ? { imageAspectRatio: imageAspectRatioFromDimensions(size.width, size.height) } : {}),
         groupId: target?.groupId,
       };
       let musicReference: CanvasNode["musicReference"];
@@ -3901,12 +4670,15 @@ export default function App({
         const duration = await readMusicReferenceAudioDuration(blob);
         const [localResult, uploadResult] = await Promise.allSettled([
           storeLocalAudio(blob),
-          node.assetId ? Promise.resolve(undefined) : uploadPlatformAsset(client.api, { file: new File([blob], asset.name || "reference-audio.mp3", { type: blob.type || "audio/mpeg" }), name: asset.name, category: "sound" }),
+          node.assetId ? Promise.resolve(undefined) : uploadDurablePlatformAsset(client.api, { file: new File([blob], asset.name || "reference-audio.mp3", { type: blob.type || "audio/mpeg" }), name: asset.name, category: "sound" }),
         ]);
         const localAudio = localResult.status === "fulfilled" ? localResult.value : node.localAudio;
         const uploaded = uploadResult.status === "fulfilled" ? uploadResult.value : undefined;
         const assetId = node.assetId || uploaded?.id;
-        if (!localAudio && !assetId) throw new Error("参考音频未能保存到本机或云端，请检查存储空间和网络后重试。");
+        if (!assetId) {
+          if (localResult.status === "fulfilled" && localAudio) await deleteLocalAudio(localAudio).catch(() => {});
+          throw new Error("参考音频上传失败，未创建参考素材。请检查网络后重试。");
+        }
         checkSession();
         const currentTarget = docRef.current.nodes.find(item => item.id === target.id);
         if (!alive.current || leaving.current || docRef.current.id !== documentId || assetReferenceTarget.current !== referenceTarget || !currentTarget || currentTarget.mediaType !== "audio" || (currentTarget.audioMode || "music") !== "music" || currentTarget.musicReference || hasPendingNodeTask(currentTarget)) throw new Error("音乐创作状态已变化，请重新选择参考音频。");
@@ -3922,7 +4694,6 @@ export default function App({
       assetReferenceTarget.current = undefined;
       if (target || boardSize.width < 700) setDrawer(null);
       reveal(target ? [target, node] : [node]);
-      if (musicReference && !musicReference.assetId) setMessage("参考音频仅保存在本机，换设备后无法恢复。", undefined, 3500);
     },
   });
   const promptMentionAssets = usePromptMentionAssets({
@@ -3987,17 +4758,9 @@ export default function App({
     expectedEpoch: number,
   ) => {
     if (!updates.length) return false;
-    // A renewed signature may already have cached bytes. Resolve them before
-    // changing <img src>, so the browser never downloads the same object just
-    // to discover the local cache in its load callback.
-    const restored = await restoreLocalImages({ nodes: [...updates] });
-    await Promise.all(restored.nodes.map(async update => {
-      if (isCachedDisplayImage(update.image)) return;
-      const node = docRef.current.nodes.find(node => node.id === update.id);
-      if (!node || node.image !== update.expectedImage || node.taskId !== update.expectedTaskId) return;
-      const cached = await readHostCachedImage({ assetId: node.assetId, taskId: update.taskId || node.taskId, resultIndex: node.resultIndex });
-      if (cached) Object.assign(update, cached);
-    }));
+    // Recovery updates are authoritative Gateway/COS deliveries. Do not
+    // replace them with browser or host cache bytes before applying them.
+    const restored = { nodes: [...updates] };
     if (
       !alive.current ||
       expectedEpoch !== imageRecoveryEpoch.current ||
@@ -4032,7 +4795,8 @@ export default function App({
         ...node,
         image: update.image,
         imageThumbnail: thumbnail,
-        localImage: update.localImage || (sameImage ? node.localImage : undefined),
+        ...(sameImage ? {} : { imageAspectRatio: undefined }),
+        localImage: undefined,
         ...(update.assetId ? { assetId: update.assetId } : {}),
         ...(update.taskId ? { taskId: update.taskId } : {}),
       };
@@ -4053,7 +4817,8 @@ export default function App({
       })
       .catch((error) => {
         pendingRecoveredSync.current = next;
-        setStatus(`图片已恢复 · 云端同步失败：${errorText(error)}`);
+        setStatus(syncFailureStatus(isLocallySaved(next)));
+        if (!isLocallySaved(next)) setMessage(errorText(error));
       });
     return true;
   };
@@ -4129,7 +4894,8 @@ export default function App({
       if (!syncNow) pendingRecoveredSync.current = next;
       void persist(next, syncNow).catch(error => {
         pendingRecoveredSync.current = next;
-        setStatus(`媒体地址已恢复 · 云端同步失败：${errorText(error)}`);
+        setStatus(syncFailureStatus(isLocallySaved(next)));
+        if (!isLocallySaved(next)) setMessage(errorText(error));
       });
     }
     const snapshot = docRef.current.nodes.filter((node) => {
@@ -4159,6 +4925,25 @@ export default function App({
           (node.imageThumbnail && mediaUrlNeedsRefresh(node.imageThumbnail))),
       ),
     );
+    const thumbnailRecoveryNodes = [...new Map(
+      [...libraryNodes, ...candidates].map(node => [node.id, node]),
+    ).values()];
+    if (thumbnailRecoveryNodes.length) {
+      setImageLoadStates(states => {
+        let changed = false;
+        const next = { ...states };
+        for (const node of thumbnailRecoveryNodes) {
+          if (next[node.id]?.source === (node.image || "") && next[node.id]?.status === "recovering") continue;
+          next[node.id] = {
+            source: node.image || "",
+            status: "loading",
+            attempt: next[node.id]?.attempt || 0,
+          };
+          changed = true;
+        }
+        return changed ? next : states;
+      });
+    }
     const byTask = new Map<string, CanvasNode[]>();
     candidates.forEach((node) => {
       const taskId = node.taskId!;
@@ -4168,8 +4953,8 @@ export default function App({
     });
     const taskUpdates = await mapWithConcurrency([...byTask], 4, async ([taskId, nodes]) => {
       try {
-        // Omitting response_format lets old inline tasks return b64_json while
-        // current application tasks continue returning newly signed URLs.
+        // Image recovery accepts only the durable URL emitted by the Gateway;
+        // an inline provider payload cannot become a canvas resource.
         const response = await readImageTaskForRecovery(taskId);
         return mapTaskImageResults(taskId, nodes, response).map((update) => ({
           ...update,
@@ -4198,7 +4983,34 @@ export default function App({
       [...libraryImageUpdates, ...legacyUpdates, ...taskUpdates.flat()],
       recoveryEpoch,
     );
-  }, [findStoredImageMatches, readImageTaskForRecovery]);
+    if (thumbnailRecoveryNodes.length) {
+      setImageLoadStates(states => {
+        let changed = false;
+        const next = { ...states };
+        for (const requested of thumbnailRecoveryNodes) {
+          const current = docRef.current.nodes.find(node => node.id === requested.id);
+          if (!current?.image) {
+            if (next[requested.id]) { delete next[requested.id]; changed = true; }
+            continue;
+          }
+          const currentPreview = displayImageThumbnail(current.image, current.imageThumbnail);
+          if (currentPreview && loadedImageSources.current.get(current.id) === currentPreview) {
+            if (next[current.id]) { delete next[current.id]; changed = true; }
+            continue;
+          }
+          const hasPreview = Boolean(displayImageThumbnail(current.image, current.imageThumbnail));
+          next[current.id] = {
+            source: current.image,
+            status: hasPreview ? "loading" : "failed",
+            attempt: next[current.id]?.attempt || 1,
+            ...(hasPreview ? {} : { message: "图片预览暂不可用" }),
+          };
+          changed = true;
+        }
+        return changed ? next : states;
+      });
+    }
+  }, [displayImageThumbnail, findStoredImageMatches, readImageTaskForRecovery]);
 
   const recoverImageNodeOnce = React.useCallback(async (
     requested: CanvasNode,
@@ -4228,7 +5040,7 @@ export default function App({
     }
     const recoveryEpoch = imageRecoveryEpoch.current;
     if (force) imageRecoveryGuard.current.reset(node.id);
-    const identity = node.taskId || node.localImage || mediaUrlIdentity(failedSource) || "unbound";
+    const identity = node.taskId || node.assetId || mediaUrlIdentity(failedSource) || "unbound";
     const fingerprint = `${identity}\0${failedSource}`;
     const recoveryAttempt = imageRecoveryGuard.current.begin(node.id, fingerprint);
     if (!recoveryAttempt) {
@@ -4244,9 +5056,7 @@ export default function App({
             source: failedSource,
             status: "failed",
             attempt: current?.attempt || 1,
-            message: node.taskId || node.localImage
-              ? "暂时无法恢复图片"
-              : "图片地址已失效",
+            message: "预览暂不可用",
           },
         };
       });
@@ -4262,17 +5072,8 @@ export default function App({
     }));
     try {
       let image: string | undefined;
-      let localImage: string | undefined;
       let taskId = node.taskId;
       let batchUpdates: PendingImageUpdate[] = [];
-      if (node.localImage && !/^https?:\/\//i.test(failedSource)) {
-        const recoverable: { nodes: Array<{ image?: string; localImage?: string }> } = {
-          nodes: [{ localImage: node.localImage }],
-        };
-        const restored = await restoreLocalImages(recoverable);
-        image = restored.nodes[0]?.image;
-        if (image) localImage = node.localImage;
-      }
       if (!image && (node.assetId || taskId)) {
         const siblings = docRef.current.nodes.filter(candidate => candidate.type === "image" ||
           (candidate.type === "prompt" && (candidate.mediaType || "image") === "image"));
@@ -4315,7 +5116,6 @@ export default function App({
         batchUpdates.length ? batchUpdates : [{
             id: node.id,
             image,
-            localImage,
             taskId,
             expectedImage: failedSource,
             expectedTaskId: node.taskId,
@@ -4373,9 +5173,7 @@ export default function App({
             source: failedSource,
             status: "failed",
             attempt: states[node.id]?.attempt || 1,
-            message: node.taskId || node.localImage
-              ? "暂时无法恢复图片"
-              : "图片地址已失效",
+            message: "预览暂不可用",
           },
         }));
       }
@@ -4405,8 +5203,10 @@ export default function App({
     source: string,
     naturalWidth?: number,
     naturalHeight?: number,
+    displaySource?: string,
   ) => {
     if (pendingRemovalNodes.current.has(nodeId)) return;
+    loadedImageSources.current.set(nodeId, displaySource || source);
     markMediaNodeLoaded(nodeId);
     imageRecoveryGuard.current.reset(nodeId);
     setImageLoadStates((states) => {
@@ -4428,13 +5228,20 @@ export default function App({
     ) {
       const current = docRef.current;
       const node = current.nodes.find((candidate) => candidate.id === nodeId);
-      if (node?.type === "image" && node.image === source) {
-        const ratio = naturalHeight! / naturalWidth!;
+      if (node && (node.type === "image" || node.type === "prompt" && (node.mediaType || "image") === "image") && node.image === source) {
+        // Once the browser has decoded the delivered preview, its dimensions
+        // are authoritative. Generation settings only provide a provisional
+        // frame while that preview is unavailable.
+        const size = fitImageNodeSize(naturalWidth!, naturalHeight!);
+        const ratio = size.height / Math.max(1, size.width);
         const nodeRatio = node.height / Math.max(1, node.width);
-        if (Math.abs(ratio - nodeRatio) > 0.02) {
-          const size = fitImageNodeSize(naturalWidth!, naturalHeight!);
+        const imageAspectRatio = imageAspectRatioFromDimensions(naturalWidth!, naturalHeight!);
+        const ratioMismatch = Math.abs(ratio - nodeRatio) > 0.02;
+        if (ratioMismatch || node.imageAspectRatio !== imageAspectRatio) {
           const nodes = current.nodes.map((candidate) =>
-            candidate.id === nodeId ? { ...candidate, ...size } : candidate,
+            candidate.id === nodeId
+              ? { ...candidate, ...(ratioMismatch ? size : {}), imageAspectRatio }
+              : candidate,
           );
           dirty.current = true;
           replaceDoc({
@@ -4456,6 +5263,20 @@ export default function App({
         void recoverImageNode(node, state.source);
     }
   }, [hydrated, authState, platformLoading, imageLoadStates, recoverImageNode]);
+  const notifiedImageErrors = React.useRef(new Map<string, string>());
+  React.useEffect(() => {
+    for (const [id, state] of Object.entries(imageLoadStates)) {
+      if (state.status !== "failed") continue;
+      const node = doc.nodes.find(value => value.id === id);
+      if (!node || !selected.includes(id) || preview?.id === id) continue;
+      if (notifiedImageErrors.current.get(id) === state.source) continue;
+      notifiedImageErrors.current.set(id, state.source);
+      setMessage("图片预览暂不可用。", { label: "重试加载", run: () => { void recoverImageNode(node, node.image || "", true); } });
+    }
+    for (const id of [...notifiedImageErrors.current.keys()]) {
+      if (imageLoadStates[id]?.status !== "failed" || !doc.nodes.some(node => node.id === id)) notifiedImageErrors.current.delete(id);
+    }
+  }, [doc.nodes, imageLoadStates, preview?.id, recoverImageNode, selected, setMessage]);
   React.useEffect(() => {
     if (!preview) return;
     const current = doc.nodes.find((node) => node.id === preview.id);
@@ -4471,12 +5292,20 @@ export default function App({
       effectiveCurrent.image !== preview.image ||
       effectiveCurrent.imageThumbnail !== preview.imageThumbnail ||
       effectiveCurrent.taskId !== preview.taskId ||
+      effectiveCurrent.assetId !== preview.assetId ||
+      effectiveCurrent.type !== preview.type ||
+      effectiveCurrent.mediaType !== preview.mediaType ||
+      effectiveCurrent.resultOf !== preview.resultOf ||
+      effectiveCurrent.resultBatchId !== preview.resultBatchId ||
+      effectiveCurrent.resultIndex !== preview.resultIndex ||
+      effectiveCurrent.generationBatchId !== preview.generationBatchId ||
+      effectiveCurrent.status !== preview.status ||
       effectiveCurrent.audio !== preview.audio ||
       effectiveCurrent.video !== preview.video ||
       effectiveCurrent.videoContentUrl !== preview.videoContentUrl ||
       effectiveCurrent.videoContentUrlExpiresAt !== preview.videoContentUrlExpiresAt
     ) setPreview(effectiveCurrent);
-  }, [doc.nodes, preview?.id, preview?.image, preview?.taskId, preview?.audio, preview?.video, preview?.videoContentUrl, audioSources.urls]);
+  }, [doc.nodes, preview?.id, preview?.image, preview?.taskId, preview?.assetId, preview?.type, preview?.mediaType, preview?.resultOf, preview?.resultBatchId, preview?.resultIndex, preview?.generationBatchId, preview?.status, preview?.audio, preview?.video, preview?.videoContentUrl, audioSources.urls]);
   React.useEffect(() => {
     if (!platformReady || !imageRecoveryReadyRef.current || viewportMoving) return;
     // Cloud URL repair is useful but non-critical for first paint. Schedule it
@@ -4520,7 +5349,8 @@ export default function App({
       })
       .catch((error) => {
         pendingRecoveredSync.current = snapshot;
-        setStatus(`图片已恢复 · 云端同步失败：${errorText(error)}`);
+        setStatus(syncFailureStatus(isLocallySaved(snapshot)));
+        if (!isLocallySaved(snapshot)) setMessage(errorText(error));
       });
   }, [hydrated, syncEnabled, authState]);
   React.useEffect(() => {
@@ -4530,14 +5360,8 @@ export default function App({
     document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => document.removeEventListener("visibilitychange", refreshWhenVisible);
   }, [authState, loadStorage, overlay]);
-  const openStoragePortal = (kind: "subscription" | "storage") => {
-    const configured = kind === "subscription"
-      ? storageUsage?.upgrade_url
-      : storageUsage?.storage_pack_url;
-    if (kind === "storage" && !configured) {
-      setMessage("当前没有可直接购买的存储包，请在会员方案页确认空间权益。");
-      return;
-    }
+  const openStoragePortal = () => {
+    const configured = storageUsage?.upgrade_url;
     const fallback = `${window.location.origin}/#/console/subscription?tab=subscription&source=canvas_storage`;
     const destination = new URL(configured || fallback, window.location.origin);
     const popup = window.open(destination.toString(), "_blank", "noopener,noreferrer");
@@ -4655,7 +5479,7 @@ export default function App({
       setMessage("这段文本已被当前创作引用，请选择其他文本节点。");
       return;
     }
-    if (!canConnect(sourceId, targetId, { allowCompletedPrompt: true })) {
+    if (!canConnect(sourceId, targetId, { allowCompletedPrompt: true, forceWorkflow: true })) {
       setMessage("当前节点不能引用这段文本，请选择其他文本节点。");
       return;
     }
@@ -4677,17 +5501,19 @@ export default function App({
       storeLocalAudio(blob).then(value => ({ value })).catch(() => ({ value: undefined })),
       source?.assetId
         ? Promise.resolve({ value: undefined })
-        : uploadPlatformAsset(client.api, { file: new File([blob], title || "reference-audio", { type: blob.type || "audio/mpeg" }), name: title, category: "sound" }).then(value => ({ value })).catch(() => ({ value: undefined })),
+        : uploadDurablePlatformAsset(client.api, { file: new File([blob], title || "reference-audio", { type: blob.type || "audio/mpeg" }), name: title, category: "sound" }).then(value => ({ value })).catch(() => ({ value: undefined })),
     ]);
     const localAudio = localResult.value;
     const assetId = source?.assetId || uploadResult.value?.id;
-    if (!localAudio && !assetId) throw new Error("参考音频未能保存到本机或云端，请检查存储空间和网络后重试。");
+    if (!assetId) {
+      if (localAudio) await deleteLocalAudio(localAudio).catch(() => {});
+      throw new Error("参考音频上传失败，未创建参考素材。请检查网络后重试。");
+    }
     checkLocalAccount();
     const target = docRef.current.nodes.find(node => node.id === targetId);
     if (!alive.current || leaving.current || docRef.current.id !== documentId || !target || target.mediaType !== "audio" || (target.audioMode || "music") !== "music" || hasPendingNodeTask(target) || target.musicReference?.localAudio !== previousReference) throw new Error("创作节点已变化，请重新选择参考音频。");
     update([targetId], { musicReference: { ...(localAudio ? { localAudio } : {}), ...(assetId ? { assetId } : {}), title: title.slice(0, 160), duration, size: blob.size, ...(sourceId ? { nodeId: sourceId } : {}) } });
     await persist(docRef.current, false);
-    if (!assetId) setMessage("云端保存失败，参考音频仅保存在本机，换设备后无法恢复。");
   };
   const selectMusicReference = async (targetId: string, sourceId: string) => {
     const source = docRef.current.nodes.find(node => node.id === sourceId);
@@ -4699,11 +5525,14 @@ export default function App({
     const documentId = docRef.current.id;
     const [localResult, uploadResult] = await Promise.allSettled([
       storeLocalAudio(file),
-      uploadPlatformAsset(client.api, { file, name: file.name, category: "sound" }),
+      uploadDurablePlatformAsset(client.api, { file, name: file.name, category: "sound" }),
     ]);
     const localAudio = localResult.status === "fulfilled" ? localResult.value : undefined;
     const uploaded = uploadResult.status === "fulfilled" ? uploadResult.value : undefined;
-    if (!localAudio && !uploaded) throw new Error("录音未能保存到本机或云端，请检查存储空间和网络后重试。");
+    if (!uploaded?.id) {
+      if (localAudio) await deleteLocalAudio(localAudio).catch(() => {});
+      throw new Error("录音上传失败，未创建完成节点。请检查网络后重试。");
+    }
     checkLocalAccount();
     const target = docRef.current.nodes.find(node => node.id === targetId);
     if (!alive.current || leaving.current || docRef.current.id !== documentId || !target) throw new Error("画布已变化，请在原画布保存录音。");
@@ -4712,7 +5541,6 @@ export default function App({
       voiceId: undefined, voiceTrialAudioAvailable: undefined, musicSubmission: undefined, voiceDesignSubmission: undefined, ttsSubmission: undefined,
       taskDiagnostic: undefined, taskPrompt: undefined, error: undefined, status: "completed", audioMode: "recording", ...DEFAULT_AUDIO_NODE_SIZE });
     await persist(docRef.current, false);
-    if (!uploaded) setMessage("云端保存失败，当前录音仅保存在本机。完成上传后才能在其他设备恢复。");
   };
   const createLyrics = async (targetId: string, prompt: string) => {
     const documentId = docRef.current.id;
@@ -4722,7 +5550,7 @@ export default function App({
     if (!alive.current || leaving.current || docRef.current.id !== documentId || !target || (target.audioMode || "music") !== "music" || hasPendingNodeTask(target)) throw new Error("创作状态已变化，请在音乐模式中重新生成歌词。");
     return result;
   };
-  const generateVoiceDesignTask = async (requested = primary, inputChanged = false) => {
+  const generateVoiceDesignTask = async (requested = primary, inputChanged = false, automaticRecovery = false) => {
     if (!requested || leaving.current || pendingRemovalNodes.current.has(requested.id)) return;
     const node = docRef.current.nodes.find(item => item.id === requested.id);
     if (!node || node.type !== "prompt" || node.mediaType !== "audio" || activeRequests.current.has(node.id)) return;
@@ -4730,6 +5558,7 @@ export default function App({
     if (!resumable && !canCreateNewCanvasTask(node, inputChanged)) return;
     const taskId = node.taskId && resumable ? node.taskId : undefined;
     const previous = !taskId && resumable ? node.voiceDesignSubmission : undefined;
+    if (automaticRecovery && !taskId && !previous) return;
     const prompt = previous?.prompt || (taskId && node.taskPrompt ? node.taskPrompt : composePrompt(docRef.current.nodes, docRef.current.edges, node.id).prompt);
     const available = compatibleVoiceDesignModels(models);
     const selected = available.find(model => model.id === node.modelId) || preferredVoiceDesignModel(available);
@@ -4743,23 +5572,30 @@ export default function App({
     activeRequests.current.set(node.id, controller);
     const currentNode = () => alive.current && !leaving.current && !controller.signal.aborted && docRef.current.id === documentId && activeRequests.current.get(node.id) === controller ? docRef.current.nodes.find(item => item.id === node.id) : undefined;
     setActiveIds(ids => [...ids, node.id]);
-    patchTask(node.id, { status: "running", taskId, taskPrompt: prompt, error: undefined, audioTaskType: "voice_design", voiceDesignSubmission: submission, musicSubmission: undefined,
+    patchTask(node.id, { status: "running", taskId, taskPrompt: prompt, error: automaticRecovery ? node.error : undefined, audioTaskType: "voice_design", voiceDesignSubmission: submission, musicSubmission: undefined,
+      ...(previous ? { taskDiagnostic: submissionRetryStartedDiagnostic(node) } : {}),
       ...(!taskId && !previous ? { modelId: selected!.id, audio: undefined, localAudio: undefined, assetId: undefined, voiceId: undefined, taskDiagnostic: { status: "running", phase: "submitting", createdAt: new Date().toISOString() }, inputSignature: audioCreationSignature({ ...node, audioMode: "voice_design" }, models as any, prompt) } : {}) });
     try {
       await persist(docRef.current, false);
       if (!currentNode()) return;
       const result = await generateVoiceDesign((path, init) => client.api.request(path, init), {
         model: submission?.model || node.modelId, prompt, previewText: submission?.previewText || node.voicePreviewText || "", taskId, idempotencyKey: submission?.key,
-      }, id => { if (!currentNode()) return; patchTask(node.id, { taskId: id, status: "running", voiceDesignSubmission: undefined }); return persist(docRef.current, false); }, {
-        signal: controller.signal, recovery: Boolean(previous),
+      }, id => { const current = currentNode(); if (!current) return; patchTask(node.id, { taskId: id, status: "running", voiceDesignSubmission: undefined, error: undefined, taskDiagnostic: submissionRetryStartedDiagnostic(current) }); return persist(docRef.current, false); }, {
+        signal: controller.signal, recovery: Boolean(previous), allowResubmit: !automaticRecovery,
         onStatus: snapshot => {
           const current = currentNode(); if (!current) return;
-          patchTask(node.id, { status: mediaTaskPublicState(snapshot) === "failed" ? "failed" : "running", taskDiagnostic: { ...current.taskDiagnostic, status: snapshot.status, code: snapshot.code, phase: snapshot.phase }, ...(snapshot.voiceId ? { voiceId: snapshot.voiceId } : {}) });
+          const publicState = mediaTaskPublicState(snapshot);
+          patchTask(node.id, { status: publicState === "failed" ? "failed" : publicState === "queued" ? "queued" : "running", taskDiagnostic: { ...current.taskDiagnostic, status: snapshot.status, code: snapshot.code, phase: snapshot.phase }, ...(snapshot.voiceId ? { voiceId: snapshot.voiceId } : {}) });
         },
       });
       const current = currentNode(); if (!current) return;
+      if (result.trialAudioAvailable !== false) requireStableMediaIdentity({
+        taskId: result.taskId,
+        assetId: result.assetId,
+        url: result.contentUrl,
+      }, "音色生成结果");
       patchTask(node.id, { status: "completed", taskId: result.taskId, voiceId: result.voiceId, audioTaskType: "voice_design", assetId: result.assetId, voiceTrialAudioAvailable: result.trialAudioAvailable !== false,
-        audio: result.trialAudioAvailable === false ? undefined : result.contentUrl || `/voice-design/tasks/${result.taskId}/content`,
+		audio: result.trialAudioAvailable === false ? undefined : result.contentUrl,
         voiceDesignSubmission: undefined, error: undefined, taskDiagnostic: { ...current.taskDiagnostic, status: "completed", phase: "completed", assetStatus: result.trialAudioAvailable === false ? "unavailable" : "ready", code: undefined } });
       await persist(docRef.current, false);
       setCreationError(null);
@@ -4767,11 +5603,17 @@ export default function App({
       if (notice) setMessage("音色已生成，可复制音色 ID 并试听。", undefined, 3500);
     } catch (error) {
       if (!currentNode() || controller.signal.reason === "cancelled" || controller.signal.reason === "replaced") return;
+      const previousError = currentNode()?.error;
       const voiceError = error instanceof VoiceDesignError ? error : undefined;
-      const pending = voiceError ? voiceError.pending || Boolean(submission && !voiceError.terminalTask) : Boolean(taskId || submission);
+      const identityMissing = error && typeof error === "object" && "code" in error && String(error.code) === "CANVAS_MEDIA_IDENTITY_MISSING";
+      const pending = identityMissing ? false : voiceError ? voiceError.pending || Boolean(submission && !voiceError.terminalTask) : Boolean(taskId || submission);
       patchTask(node.id, { status: pending ? "queued" : "failed", error: errorText(error), ...(!pending ? { voiceDesignSubmission: undefined } : {}), ...(voiceError?.taskId ? { taskId: voiceError.taskId } : {}), taskDiagnostic: { ...currentNode()?.taskDiagnostic, code: voiceError?.code, status: pending ? "pending" : "failed" } });
-      void persist(docRef.current, false).catch(() => setStatus("任务恢复信息保存失败 · 请保留页面并导出备份"));
-      if (!pending) reportTaskFailure(node, error, submission?.key);
+      void persist(docRef.current, false).catch(error => {
+        setStatus("保存状态待确认 · 建议导出备份");
+        setMessage(errorText(error));
+      });
+      if (pending) reportPendingTaskError(node, error, previousError);
+      else reportTaskFailure(node, error, submission?.key);
     } finally {
       if (activeRequests.current.get(node.id) === controller) { activeRequests.current.delete(node.id); if (alive.current) setActiveIds(ids => ids.filter(id => id !== node.id)); }
     }
@@ -4779,6 +5621,13 @@ export default function App({
   const cancelVoiceDesignCreator = async (requested: CanvasNode) => {
     const node = docRef.current.nodes.find(item => item.id === requested.id);
     if (!node?.taskId || cancelingIds.includes(node.id)) return;
+    if (mediaTaskPublicState({
+      status: node.taskDiagnostic?.status || node.status,
+      code: node.taskDiagnostic?.code,
+      phase: node.taskDiagnostic?.phase,
+      assetStatus: node.taskDiagnostic?.assetStatus,
+      supplierConfirmationState: node.taskDiagnostic?.supplierConfirmation?.state,
+    }) !== "queued") return;
     const taskId = node.taskId, documentId = docRef.current.id;
     setCancelingIds(ids => [...ids, node.id]);
     try {
@@ -4788,14 +5637,13 @@ export default function App({
       const cancelled = ["cancelled", "canceled"].includes(snapshot.status);
       if (cancelled) activeRequests.current.get(node.id)?.abort("cancelled");
       patchTask(node.id, { status: cancelled ? "failed" : current.status === "completed" ? "completed" : "queued", ...(cancelled ? { voiceDesignSubmission: undefined, error: undefined } : {}), taskDiagnostic: { ...current.taskDiagnostic, status: snapshot.status, code: snapshot.code, phase: snapshot.phase } });
-      if (!cancelled && !activeRequests.current.has(node.id)) void generateVoiceDesignTask(current);
       await persist(docRef.current, false);
       if (cancelled) setMessage("音色生成已取消。", undefined, 2500);
     } catch (error) {
       if (docRef.current.id === documentId) setMessage(`取消音色生成失败：${errorText(error)}`);
     } finally { if (alive.current) setCancelingIds(ids => ids.filter(id => id !== node.id)); }
   };
-  const generateMusicTask = async (requested = primary, inputChanged = false) => {
+  const generateMusicTask = async (requested = primary, inputChanged = false, automaticRecovery = false) => {
     if (!requested || leaving.current || pendingRemovalNodes.current.has(requested.id)) return;
     const node = docRef.current.nodes.find(item => item.id === requested.id);
     if (!node || node.type !== "prompt" || node.mediaType !== "audio" || activeRequests.current.has(node.id)) return;
@@ -4803,9 +5651,20 @@ export default function App({
     const previous = !node.taskId && resumable ? node.musicSubmission : undefined;
     if (!resumable && !canCreateNewCanvasTask(node, inputChanged)) return;
     const taskId = node.taskId && resumable ? node.taskId : undefined;
+    if (automaticRecovery && !taskId && !previous) return;
+    if (!taskId && !previous && node.musicReference && !node.musicReference.assetId) {
+      setCreationError({ id: node.id, message: "参考音频尚未上传为平台素材，请重新添加参考音频后再生成。" });
+      setInspectorOpen(true);
+      return;
+    }
+    if (!taskId && previous && previous.referenceLocalAudio && !previous.referenceAssetId) {
+      setCreationError({ id: node.id, message: "原音乐提交只有本地参考音频，无法安全恢复；请重新上传参考音频后再生成。" });
+      setInspectorOpen(true);
+      return;
+    }
     const composition = composePrompt(docRef.current.nodes, docRef.current.edges, node.id);
     const effectivePrompt = previous?.prompt || (taskId && node.taskPrompt ? node.taskPrompt : composition.prompt);
-    const inputMode = (previous?.referenceLocalAudio || node.musicReference) ? "reference_audio" : "text";
+    const inputMode = (previous?.referenceAssetId || node.musicReference) ? "reference_audio" : "text";
     const available = compatibleMusicModels(models as any, inputMode);
     const selected = available.find(model => model.id === node.modelId) || preferredMusicModel(available, inputMode);
     const settings = resolveMusicSettings(selected, node.musicSettings);
@@ -4817,7 +5676,7 @@ export default function App({
     const submission = taskId ? undefined : previous || {
       key: uid("canvas-music-submit"), model: selected!.id!, prompt: effectivePrompt,
       ...(settings.audio_mode !== "instrumental" && node.musicLyrics?.trim() ? { lyrics: node.musicLyrics.trim() } : {}),
-      ...(node.musicReference ? { referenceLocalAudio: node.musicReference.localAudio, referenceAssetId: node.musicReference.assetId, referenceNodeId: node.musicReference.nodeId, referenceTitle: node.musicReference.title, referenceDuration: node.musicReference.duration, referenceSize: node.musicReference.size } : {}),
+      ...(node.musicReference ? { referenceAssetId: node.musicReference.assetId, referenceNodeId: node.musicReference.nodeId, referenceTitle: node.musicReference.title, referenceDuration: node.musicReference.duration, referenceSize: node.musicReference.size } : {}),
       ...(settings.audio_mode ? { audio_mode: settings.audio_mode } : {}),
       ...(settings.output_format ? { output_format: settings.output_format } : {}),
       ...(settings.duration !== undefined ? { duration: settings.duration } : {}),
@@ -4828,7 +5687,8 @@ export default function App({
     const currentNode = () => alive.current && !leaving.current && !controller.signal.aborted && activeRequests.current.get(node.id) === controller
       ? docRef.current.nodes.find(item => item.id === node.id) : undefined;
     setActiveIds(ids => [...ids, node.id]);
-    patchTask(node.id, { status: "running", taskId, taskPrompt: effectivePrompt, error: undefined, musicSubmission: submission, audioTaskType: "music", voiceDesignSubmission: undefined,
+    patchTask(node.id, { status: "running", taskId, taskPrompt: effectivePrompt, error: automaticRecovery ? node.error : undefined, musicSubmission: submission, audioTaskType: "music", voiceDesignSubmission: undefined,
+      ...(previous ? { taskDiagnostic: submissionRetryStartedDiagnostic(node) } : {}),
       ...(!taskId && !previous ? { voiceId: undefined, voiceTrialAudioAvailable: undefined, audio: undefined, assetId: undefined, localAudio: undefined, taskDiagnostic: { status: "running", phase: "submitting", createdAt: new Date().toISOString() }, inputSignature: audioCreationSignature(node, models as any, effectivePrompt) } : {}),
       ...(selected?.id && !taskId && !previous ? { modelId: selected.id, musicSettings: settings } : {}) });
     try {
@@ -4840,20 +5700,23 @@ export default function App({
         lyrics_optimizer: submission?.lyrics_optimizer,
         output_format: submission?.output_format, duration: submission?.duration,
         idempotencyKey: submission?.key, taskId,
-      }, id => { if (!currentNode()) return; patchTask(node.id, { taskId: id, status: "running", musicSubmission: undefined }); return persist(docRef.current, false); }, {
-        signal: controller.signal, observeUnknown: true, recovery: Boolean(previous),
+      }, id => { const current = currentNode(); if (!current) return; patchTask(node.id, { taskId: id, status: "running", musicSubmission: undefined, error: undefined, taskDiagnostic: submissionRetryStartedDiagnostic(current) }); return persist(docRef.current, false); }, {
+        signal: controller.signal, observeUnknown: true, recovery: Boolean(previous), allowResubmit: !automaticRecovery,
         loadReferenceAudio: submission?.referenceLocalAudio || submission?.referenceAssetId ? async () => {
-          const local = submission.referenceLocalAudio ? await readLocalAudio(submission.referenceLocalAudio) : null;
-          const blob = local || (submission.referenceAssetId
-            ? await audioSources.read({ type: "audio", status: "completed", assetId: submission.referenceAssetId }, controller.signal, 50 * 1024 * 1024)
-            : null);
+          if (!submission.referenceAssetId) throw new MusicGenerationError("原 Cover 提交尚未被平台受理，且参考音频没有稳定的平台资产身份。请重新上传参考音频后再生成。", { terminalTask: true, code: "MUSIC_REFERENCE_MISSING" });
+          const blob = await audioSources.read({ type: "audio", status: "completed", assetId: submission.referenceAssetId }, controller.signal, 50 * 1024 * 1024);
           if (!blob) throw new MusicGenerationError("原 Cover 提交尚未被平台受理，且参考音频已无法恢复。请重新添加参考音频后再生成。", { terminalTask: true, code: "MUSIC_REFERENCE_MISSING" });
           validateMusicReferenceAudio(blob, submission.referenceDuration || 0);
           return readMusicReferenceAudioBase64(blob);
         } : undefined,
-        onStatus: snapshot => { if (!currentNode()) return; patchTask(node.id, { status: mediaTaskPublicState({ status: snapshot.status, code: snapshot.code, phase: snapshot.phase, assetStatus: snapshot.assetStatus }) === "failed" ? "failed" : "running", taskDiagnostic: { ...docRef.current.nodes.find(item => item.id === node.id)?.taskDiagnostic, status: snapshot.status, phase: snapshot.phase, assetStatus: snapshot.assetStatus, code: snapshot.code || undefined, requestId: snapshot.requestId, supplierConfirmation: snapshot.supplierConfirmation }, ...(snapshot.assetId ? { assetId: snapshot.assetId } : {}) }); },
+        onStatus: snapshot => { if (!currentNode()) return; const publicState = mediaTaskPublicState({ status: snapshot.status, code: snapshot.code, phase: snapshot.phase, assetStatus: snapshot.assetStatus, supplierConfirmationState: snapshot.supplierConfirmation?.state }); patchTask(node.id, { status: publicState === "failed" ? "failed" : publicState === "queued" ? "queued" : "running", taskDiagnostic: { ...docRef.current.nodes.find(item => item.id === node.id)?.taskDiagnostic, status: snapshot.status, phase: snapshot.phase, assetStatus: snapshot.assetStatus, code: snapshot.code || undefined, requestId: snapshot.requestId, supplierConfirmation: snapshot.supplierConfirmation }, ...(snapshot.assetId ? { assetId: snapshot.assetId } : {}) }); },
       });
       const source = currentNode(); if (!source) return;
+      requireStableMediaIdentity({
+        taskId: result.taskId,
+        assetId: result.assetId,
+        url: result.contentUrl,
+      }, "音乐生成结果");
       patchTask(node.id, { status: "completed", error: undefined, audio: result.contentUrl, assetId: result.assetId, taskId: result.taskId, musicSubmission: undefined, taskDiagnostic: { ...source.taskDiagnostic, status: "completed", phase: "completed", assetStatus: "ready", code: undefined } });
       await persist(docRef.current, false);
       setInspectorMode(null); setCreationError(null);
@@ -4861,11 +5724,17 @@ export default function App({
       if (notice) setMessage(notice.text, undefined, 3500);
     } catch (error) {
       if (!currentNode() || controller.signal.reason === "cancelled" || controller.signal.reason === "replaced") return;
+      const previousError = currentNode()?.error;
       const musicError = error instanceof MusicGenerationError ? error : undefined;
-      const pending = musicError ? musicError.pending || Boolean(submission && !musicError.terminalTask) : Boolean(taskId || submission);
+      const identityMissing = error && typeof error === "object" && "code" in error && String(error.code) === "CANVAS_MEDIA_IDENTITY_MISSING";
+      const pending = identityMissing ? false : musicError ? musicError.pending || Boolean(submission && !musicError.terminalTask) : Boolean(taskId || submission);
       patchTask(node.id, { status: pending ? "queued" : "failed", ...(!pending ? { musicSubmission: undefined } : {}), error: errorText(error), ...(musicError?.taskId ? { taskId: musicError.taskId } : {}), taskDiagnostic: { ...docRef.current.nodes.find(item => item.id === node.id)?.taskDiagnostic, ...(musicError ? { code: musicError.code, status: musicError.status || (pending ? "pending" : "failed"), requestId: musicError.requestId } : {}) } });
-      void persist(docRef.current, false).catch(() => setStatus("任务恢复信息保存失败 · 请保留页面并导出备份"));
-      if (!pending) reportTaskFailure(node, error, submission?.key);
+      void persist(docRef.current, false).catch(error => {
+        setStatus("保存状态待确认 · 建议导出备份");
+        setMessage(errorText(error));
+      });
+      if (pending) reportPendingTaskError(node, error, previousError);
+      else reportTaskFailure(node, error, submission?.key);
     } finally {
       if (activeRequests.current.get(node.id) === controller) { activeRequests.current.delete(node.id); if (alive.current) setActiveIds(ids => ids.filter(id => id !== node.id)); }
     }
@@ -4874,6 +5743,13 @@ export default function App({
     if (cancelingIds.includes(requested.id)) return;
     const node = docRef.current.nodes.find(item => item.id === requested.id);
     if (!node || node.type !== "prompt" || node.mediaType !== "audio" || !node.taskId) return;
+    if (mediaTaskPublicState({
+      status: node.taskDiagnostic?.status || node.status,
+      code: node.taskDiagnostic?.code,
+      phase: node.taskDiagnostic?.phase,
+      assetStatus: node.taskDiagnostic?.assetStatus,
+      supplierConfirmationState: node.taskDiagnostic?.supplierConfirmation?.state,
+    }) !== "queued") return;
     const taskId = node.taskId;
     const documentId = docRef.current.id;
     setCancelingIds(ids => ids.includes(node.id) ? ids : [...ids, node.id]);
@@ -4895,7 +5771,6 @@ export default function App({
           ...(cancelled ? { assetStatus: undefined } : {}),
         },
       });
-      if (!cancelled && !activeRequests.current.has(node.id)) void generateMusicTask(current);
       await persist(docRef.current, false);
       if (cancelled) setMessage("音乐生成已取消。", undefined, 2500);
     } catch (error) {
@@ -4925,7 +5800,6 @@ export default function App({
     setPicker(null);
     closeZoomMenu();
     setToolMenu(false);
-    setLayoutMenu(false);
   };
   const closeDockPanels = () => {
     setOverlay(current => current === "help" || current === "settings" ? null : current);
@@ -5020,13 +5894,18 @@ export default function App({
         if (!alive.current) return;
         if (backup)
           setRecovery(normalize({ ...backup, id: initialDocument.id }));
+        const savedCloudBase = await readDraft<Document>(`cloud-base:${initialDocument.id}`);
+        if (!alive.current) return;
+        if (savedCloudBase?.id === initialDocument.id)
+          cloudBaseRef.current = normalize(savedCloudBase);
         setStatus(isSessionOnlyStorage() ? "正在确认云端保存状态…" : "已打开本机画布");
       } catch (error) {
         setMessage(errorText(error));
       }
       if (!alive.current) return;
       setDraftReady(true);
-      void refreshPlatform(true, initialDocument);
+      onReady(initialDocument.id);
+      void refreshPlatform(true);
     })();
     return () => {
       alive.current = false;
@@ -5050,15 +5929,184 @@ export default function App({
     void refreshPlatform();
   }, [platformRevision]);
   React.useEffect(() => {
+    if (!draftReady || !hydrated || !syncEnabled || !platformReady) return;
+    return watchCanvasDocumentChanges(client.storage, initialDocument.id, async (state) => {
+      if (!alive.current || !state.document || docRef.current.id !== initialDocument.id) return;
+      cloudResolutionEpoch.current += 1;
+      let remote = normalize(state.document);
+      let current = normalize(docRef.current);
+      if (!alive.current || docRef.current.id !== remote.id) return;
+      if (documentRevisionSignature(current) === documentRevisionSignature(remote)) {
+        acceptCanvasDocumentState(client.storage, initialDocument.id, state);
+        await rememberCloudBase(remote);
+        return;
+      }
+      // A newer marker can represent only a camera move, timestamp, or
+      // short-lived task/media delivery update. Accept its CAS baseline but
+      // keep the live editor in place; those changes do not need a merge.
+      if (canvasContentSignature(current) === canvasContentSignature(remote)) {
+        acceptCanvasDocumentState(client.storage, initialDocument.id, state);
+        await rememberCloudBase(remote);
+        return;
+      }
+      // A canvas switch will unmount this watcher. Do not interrupt the leave
+      // flow; the next editor load will reconcile it.
+      if (leaving.current) return;
+      if (cloudReconcileRef.current) return;
+      cloudReconcileRef.current = true;
+      setCloudMergeError("");
+      let base: Document | null = null;
+      if (saveTimer.current !== null) {
+        window.clearTimeout(saveTimer.current);
+        saveTimer.current = null;
+      }
+      if (cloudSaveTimer.current !== null) {
+        window.clearTimeout(cloudSaveTimer.current);
+        cloudSaveTimer.current = null;
+      }
+      // Stop new outbox writes while we combine snapshots. Existing writes
+      // retain their previous CAS baseline and therefore cannot overwrite the
+      // cloud edit which caused this reconciliation.
+      setSyncEnabled(false);
+      try {
+        const queued = cloudSaveQueues.get(initialDocument.id);
+        if (queued) await queued.promise.catch(() => {});
+        if (!alive.current) return;
+        // Cloud saves that were already in flight may have completed while we
+        // waited. Their confirmed snapshot is now the true common ancestor;
+        // using the pre-wait base can misclassify the next local keystroke as
+        // a simultaneous remote edit and reopen the reload dialog.
+        base = cloudBaseRef.current ? clone(cloudBaseRef.current) : null;
+        let mergeBase = base;
+        let recoverySaved = false;
+        let historyRecorded = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          // `peek` is deliberately non-mutating: a conflict must not bless a
+          // cloud revision as a save baseline before it is safely reconciled.
+          const latestState = await peekCanvasDocument(client.storage, initialDocument.id);
+          if (!alive.current || !latestState.document) return;
+          remote = normalize(latestState.document);
+          current = normalize(docRef.current);
+          if (current.id !== initialDocument.id) return;
+          let plan = planCloudDocumentMerge(mergeBase, current, remote);
+          if (plan.kind === "conflict") {
+            setCloudCandidate(remote);
+            setStatus(savedStatus(false));
+            setOverlay("restore");
+            return;
+          }
+          if (plan.kind === "same") {
+            acceptCanvasDocumentState(client.storage, initialDocument.id, latestState);
+            await rememberCloudBase(remote);
+            onCloudSynced?.(remote);
+            const pending = await getPendingCloudSync(initialDocument.id);
+            if (pending?.updatedAt === current.updatedAt)
+              await removePendingCloudSync(initialDocument.id, pending.revision);
+            setCloudCandidate(null);
+            setSyncEnabled(true);
+            return;
+          }
+
+          if (!recoverySaved) {
+            await rememberVersion(current);
+            recoverySaved = true;
+          }
+          if (!alive.current) return;
+          // Re-read the editor after the recovery write. The user may have
+          // continued editing while storage was busy; rebase those edits
+          // against the same cloud snapshot before publishing the merge.
+          current = normalize(docRef.current);
+          if (current.id !== initialDocument.id) return;
+          plan = planCloudDocumentMerge(mergeBase, current, remote);
+          if (plan.kind === "conflict") {
+            setCloudCandidate(remote);
+            setStatus(savedStatus(false));
+            setOverlay("restore");
+            return;
+          }
+          if (plan.kind === "same") {
+            acceptCanvasDocumentState(client.storage, initialDocument.id, latestState);
+            await rememberCloudBase(remote);
+            onCloudSynced?.(remote);
+            setCloudCandidate(null);
+            setSyncEnabled(true);
+            return;
+          }
+
+          const next = normalize(plan.document);
+          if (plan.kind === "remote-only") next.updatedAt = remote.updatedAt;
+
+          acceptCanvasDocumentState(client.storage, initialDocument.id, latestState);
+          if (!historyRecorded) {
+            setPast((items) => [...items.slice(-49), clone(current)]);
+            setFuture([]);
+            historyRecorded = true;
+          }
+          // The direct persist below owns this snapshot; avoid a second
+          // autosave of the pre-merge document.
+          clearConnection();
+          dirty.current = false;
+          replaceDoc(next);
+          setSelectedEdge((edgeId) => edgeId && next.edges.some(edge => edge.id === edgeId) ? edgeId : null);
+          setSelected((selectedIds) => selectedIds.filter(id => next.nodes.some(node => node.id === id)));
+          setInspectorOpen(false);
+
+          try {
+            await persist(next, plan.kind !== "remote-only", false);
+          } catch (error) {
+            if (!isCanvasVersionConflict(error) || attempt === 2) throw error;
+            // Someone saved again between our read and CAS write. Rebase the
+            // already combined snapshot on the just-read cloud version and
+            // retry against the newest document.
+            mergeBase = remote;
+            continue;
+          }
+          if (!alive.current) return;
+          const currentMatchesMerged = docRef.current.id === next.id &&
+            documentRevisionSignature(docRef.current) === documentRevisionSignature(next);
+          if (currentMatchesMerged) dirty.current = false;
+          await rememberCloudBase(plan.kind === "remote-only" ? remote : next);
+          if (plan.kind === "remote-only") {
+            onCloudSynced?.(remote);
+            const pending = await getPendingCloudSync(initialDocument.id);
+            if (pending?.updatedAt === current.updatedAt)
+              await removePendingCloudSync(initialDocument.id, pending.revision);
+          }
+          setCloudCandidate(null);
+          setOverlay(null);
+          setSyncEnabled(true);
+          if (currentMatchesMerged) setStatus(savedStatus(true));
+          return;
+        }
+        throw Object.assign(
+          new Error("云端版本仍在变化，已保留当前内容，请稍后再次加载。"),
+          { code: "APP_STORAGE_CONFLICT" },
+        );
+      } catch (error) {
+        if (!alive.current) return;
+        // The merge planner above is the only place that can identify a real
+        // authored-content conflict. Any error here is a failed read/recovery/
+        // CAS write, so keep the editor usable and leave the marker unaccepted
+        // for the watcher to retry on its next poll.
+        setSyncEnabled(true);
+        setStatus(syncFailureStatus());
+        setCloudMergeError("");
+        throw error;
+      } finally {
+        cloudReconcileRef.current = false;
+      }
+    }, { pollIntervalMs: 5000 });
+  }, [draftReady, hydrated, initialDocument.id, onCloudSynced, platformReady, setMessage, syncEnabled]);
+  React.useEffect(() => {
     if (!draftReady || !dirty.current || gesturing || viewportMoving || leaving.current) return;
-    setStatus("正在保存…");
+    setStatus("正在保存到本机…");
     const snapshot = doc;
     const timer = window.setTimeout(() => {
       if (leaving.current) return;
       void persist(snapshot, false)
         .then(() => {
           scheduleCloudSync(snapshot);
-          if (docRef.current.updatedAt === snapshot.updatedAt)
+          if (docRef.current.id === snapshot.id && docRef.current.updatedAt === snapshot.updatedAt)
             setStatus(
               syncEnabled && hydrated
                 ? isSessionOnlyStorage() ? "等待云端同步 · 仅当前页面保留" : "已保存本机 · 等待云端同步"
@@ -5066,8 +6114,9 @@ export default function App({
             );
         })
         .catch((error) => {
+          if (!isSameDocumentRevision(docRef.current, snapshot)) return;
           setStatus(
-            lastLocalSave.current === snapshot.updatedAt
+            isLocallySaved(snapshot)
               ? syncFailureStatus()
               : "保存失败 · 请导出备份",
           );
@@ -5080,6 +6129,20 @@ export default function App({
       if (saveTimer.current === timer) saveTimer.current = null;
     };
   }, [doc, draftReady, gesturing, viewportMoving, syncEnabled, hydrated, scheduleCloudSync]);
+  React.useEffect(() => {
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      const localWritePending = dirty.current || saveTimer.current !== null || (
+        saveProgressRef.current.phase === "local" &&
+        saveProgressRef.current.revision === documentSaveRevision(docRef.current)
+      );
+      const memoryOnlyChanges = isSessionOnlyStorage() && hasPendingSessionChanges();
+      if (!localWritePending && !memoryOnlyChanges) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, []);
   React.useEffect(() => () => {
     if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
     if (cloudSaveTimer.current !== null) window.clearTimeout(cloudSaveTimer.current);
@@ -5174,6 +6237,11 @@ export default function App({
         .filter((node) => node.groupId && wholeGroups.has(node.groupId))
         .map((node) => node.id),
     ])];
+    if (preview && nodeIds.includes(preview.id)) closePreview();
+    const activeGallery = previewNavigationContext.current;
+    if (activeGallery) {
+      activeGallery.context = removeMediaNavigationSnapshots(activeGallery.context, nodeIds);
+    }
     clearConnection();
     const edgeId = selectedEdge;
     if (!nodeIds.length && !edgeId) return;
@@ -5249,10 +6317,10 @@ export default function App({
       );
       const outgoing = new Map<string, Edge[]>();
       docRef.current.edges.forEach((edge) => {
-        const list = outgoing.get(edge.from) || [];
-        list.push(edge);
-        outgoing.set(edge.from, list);
-      });
+          const list = outgoing.get(edge.from) || [];
+          list.push(edge);
+          outgoing.set(edge.from, list);
+        });
       const queue: { id: string; path: string[] }[] = [{ id: visibleEdge.from, path: [] }];
       const visited = new Set<string>();
       while (queue.length) {
@@ -5312,69 +6380,101 @@ export default function App({
     });
     setSelected(grouped);
   };
-  const applyLayout = (
-    mode: "flow" | "grid",
-    scope: "all" | "selected" = chosen.length > 1 ? "selected" : "all",
-    sort: typeof layoutSort = layoutSort,
-  ) => {
-    const source = scope === "selected" ? chosen : docRef.current.nodes;
-    if (source.length < 2) {
-      setMessage("至少选择 2 个节点后才能整理布局。");
-      setLayoutMenu(false);
+  const applyLayout = (scope: "all" | "selected" = chosen.length > 1 ? "selected" : "all") => {
+    const source = layoutSourceNodes(docRef.current.nodes, chosen.map((node) => node.id), scope);
+    if (layoutUnitCount(source) < 2) {
+      setMessage("至少需要 2 个节点或分组后才能整理布局。");
       return;
     }
     const ids = new Set(source.map((node) => node.id));
-    let arranged: CanvasNode[];
-    if (mode === "flow") {
-      arranged = arrangeNodes(
-        source,
-        docRef.current.edges.filter((edge) => ids.has(edge.from) && ids.has(edge.to)),
-      );
-    } else {
-      const selectedOrder = new Map(selected.map((id, index) => [id, index]));
-      const ordered = [...source].sort((a, b) => {
-        if (sort === "custom") return (selectedOrder.get(a.id) ?? 0) - (selectedOrder.get(b.id) ?? 0);
-        if (sort === "name") return a.title.localeCompare(b.title, "zh-CN") || a.id.localeCompare(b.id);
-        if (sort === "time") return docRef.current.nodes.indexOf(a) - docRef.current.nodes.indexOf(b);
-        return a.y - b.y || a.x - b.x || a.id.localeCompare(b.id);
-      });
-      const rows = Math.max(1, Math.min(layoutRows, ordered.length));
-      const columns = Math.ceil(ordered.length / rows);
-      const columnWidths = Array.from({ length: columns }, (_, column) =>
-        Math.max(...ordered.filter((_, index) => index % columns === column).map((node) => node.width)),
-      );
-      const rowHeights = Array.from({ length: rows }, (_, row) =>
-        Math.max(...ordered.filter((_, index) => Math.floor(index / columns) === row).map((node) => node.height)),
-      );
-      const startX = Math.min(...source.map((node) => node.x));
-      const startY = Math.min(...source.map((node) => node.y));
-      const gap = 32;
-      const xOffsets = columnWidths.map((_, column) => columnWidths.slice(0, column).reduce((sum, width) => sum + width + gap, 0));
-      const yOffsets = rowHeights.map((_, row) => rowHeights.slice(0, row).reduce((sum, height) => sum + height + gap, 0));
-      arranged = ordered.map((node, index) => ({
-        ...node,
-        x: startX + xOffsets[index % columns],
-        y: startY + yOffsets[Math.floor(index / columns)],
-      }));
-    }
+    // Use the same visible graph as the canvas so layout follows the exact
+    // dependency/reference graph users see.
+    const arranged = arrangeSmartNodes(
+      source,
+      visibleCanvasEdges(docRef.current.nodes, docRef.current.edges)
+        .filter((edge) => ids.has(edge.from) && ids.has(edge.to)),
+    );
     const minX = Math.min(...source.map((node) => node.x));
     const minY = Math.min(...source.map((node) => node.y));
+    const arrangedMinX = Math.min(...arranged.map((node) => node.x));
+    const arrangedMinY = Math.min(...arranged.map((node) => node.y));
     const next = new Map(arranged.map((node) => [node.id, node]));
     const positioned = docRef.current.nodes.map((node) => {
       const position = next.get(node.id);
       if (!position) return node;
-      return mode === "flow"
-        ? { ...node, x: position.x + minX - 100, y: position.y + minY - 100 }
-        : { ...node, x: position.x, y: position.y };
+      return { ...node, x: position.x + minX - arrangedMinX, y: position.y + minY - arrangedMinY };
     });
-    commit((value) => ({
-      ...value,
-      nodes: value.nodes.map((node) => positioned.find((item) => item.id === node.id) || node),
-    }));
+    commit((value) => {
+      const nodes = value.nodes.map((node) => positioned.find((item) => item.id === node.id) || node);
+      return { ...value, nodes, groups: expandGroupFrames(nodes, value.groups) };
+    });
     if (scope === "all") navigateView(fitViewport(positioned, boardSize, 110, 1));
-    setLayoutMenu(false);
   };
-  const arrangeSelection = () => applyLayout(canvasPreferences.autoLayout, "selected");
+  const arrangeSelection = () => applyLayout("selected");
+  const arrangeChosenNodes = () => {
+    if (selectedWholeGroup && chosen[0]?.groupId) {
+      arrangeGroupContents(chosen[0].groupId);
+      return;
+    }
+    arrangeSelection();
+  };
+  const arrangeGroupContents = (groupId: string) => {
+    const current = docRef.current;
+    const members = current.nodes.filter((node) => node.groupId === groupId);
+    const visible = members.filter((node) => !isCollapsedResultTask(node, current.nodes, current.edges));
+    if (visible.length < 2) return;
+    const visibleIds = new Set(visible.map((node) => node.id));
+    const edges = visibleCanvasEdges(current.nodes, current.edges)
+      .filter((edge) => visibleIds.has(edge.from) && visibleIds.has(edge.to));
+    const arranged = arrangeGroupMembers(visible, edges);
+    const minX = Math.min(...visible.map((node) => node.x));
+    const minY = Math.min(...visible.map((node) => node.y));
+    const arrangedMinX = Math.min(...arranged.map((node) => node.x));
+    const arrangedMinY = Math.min(...arranged.map((node) => node.y));
+    const arrangedById = new Map(arranged.map((node) => [node.id, node]));
+    const ancestorMoves = new Map<string, Array<{ x: number; y: number }>>();
+    const nodeById = new Map(current.nodes.map((node) => [node.id, node]));
+    for (const node of visible) {
+      const position = arrangedById.get(node.id);
+      if (!position) continue;
+      const delta = {
+        x: position.x + minX - arrangedMinX - node.x,
+        y: position.y + minY - arrangedMinY - node.y,
+      };
+      const visited = new Set<string>([node.id]);
+      let parentId = node.resultOf || node.continuationOf;
+      while (parentId && !visited.has(parentId)) {
+        visited.add(parentId);
+        const parent = nodeById.get(parentId);
+        if (!parent) break;
+        const moves = ancestorMoves.get(parent.id) || [];
+        moves.push(delta);
+        ancestorMoves.set(parent.id, moves);
+        parentId = parent.resultOf || parent.continuationOf;
+      }
+    }
+    const positioned = current.nodes.map((node) => {
+      const position = arrangedById.get(node.id);
+      if (position) return {
+        ...node,
+        x: position.x + minX - arrangedMinX,
+        y: position.y + minY - arrangedMinY,
+      };
+      if (node.groupId !== groupId) return node;
+      const moves = ancestorMoves.get(node.id);
+      if (!moves?.length) return node;
+      const delta = moves.reduce((sum, move) => ({ x: sum.x + move.x, y: sum.y + move.y }), { x: 0, y: 0 });
+      return { ...node, x: node.x + delta.x / moves.length, y: node.y + delta.y / moves.length };
+    });
+    const targetPositions = new Map(positioned.map((node) => [node.id, { x: node.x, y: node.y }]));
+    commit((value) => {
+      const nodes = value.nodes.map((node) => {
+        const target = targetPositions.get(node.id);
+        return target ? { ...node, ...target } : node;
+      });
+      return { ...value, nodes, groups: expandGroupFrames(nodes, value.groups) };
+    });
+  };
   const exportSelection = () => {
     if (!chosen.length) return;
     const ids = new Set(chosen.map((node) => node.id));
@@ -5386,8 +6486,55 @@ export default function App({
       edges: value.edges.filter((edge) => ids.has(edge.from) && ids.has(edge.to)),
     }, true);
   };
-  const duplicateNodes = (originals: CanvasNode[]) => {
+  const rollbackPendingImageImport = (nodeId: string, message: string) => {
+    mediaUploadFiles.current.delete(nodeId);
+    updateMediaUploadStates(current => {
+      if (!(nodeId in current)) return current;
+      const next = { ...current };
+      delete next[nodeId];
+      return next;
+    });
+    if (preview?.id === nodeId) closePreview();
+    const activeGallery = previewNavigationContext.current;
+    if (activeGallery) {
+      activeGallery.context = removeMediaNavigationSnapshots(activeGallery.context, [nodeId]);
+    }
+    stopRemovedNodeRequests([nodeId]);
+    if (docRef.current.nodes.some(node => node.id === nodeId)) {
+      commit(value => {
+        const nodes = value.nodes.filter(node => node.id !== nodeId);
+        const result = rebuildGroupStateFromNodes(nodes);
+        return {
+          ...value,
+          ...result,
+          edges: value.edges.filter(edge => edge.from !== nodeId && edge.to !== nodeId),
+        };
+      });
+    }
+    setSelected(current => current.filter(id => id !== nodeId));
+    setMessage(message, undefined, 3500);
+  };
+
+  const duplicateNodes = (originals: CanvasNode[], at?: Point) => {
     if (!originals.length) return;
+    const hasUnrecoverableMedia = originals.some(node => {
+      const mediaType = node.mediaType || node.type;
+      const hasMediaSource = Boolean(node.image || node.localImage || node.video || node.localVideo || node.videoContentUrl || node.audio || node.localAudio);
+      if (["image", "audio", "video"].includes(mediaType) && hasMediaSource &&
+        (mediaUploadStates[node.id] || !copiedMediaIdentity(node).status)) return true;
+      if (node.musicReference && !node.musicReference.assetId) return true;
+      return (node.embeddedReferences || []).some(reference => {
+        const hasReferenceSource = Boolean(reference.image || reference.localImage || reference.video || reference.localVideo || reference.videoContentUrl || reference.audio || reference.localAudio);
+        return hasReferenceSource && !hasStableMediaInput({
+          assetId: reference.assetId,
+          url: reference.image || reference.video || reference.videoContentUrl || reference.audio,
+        });
+      });
+    });
+    if (hasUnrecoverableMedia) {
+      setMessage("部分媒体仍在上传，或缺少可复用的稳定身份，暂时无法复制。请先完成上传或重新加载资产。", undefined, 3500);
+      return;
+    }
     const mapping = new Map(originals.map((node) => [node.id, uid(node.type)]));
     const groupMapping = new Map<string, string>();
     originals.forEach((node) => {
@@ -5395,20 +6542,21 @@ export default function App({
     });
     const minX = Math.min(...originals.map((n) => n.x)),
       minY = Math.min(...originals.map((n) => n.y));
-    const area = {
-      x: minX + 40,
-      y: minY + 40,
-      width: Math.max(...originals.map((n) => n.x + n.width)) - minX,
-      height: Math.max(...originals.map((n) => n.y + n.height)) - minY,
-    };
+    const width = Math.max(...originals.map((n) => n.x + n.width)) - minX;
+    const height = Math.max(...originals.map((n) => n.y + n.height)) - minY;
+    const area = at
+      ? { x: at.x - width / 2, y: at.y - height / 2, width, height }
+      : { x: minX + 40, y: minY + 40, width, height };
     const location = findFreePosition(docRef.current.nodes, area);
-    const copies = originals.map((node) => ({
+    const copies = remapCopiedNodeReferences(originals.map((node) => ({
       ...node,
       id: mapping.get(node.id)!,
       title: `${node.title} 副本`,
       x: node.x + location.x - minX,
       y: node.y + location.y - minY,
-      taskId: node.mediaType === "audio" && node.status === "completed" ? node.taskId : undefined,
+      taskId: undefined,
+      assetId: undefined,
+      status: undefined,
       videoSubmission: undefined,
       musicSubmission: undefined,
       voiceDesignSubmission: undefined,
@@ -5421,9 +6569,12 @@ export default function App({
       resultIndex: undefined,
       continuationOf: undefined,
       groupId: node.groupId ? groupMapping.get(node.groupId) : undefined,
-      status: node.mediaType === "audio" && node.status === "completed" ? "completed" as const : undefined,
+      uploadState: undefined,
+      uploadProgress: undefined,
+      uploadError: undefined,
       error: undefined,
-    }));
+      ...copiedMediaFields(node),
+    })), mapping, () => uid("reference"));
     if (!copies.length) return;
     const edges = docRef.current.edges
       .filter((edge) => mapping.has(edge.to))
@@ -5452,12 +6603,89 @@ export default function App({
     const originals = docRef.current.nodes.filter((node) => expandedIds.includes(node.id));
     if (!originals.length) return;
     nodeClipboard.current = clone(originals);
+    nodeClipboardDocumentId.current = docRef.current.id;
+    nodeClipboardText.current = originals.map((node) => node.title).join("\n");
+    nodeClipboardPreferredUntil.current = Date.now() + 5000;
+    let clipboardWrite: Promise<void> | undefined;
+    try {
+      clipboardWrite = navigator.clipboard?.write?.([
+        new ClipboardItem({
+          [CANVAS_NODE_CLIPBOARD_TYPE]: new Blob([serializeCanvasNodes(nodeClipboard.current, nodeClipboardDocumentId.current)], { type: CANVAS_NODE_CLIPBOARD_TYPE }),
+          "text/plain": new Blob([nodeClipboardText.current], { type: "text/plain" }),
+        }),
+      ]);
+    } catch {
+      clipboardWrite = undefined;
+    }
+    if (clipboardWrite) {
+      void clipboardWrite.catch(() => navigator.clipboard?.writeText(nodeClipboardText.current)).catch(() => {});
+    } else {
+      const textWrite = navigator.clipboard?.writeText(nodeClipboardText.current);
+      if (textWrite) void textWrite.catch(() => {});
+    }
     closeMenus();
     setMessage(`已复制 ${originals.length} 个节点，可使用 ⌘/Ctrl + V 粘贴。`, undefined, 2500);
   };
-  const pasteNodes = () => {
-    if (!nodeClipboard.current.length) return;
-    duplicateNodes(clone(nodeClipboard.current));
+  const canvasPastePoint = () => {
+    const element = board.current;
+    const screen = pointerInside.current ? pointerScreen.current : null;
+    if (!element || !screen) return centerPoint();
+    const rect = element.getBoundingClientRect();
+    return point(rect.left + screen.x, rect.top + screen.y);
+  };
+  const pasteNodes = (at?: Point) => {
+    if (!nodeClipboard.current.length) return false;
+    const currentNodes = docRef.current.nodes;
+    const currentClipboard = refreshCanvasClipboardNodes(
+      nodeClipboard.current,
+      nodeClipboardDocumentId.current,
+      docRef.current.id,
+      currentNodes,
+    );
+    duplicateNodes(clone(currentClipboard), at || canvasPastePoint());
+    return true;
+  };
+  const pasteClipboard = (event: React.ClipboardEvent<HTMLDivElement>) => {
+    if (!platformReadyRef.current || referencePickTarget || overlay || preview) return;
+    const target = event.target as Element | null;
+    if (target?.closest('input,textarea,select,[contenteditable="true"],[data-canvas-management]')) return;
+    const serializedNodes = event.clipboardData?.getData(CANVAS_NODE_CLIPBOARD_TYPE);
+    const systemClipboard = serializedNodes ? parseCanvasNodeClipboard(serializedNodes) : null;
+    if (systemClipboard?.nodes.length) {
+      event.preventDefault();
+      const currentNodes = docRef.current.nodes;
+      const currentClipboard = refreshCanvasClipboardNodes(
+        systemClipboard.nodes,
+        systemClipboard.documentId,
+        docRef.current.id,
+        currentNodes,
+      );
+      duplicateNodes(currentClipboard, canvasPastePoint());
+      return;
+    }
+    const payload = event.clipboardData && readCanvasClipboard(event.clipboardData);
+    if (!payload) {
+      if (pasteNodes()) event.preventDefault();
+      return;
+    }
+    event.preventDefault();
+    if (payload.kind === "text" && nodeClipboard.current.length &&
+      Date.now() < nodeClipboardPreferredUntil.current &&
+      (payload.text === nodeClipboardText.current || payload.text.trim() === nodeClipboardText.current.trim())) {
+      pasteNodes();
+      nodeClipboardPreferredUntil.current = 0;
+      return;
+    }
+    const at = canvasPastePoint();
+    if (payload.kind === "text") {
+      add("note", at, undefined, payload.text.slice(0, 50_000));
+      return;
+    }
+    payload.files.forEach((source, index) => {
+      const name = source.name?.trim() || `剪贴板素材-${index + 1}.${source.type.split("/")[1] || "bin"}`;
+      const input = source.name?.trim() ? source : new File([source], name, { type: source.type });
+      importImage(input, { at: { x: at.x + index * 48, y: at.y + index * 48 } });
+    });
   };
   const applyImageOperation = (source: CanvasNode, outputs: ImageToolOutput[]) => {
     if (!outputs.length) return;
@@ -5468,43 +6696,42 @@ export default function App({
     const liveSource = current.nodes.find((node) => node.id === source.id);
     if (!liveSource || pendingRemovalNodes.current.has(source.id)) return;
     source = liveSource;
-    const created: CanvasNode[] = [];
-    for (const [index, output] of outputs.entries()) {
-      const width = Math.min(1600, Math.max(120, output.width || source.width));
-      const height = Math.min(1200, Math.max(80, output.height || source.height));
-      const location = findFreePosition(
-        [...current.nodes, ...created],
-        { x: source.x + source.width + 40 + index * 30, y: source.y + index * 30, width, height },
-      );
-      created.push({
-        id: uid("image"),
-        type: "image",
-        title: `${source.title} · ${output.titleSuffix}`,
-        text: "",
-        x: location.x,
-        y: location.y,
-        width,
-        height,
-        color: COLORS[1],
-        image: output.dataUrl,
-        resultOf: source.id,
-        resultIndex: index,
-        operationId: output.operationId,
-        operationParams: output.params,
-        status: "completed",
-      });
-    }
-    commit((value) => ({
-      ...value,
-      nodes: [...value.nodes, ...created],
-      groups: expandGroupFrames([...value.nodes, ...created], value.groups),
-    }));
-    setSelected(created.map((node) => node.id));
-    setSelectedEdge(null);
-    reveal(created);
-    setMessage(`已生成 ${created.length} 张${outputs[0].titleSuffix}图片。`, undefined, 2500);
+    void (async () => {
+      // Reserve each result's position before awaiting the next conversion so
+      // a multi-output operation cannot place every upload on the same card.
+      const reserved = [...docRef.current.nodes];
+      for (const [index, output] of outputs.entries()) {
+        const width = Math.min(1600, Math.max(120, output.width || source.width));
+        const height = Math.min(1200, Math.max(80, output.height || source.height));
+        const location = findFreePosition(
+          reserved,
+          { x: source.x + source.width + 40 + index * 30, y: source.y + index * 30, width, height },
+        );
+        reserved.push({ id: `reserved-${index}`, type: "image", title: "", text: "", ...location, width, height, color: COLORS[1] });
+        const file = await imageDataFile(output.dataUrl, `${source.title}-${output.titleSuffix}`);
+        if (!docRef.current.nodes.some((node) => node.id === source.id) || pendingRemovalNodes.current.has(source.id)) return;
+        // importImage owns the placeholder, progress indicator, COS upload and
+        // rollback. The canvas operation's data URL is never committed.
+        importImage(file, {
+          at: { x: location.x + width / 2, y: location.y + height / 2 },
+          sourceId: source.id,
+          nodeMetadata: {
+            title: `${source.title} · ${output.titleSuffix}`,
+            resultOf: source.id,
+            resultIndex: index,
+            operationId: output.operationId,
+            operationParams: output.params,
+            groupId: source.groupId,
+          },
+        });
+      }
+      if (alive.current && docRef.current.nodes.some((node) => node.resultOf === source.id && node.operationId))
+        setMessage(`已开始上传 ${outputs.length} 张${outputs[0].titleSuffix}图片。`, undefined, 2500);
+    })().catch((error) => {
+      if (alive.current) setMessage(`图片处理结果上传失败：${errorText(error)}`, undefined, 3500);
+    });
   };
-  const insertCapturedVideoFrame = (source: CanvasNode, documentId: string, frame: CapturedVideoFrame) => {
+  const insertCapturedVideoFrame = async (source: CanvasNode, documentId: string, frame: CapturedVideoFrame) => {
     const current = docRef.current.nodes.find(node => node.id === source.id);
     if (!alive.current || leaving.current || documentId !== docRef.current.id || !current || !sameVideoNodeSource(source, current)) {
       throw new Error("原视频已更换或画布已关闭，请在当前视频上重新截帧。");
@@ -5515,38 +6742,42 @@ export default function App({
       throw new Error("无法读取当前视频画面，请等待加载完成后重试。");
     }
     const size = fitImageNodeSize(frame.width, frame.height);
-    const node: CanvasNode = {
-      id: uid("image"),
-      type: "image",
-      title: `${displayNodeTitle(current)} · ${formatVideoTime(frame.time)} 截帧`,
-      text: `截取自「${displayNodeTitle(current)}」 ${formatVideoTime(frame.time)}`,
-      ...findFreePosition(docRef.current.nodes, { x: current.x + current.width + 40, y: current.y, ...size }),
+    const position = findFreePosition(docRef.current.nodes, {
+      x: current.x + current.width + 40,
+      y: current.y,
       ...size,
-      color: COLORS[1],
-      image: frame.dataUrl,
-      // Local derivation is not a model task result. In particular, a legacy
-      // inline-video prompt must stay visible after one of its frames is saved.
-      operationId: "video-frame",
-      operationParams: { sourceNodeId: current.id, time: frame.time, width: frame.width, height: frame.height },
-      groupId: current.groupId,
-      status: "completed",
-    };
-    // Use the regular document transaction: undo, autosave, and the existing
-    // content-addressed image cache own this local image just like an upload.
-    commit(value => ({
-      ...value,
-      nodes: [...value.nodes, node],
-      groups: expandGroupFrames([...value.nodes, node], value.groups),
-    }));
-    setSelected([node.id]);
-    setSelectedEdge(null);
-    setInspectorOpen(false);
-    reveal([current, node]);
-    setMessage("已将当前帧添加为图片，可继续创作或撤销。", undefined, 2500);
+    });
+    try {
+      const file = await imageDataFile(
+        frame.dataUrl,
+        `${displayNodeTitle(current)}-${formatVideoTime(frame.time)}-截帧`,
+      );
+      const latest = docRef.current.nodes.find(node => node.id === source.id);
+      if (!latest || !sameVideoNodeSource(source, latest)) throw new Error("原视频已更换，请重新截帧。");
+      importImage(file, {
+        at: { x: position.x + size.width / 2, y: position.y + size.height / 2 },
+        sourceId: current.id,
+        sourceGuard: () => {
+          const node = docRef.current.nodes.find(candidate => candidate.id === source.id);
+          return Boolean(node && sameVideoNodeSource(source, node));
+        },
+        nodeMetadata: {
+          title: `${displayNodeTitle(current)} · ${formatVideoTime(frame.time)} 截帧`,
+          text: `截取自「${displayNodeTitle(current)}」 ${formatVideoTime(frame.time)}`,
+          resultOf: current.id,
+          operationId: "video-frame",
+          operationParams: { sourceNodeId: current.id, time: frame.time, width: frame.width, height: frame.height },
+          groupId: current.groupId,
+        },
+      });
+    } catch (error) {
+      setMessage(`视频截帧上传失败：${errorText(error)}`, undefined, 3500);
+    }
   };
   const saveVideoProcessResult = async (blob: Blob, request: VideoProcessRequest, signal: AbortSignal) => {
     const { source, options } = request;
     const nodeId = source.source.id;
+    const processStateNodeId = request.targetNodeId || nodeId;
     const currentSource = () => {
       signal.throwIfAborted();
       const node = docRef.current.nodes.find(item => item.id === nodeId);
@@ -5556,122 +6787,258 @@ export default function App({
       }
       return node!;
     };
+    const currentTarget = () => {
+      signal.throwIfAborted();
+      const targetId = request.targetNodeId;
+      const target = targetId ? docRef.current.nodes.find(item => item.id === targetId) : undefined;
+      if (targetId && (!target || target.status !== "running" || pendingRemovalNodes.current.has(targetId))) {
+        throw new DOMException("音频目标节点已变化，提取已停止。", "AbortError");
+      }
+      return target;
+    };
     let current = currentSource();
     if (options.operation === "extract-video" || options.operation === "extract-audio") {
       const audio = options.operation === "extract-audio";
       let localKey: string | undefined;
       let ownsLocalKey = false;
       const mimeType = blob.type || (audio ? "audio/webm" : "video/webm");
-      const extension = mimeType.includes("mp4") ? "mp4" : mimeType.includes("mpeg") ? "mp3" : "webm";
+      const extension = mimeType.includes("mp4") ? "m4a" : mimeType.includes("mpeg") ? "mp3" : mimeType.includes("ogg") ? "ogg" : "webm";
       const file = new File([blob], `${displayNodeTitle(current)}-extract.${extension}`, { type: mimeType });
+      let lastAudioUploadProgressAt = 0;
+      let lastAudioUploadPercent = -1;
       try {
+        if (audio) {
+          setVideoProcessStatus(state => ({ ...state, [processStateNodeId]: "正在保存到本机并上传素材库…" }));
+          setVideoProcessProgress(state => ({ ...state, [processStateNodeId]: 55 }));
+        }
         const [localResult, uploadResult] = await Promise.allSettled([
           audio ? storeLocalAudio(blob) : storeLocalVideo(blob),
-          uploadPlatformAsset(client.api, { file, name: file.name, category: audio ? "sound" : "other" }),
+          uploadDurablePlatformAsset(client.api, {
+            file, name: file.name, category: audio ? "sound" : "other", signal,
+            ...(audio ? { onProgress: update => {
+              if (videoProcessJobs.current.get(nodeId) !== request) return;
+              const percent = Math.max(0, Math.min(100, update.percent ?? 0));
+              const now = Date.now();
+              if (update.phase === "uploading" && Math.round(percent) === lastAudioUploadPercent && now - lastAudioUploadProgressAt < 120) return;
+              lastAudioUploadProgressAt = now;
+              lastAudioUploadPercent = Math.round(percent);
+              const status = update.phase === "preparing" ? "正在准备上传音频…"
+                : update.phase === "uploading" ? "正在上传音频…"
+                  : "正在完成素材入库…";
+              setVideoProcessStatus(state => ({ ...state, [processStateNodeId]: status }));
+              setVideoProcessProgress(state => ({ ...state, [processStateNodeId]: 55 + percent * 0.43 }));
+            } } : {}),
+          }),
         ]);
         if (localResult.status === "fulfilled") { localKey = localResult.value; ownsLocalKey = true; }
+        signal.throwIfAborted();
         const uploaded = uploadResult.status === "fulfilled" ? uploadResult.value : undefined;
-        if (!localKey && !uploaded) throw new Error("提取结果未能保存到本机或云端，请检查存储空间和网络后重试。");
+        if (!uploaded?.id) throw new Error("提取结果上传失败，未创建完成节点。请检查网络后重试。");
         current = currentSource();
-        const size = audio ? DEFAULT_AUDIO_NODE_SIZE : fitVideoNodeSize(current.width, current.height);
         const kind = audio ? "音频" : "视频";
-        const node: CanvasNode = {
-          id: uid(audio ? "audio" : "video"), type: audio ? "audio" : "video", mediaType: audio ? "audio" : "video",
-          title: `${displayNodeTitle(current)} · 提取${kind}`.slice(0, 160),
-          text: `提取自「${displayNodeTitle(current)}」`,
-          ...size,
-          ...findFreePosition(docRef.current.nodes, { x: current.x + current.width + 40, y: current.y, ...size }),
-          color: current.color, groupId: current.groupId, status: "completed", resultOf: current.id,
-          ...(audio ? { ...(localKey ? { localAudio: localKey } : {}), ...(uploaded?.url ? { audio: uploaded.url } : {}), audioMode: "recording" as const } : { ...(localKey ? { localVideo: localKey } : {}), ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : {}), videoDuration: options.endTime - options.startTime }),
-          ...(uploaded?.id ? { assetId: uploaded.id } : {}),
-          operationId: options.operation,
-          operationParams: { sourceNodeId: current.id, startTime: options.startTime, endTime: options.endTime, mimeType, size: blob.size },
-        };
-        commit(value => {
-          const nodes = [...value.nodes, node];
-          return { ...value, nodes, groups: expandGroupFrames(nodes, value.groups) };
-        });
-        setSelected([node.id]); setSelectedEdge(null); setInspectorOpen(false);
-        reveal([current, node]);
+        if (audio) {
+          const target = currentTarget();
+          if (!target) throw new DOMException("音频目标节点已变化，提取已停止。", "AbortError");
+          const completed: CanvasNode = {
+            ...target,
+            status: "completed",
+            ...(localKey ? { localAudio: localKey } : {}),
+            ...(uploaded?.url ? { audio: uploaded.url } : {}),
+            ...(uploaded?.id ? { assetId: uploaded.id } : {}),
+            audioMode: "recording",
+            operationId: options.operation,
+            operationParams: { sourceNodeId: current.id, startTime: options.startTime, endTime: options.endTime, mimeType, size: blob.size },
+          };
+          const completedNodes = docRef.current.nodes.map(node => node.id === target.id ? completed : node);
+          // The placeholder insertion already represents this operation in
+          // history. Updating it in place keeps one undo step for the whole
+          // extraction, so undo removes the completed target instead of
+          // exposing an intermediate running card.
+          dirty.current = true;
+          replaceDoc({
+            ...docRef.current,
+            nodes: completedNodes,
+            groups: expandGroupFrames(completedNodes, docRef.current.groups),
+            updatedAt: now(),
+          });
+          setSelected([target.id]); setSelectedEdge(null); setInspectorOpen(false);
+          reveal([current, completed]);
+        } else {
+          const size = fitVideoNodeSize(current.width, current.height);
+          const node: CanvasNode = {
+            id: uid("video"), type: "video", mediaType: "video",
+            title: `${displayNodeTitle(current)} · 提取${kind}`.slice(0, 160),
+            text: `提取自「${displayNodeTitle(current)}」`,
+            ...size,
+            ...findFreePosition(docRef.current.nodes, { x: current.x + current.width + 40, y: current.y, ...size }),
+            color: current.color, groupId: current.groupId, status: "completed", resultOf: current.id,
+            ...(localKey ? { localVideo: localKey } : {}),
+            ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : {}),
+            videoDuration: options.endTime - options.startTime,
+            ...(uploaded?.id ? { assetId: uploaded.id } : {}),
+            operationId: options.operation,
+            operationParams: { sourceNodeId: current.id, startTime: options.startTime, endTime: options.endTime, mimeType, size: blob.size },
+          };
+          commit(value => {
+            const nodes = [...value.nodes, node];
+            return {
+              ...value,
+              nodes,
+              edges: [...value.edges, { id: uid("edge"), from: current.id, to: node.id }],
+              groups: expandGroupFrames(nodes, value.groups),
+            };
+          });
+          setSelected([node.id]); setSelectedEdge(null); setInspectorOpen(false);
+          reveal([current, node]);
+        }
         clearVideoProcess(nodeId, request);
-        setMessage(uploaded ? `已将提取${kind}保存到素材库并添加为新节点。` : `已将提取${kind}添加为新节点；云端保存失败，当前仅保存在本机。`, undefined, 3500);
+        setMessage(`已将提取${kind}保存到素材库并添加为新节点。`, undefined, 3500);
       } catch (error) {
         if (localKey && ownsLocalKey) await (audio ? deleteLocalAudio(localKey) : deleteLocalVideo(localKey)).catch(() => {});
         throw error;
       }
       return;
     }
-    const url = URL.createObjectURL(blob);
+    // Processed videos are reusable canvas media, rather than one-shot
+    // downloads. Keep the source node intact and only commit the derived
+    // node after both the local preview cache and the durable asset upload
+    // have completed. This mirrors extraction and prevents a local-only blob
+    // from looking like a recoverable result on another device.
+    const suffix = options.operation === "convert"
+      ? `${(options.outputFormat || "webm").toUpperCase()}格式`
+      : options.operation === "trim" ? "裁剪"
+        : options.operation === "watermark" ? "水印"
+          : options.operation === "crop" ? "画面裁剪"
+            : options.operation === "compress" ? "压缩"
+              : options.operation === "grade" ? "调色"
+                : options.operation === "rotate" ? "旋转"
+                  : options.operation === "mirror" ? "镜像"
+                    : options.operation === "speed" ? `${options.playbackRate || 1}倍速`
+                      : "静音";
     const extension = videoOutputExtension(blob.type);
-    const suffix = options.operation === "convert" ? `${(options.outputFormat || "webm").toUpperCase()}格式` : options.operation === "trim" ? "裁剪" : options.operation === "watermark" ? "水印" : options.operation === "crop" ? "裁剪" : options.operation === "compress" ? "压缩" : options.operation === "grade" ? "调色" : options.operation === "rotate" ? "旋转" : options.operation === "mirror" ? "镜像" : options.operation === "speed" ? `${options.playbackRate || 1}倍速` : "静音";
-    const link = document.createElement("a"); link.href = url; link.download = `${current.title || "video"} · ${suffix}.${extension}`; link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    clearVideoProcess(nodeId, request);
-    setMessage(`已导出${suffix}文件。`, undefined, 2500);
+    const mimeType = (blob.type || "video/webm").split(";", 1)[0].trim().toLowerCase() || "video/webm";
+    if (blob.size > MAX_APPLICATION_MEDIA_ASSET_BYTES) {
+      throw new Error(`处理结果超过素材库单文件上限 ${Math.floor(MAX_APPLICATION_MEDIA_ASSET_BYTES / (1024 * 1024))} MiB，请缩短片段或降低分辨率后重试。`);
+    }
+    const fileStem = displayNodeTitle(current).replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 100) || "video";
+    const file = new File([blob], `${fileStem}-${suffix}.${extension}`, { type: mimeType });
+    let localKey: string | undefined;
+    let ownsLocalKey = false;
+    try {
+      setVideoProcessStatus(state => ({ ...state, [processStateNodeId]: "正在保存视频并上传素材库…" }));
+      setVideoProcessProgress(state => ({ ...state, [processStateNodeId]: 55 }));
+      let lastProgressAt = 0;
+      let lastProgressPercent = -1;
+      const [localResult, uploadResult] = await Promise.allSettled([
+        storeLocalVideo(blob),
+        uploadDurablePlatformAsset(client.api, {
+          file,
+          name: file.name,
+          category: "other",
+          signal,
+          onProgress: update => {
+            if (videoProcessJobs.current.get(nodeId) !== request) return;
+            const percent = Math.max(0, Math.min(100, update.percent ?? 0));
+            const timestamp = Date.now();
+            if (update.phase === "uploading" && Math.round(percent) === lastProgressPercent && timestamp - lastProgressAt < 120) return;
+            lastProgressAt = timestamp;
+            lastProgressPercent = Math.round(percent);
+            const status = update.phase === "preparing" ? "正在准备上传视频…"
+              : update.phase === "uploading" ? "正在上传视频…"
+                : "正在完成素材入库…";
+            setVideoProcessStatus(state => ({ ...state, [processStateNodeId]: status }));
+            setVideoProcessProgress(state => ({ ...state, [processStateNodeId]: 55 + percent * 0.43 }));
+          },
+        }),
+      ]);
+      if (localResult.status === "fulfilled") {
+        localKey = localResult.value;
+        ownsLocalKey = true;
+      }
+      signal.throwIfAborted();
+      const uploaded = uploadResult.status === "fulfilled" ? uploadResult.value : undefined;
+      if (!uploaded?.id) throw new Error("视频处理结果上传失败，未创建完成节点。请检查网络后重试。");
+      current = currentSource();
+      const sourceRatio = current.width > 0 && current.height > 0 ? current.width / current.height : 16 / 9;
+      const outputRatio = options.operation === "crop" && options.aspectRatio && options.aspectRatio !== "original"
+        ? videoAspectRatio(options.aspectRatio)
+        : sourceRatio;
+      const size = fitVideoNodeSize(outputRatio, 1);
+      const operationParams = videoEditOperationParams(current.id, options, mimeType, blob.size);
+      const duration = videoEditOutputDuration(options);
+      const node: CanvasNode = {
+        id: uid("video"),
+        type: "video",
+        mediaType: "video",
+        title: `${displayNodeTitle(current)} · ${suffix}`.slice(0, 160),
+        text: `处理自「${displayNodeTitle(current)}」`,
+        ...size,
+        ...findFreePosition(docRef.current.nodes, { x: current.x + current.width + 40, y: current.y, ...size }),
+        color: current.color,
+        groupId: current.groupId,
+        status: "completed",
+        resultOf: current.id,
+        ...(localKey ? { localVideo: localKey } : {}),
+        ...(uploaded.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : {}),
+        assetId: uploaded.id,
+        videoDuration: duration,
+        ...(options.operation === "crop" && options.aspectRatio && options.aspectRatio !== "original" ? { videoAspectRatio: options.aspectRatio } : {}),
+        operationId: options.operation,
+        operationParams,
+      };
+      commit(value => {
+        const nodes = [...value.nodes, node];
+        return {
+          ...value,
+          nodes,
+          edges: [...value.edges, { id: uid("edge"), from: current.id, to: node.id }],
+          groups: expandGroupFrames(nodes, value.groups),
+        };
+      });
+      localKey = undefined;
+      setSelected([node.id]); setSelectedEdge(null); setInspectorOpen(false);
+      reveal([current, node]);
+      clearVideoProcess(nodeId, request);
+      setMessage(`已将${suffix}保存到素材库并添加为新节点，原视频保持不变。`, undefined, 3500);
+    } catch (error) {
+      if (localKey && ownsLocalKey) await deleteLocalVideo(localKey).catch(() => {});
+      throw error;
+    }
   };
   saveVideoProcessResultRef.current = saveVideoProcessResult;
+  const copyVoiceId = async (node: CanvasNode) => {
+    const voiceId = node.voiceId?.trim();
+    if (!voiceId) return;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard_unavailable");
+      await navigator.clipboard.writeText(voiceId);
+      setMessage("音色 ID 已复制。", undefined, 2500);
+    } catch {
+      setMessage("音色 ID 复制失败，请检查剪贴板权限后重试。", undefined, 3000);
+    } finally {
+      closeMenus();
+    }
+  };
   const copyImage = async (node: CanvasNode) => {
-    if (!node.image && !node.localImage && !node.assetId && !node.taskId) return;
+    if (!node.image && !node.assetId && !node.taskId) return;
     try {
       if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
         setMessage("当前浏览器不支持复制图片，请尝试下载图片。");
         return;
       }
-      const nodeElement = [...document.querySelectorAll<HTMLElement>(".node[data-node-id]")]
-        .find((element) => element.dataset.nodeId === node.id);
-      const displayedImage = nodeElement?.querySelector<HTMLImageElement>(
-        "img.node-image, .creation-inline-media img, .creation-result-thumb",
-      );
-      const displayedSource = displayedImage?.currentSrc || displayImageThumbnail(node.image, node.imageThumbnail);
       let blob: Blob | undefined;
-
-      // Read the decoded pixels first. This keeps same-origin and inline media
-      // on the zero-request path.
-      if (displayedImage?.complete && displayedImage.naturalWidth > 0 && displayedImage.naturalHeight > 0) {
-        try {
-          const canvas = document.createElement("canvas");
-          canvas.width = displayedImage.naturalWidth;
-          canvas.height = displayedImage.naturalHeight;
-          const context = canvas.getContext("2d");
-          if (!context) throw new Error("canvas");
-          context.drawImage(displayedImage, 0, 0);
-          blob = await new Promise<Blob | undefined>((resolve) => canvas.toBlob(
-            (value) => resolve(value || undefined),
-            "image/png",
-          ));
-        } catch {
-          // Cross-origin images without CORS permission taint the canvas.
-        }
+      let copySource = imageCopySource(node);
+      if (node.assetId) {
+        const asset = await readPlatformAsset(client.api, node.assetId, { forceRefresh: true });
+        if (asset.storedAsset.type !== "image") throw new Error("原图片资产类型无效");
+        copySource = asset.url || copySource;
       }
-
-      if (!blob && node.localImage) {
-        const local = await readCachedImage(node.localImage).catch(() => null);
-        if (local) blob = await imageDataBlob(local);
-      }
-
-      if (!blob && node.image) {
-        const original = imageOriginalURL(node.image) || node.image;
-        const cached = getCachedRemoteImage(node.image) || getCachedRemoteImage(original);
-        if (cached) blob = await imageDataBlob(cached);
-      }
-
-      // The host cache can supply bytes for a displayed COS image without
-      // asking the Canvas page to download the object again.
-      if (!blob && (node.assetId || node.taskId)) {
-        const cached = await readHostCachedImage({
-          assetId: node.assetId,
-          taskId: node.taskId,
-          resultIndex: node.resultIndex,
-        });
-        if (cached?.image) blob = await imageDataBlob(cached.image);
-      }
-
-      if (!blob && displayedSource && /^(?:data|blob):/i.test(displayedSource)) {
-        blob = await imageDataBlob(displayedSource);
+      if (!blob && copySource && (node.assetId || isImageCopySource(copySource))) {
+        blob = await imageDataBlob(copySource).catch(() => undefined);
       }
 
       if (!blob) {
-        setMessage("图片已显示，但浏览器无法读取跨域图片像素，且本机缓存不可用。可尝试下载图片。", {
+        setMessage("浏览器无法读取图片，请检查 COS 跨域配置，或尝试下载图片。", {
           label: "下载图片",
           run: () => { void downloadImage(node); },
         });
@@ -5790,8 +7157,8 @@ export default function App({
         ? expandGroupFrames([...value.nodes, node], value.groups)
         : value.groups,
       edges:
-        sourceId && value.nodes.some((n) => n.id === sourceId)
-          ? [...value.edges, { id: uid("edge"), from: sourceId, to: node.id }]
+        sourceId && value.nodes.some((n) => n.id === sourceId) && sourceNode
+          ? [...value.edges, edgeForNodes(sourceNode, node)]
           : value.edges,
     }));
     setSelected([node.id]);
@@ -5805,8 +7172,112 @@ export default function App({
     reveal([node], type === "prompt");
     if (type === "note") startEdit(node);
   };
+
+  const createCharacterTurnaround = (source: CanvasNode, request: CharacterTurnaroundRequest) => {
+    const liveSource = docRef.current.nodes.find((node) => node.id === source.id);
+    if (!liveSource || pendingRemovalNodes.current.has(source.id)) {
+      setMessage("原图片已被移除，请重新选择角色图片。", undefined, 3000);
+      return;
+    }
+    const width = 480;
+    const height = 320;
+    const location = findFreePosition(docRef.current.nodes, {
+      x: liveSource.x + liveSource.width + 100,
+      y: liveSource.y,
+      width,
+      height,
+    });
+    const node: CanvasNode = {
+      id: uid("prompt"),
+      type: "prompt",
+      title: request.title,
+      text: request.prompt,
+      mediaType: "image",
+      ...location,
+      width,
+      height,
+      color: COLORS[2],
+      continuationOf: liveSource.id,
+      groupId: liveSource.groupId,
+      operationId: "character-turnaround",
+      operationParams: {
+        name: request.name,
+        notes: request.notes,
+        preserveStyle: request.preserveStyle,
+        includeAccessories: request.includeAccessories,
+      },
+      imageSettings: { count: 1, aspectRatio: "3:2" },
+    };
+    commit((value) => {
+      const nodes = [...value.nodes, node];
+      return {
+        ...value,
+        nodes,
+        edges: [...value.edges, edgeForNodes(liveSource, node)],
+        groups: node.groupId ? expandGroupFrames(nodes, value.groups) : value.groups,
+      };
+    });
+    setSelected([node.id]);
+    setSelectedEdge(null);
+    setEditing(null);
+    setInspectorOpen(true);
+    closeMenus();
+    reveal([node], true);
+    setMessage("已创建角色三视图任务，正在生成。", undefined, 2500);
+    void generateImageTask(node).catch((error) => setMessage(errorText(error), undefined, 3500));
+  };
+
+  /**
+   * Start a separate task from a creator whose frozen submission could not be
+   * found. The original node remains untouched so its request key can still be
+   * retried safely; only the editable inputs and incoming workflow edges are
+   * carried into the new node.
+   */
+  const createNewTaskFromCreator = (sourceId: string) => {
+    const source = docRef.current.nodes.find((node) => node.id === sourceId && node.type === "prompt");
+    if (!source || activeRequests.current.has(source.id) || !canRetryMissedSubmission(source)) return;
+
+    const copyId = uid("prompt");
+    const copyBase = createEditableCanvasTaskCopy(source, copyId);
+    // Embedded references use their own IDs, while promptSegments may also
+    // point at ordinary canvas nodes. Remap only the embedded IDs so graph
+    // relationships keep pointing to the original reference nodes.
+    const copy = remapCopiedNodeReferences([copyBase], new Map(), () => uid("reference"))[0];
+    if (!copy) return;
+    const location = findFreePosition(docRef.current.nodes, {
+      x: source.x + source.width + 80,
+      y: source.y,
+      width: source.width,
+      height: source.height,
+    });
+    copy.x = location.x;
+    copy.y = location.y;
+    const incomingEdges = docRef.current.edges
+      .filter((edge) => edge.to === source.id)
+      .map((edge) => ({ ...edge, id: uid("edge"), to: copy.id }));
+
+    commit((value) => {
+      const nodes = [...value.nodes, copy];
+      return {
+        ...value,
+        nodes,
+        edges: [...value.edges, ...incomingEdges],
+        groups: expandGroupFrames(nodes, value.groups),
+      };
+    });
+    setCreationError(null);
+    closePreview();
+    setSelected([copy.id]);
+    setSelectedEdge(null);
+    setEditing(null);
+    closeMenus();
+    setDrawer(null);
+    setInspectorOpen(true);
+    setCreatorFocusRequest((request) => request + 1);
+    reveal([copy], true);
+  };
   const addNext = (node: CanvasNode) => {
-    setPreview(null);
+    closePreview();
     // One source asset owns one continuation task. Reuse it across repeated
     // clicks, including completed and failed tasks, so repeated generation
     // does not create a trail of duplicate prompt nodes.
@@ -5862,7 +7333,7 @@ export default function App({
     }
   };
   const downloadImage = async (node: CanvasNode) => {
-    if (!node.image && !node.assetId && !node.localImage) return;
+    if (!node.image && !node.assetId) return;
     setExportError("");
     try {
       const source = await resolveImageDownloadSource(node);
@@ -5884,7 +7355,7 @@ export default function App({
       setMessage("图片已开始下载。", undefined, 2500);
     } catch {
       if (!docRef.current.nodes.some((candidate) => candidate.id === node.id)) return;
-      setPreview(node);
+      selectPreview(node);
       const message = "图片暂时无法下载，请重新打开原图后重试。";
       setExportError(message);
       setMessage(message);
@@ -5972,11 +7443,11 @@ export default function App({
       const outputFile = new File([output], `${displayNodeTitle(current)}-trim.wav`, { type: output.type || "audio/wav" });
       const [localResult, uploadResult] = await Promise.allSettled([
         storeLocalAudio(output),
-        uploadPlatformAsset(client.api, { file: outputFile, name: outputFile.name, category: "sound" }),
+        uploadDurablePlatformAsset(client.api, { file: outputFile, name: outputFile.name, category: "sound" }),
       ]);
       localKey = localResult.status === "fulfilled" ? localResult.value : undefined;
       const uploaded = uploadResult.status === "fulfilled" ? uploadResult.value : undefined;
-      if (!localKey && !uploaded) throw new Error("裁切片段未能保存到本机或云端，请检查存储空间和网络后重试。");
+      if (!uploaded?.id) throw new Error("裁切片段上传失败，未创建完成节点。请检查网络后重试。");
       currentSource();
       const size = DEFAULT_AUDIO_NODE_SIZE;
       const title = `${displayNodeTitle(current)} · 裁切`;
@@ -5990,7 +7461,12 @@ export default function App({
       };
       commit(value => {
         const nodes = [...value.nodes, node];
-        return { ...value, nodes, groups: expandGroupFrames(nodes, value.groups) };
+        return {
+          ...value,
+          nodes,
+          edges: [...value.edges, { id: uid("edge"), from: current.id, to: node.id }],
+          groups: expandGroupFrames(nodes, value.groups),
+        };
       });
       saved = true;
       localKey = undefined;
@@ -5998,7 +7474,7 @@ export default function App({
       setSelectedEdge(null);
       setInspectorOpen(false);
       reveal([current, node]);
-      setMessage(uploaded ? "已将裁切片段保存到素材库并添加为新节点，原音频保持不变。" : "已添加裁切片段；云端保存失败，当前仅保存在本机。", undefined, 3500);
+      setMessage("已将裁切片段保存到素材库并添加为新节点，原音频保持不变。", undefined, 3500);
     } catch (error) {
       if (audioEditJobs.current.get(nodeId) === request && !request.controller.signal.aborted &&
         !(error instanceof DOMException && error.name === "AbortError")) {
@@ -6013,7 +7489,7 @@ export default function App({
     }
   };
   const arrange = () => {
-    applyLayout(canvasPreferences.autoLayout, "all");
+    applyLayout("all");
   };
   const prepareLeave = async () => {
     if (leaving.current) return false;
@@ -6037,7 +7513,7 @@ export default function App({
       await persist(snapshot, false);
       if (syncEnabled && hydrated && platformReadyRef.current) {
         void syncSnapshot(snapshot).catch((error) => {
-          if (alive.current) setMessage(`已保存到本机，但云端同步失败：${errorText(error)}`);
+          if (alive.current) setMessage(`已保存到本机，但云端同步失败：${cloudSyncErrorText(error)}`);
         });
       }
       return true;
@@ -6057,13 +7533,35 @@ export default function App({
   };
   const agentAdapterRef = React.useRef<CanvasAgentAdapter | null>(null);
   agentAdapterRef.current = {
-    getDocument: () => { if (!platformReadyRef.current) throw Object.assign(new Error("请先登录并打开画布"), { code: "CANVAS_NOT_READY", executionStarted: false, reason: "auth_required", retryable: false, nextAction: { type: "user_login" } }); return docRef.current; },
+    getDocument: () => {
+      if (!platformReadyRef.current) throw Object.assign(new Error("请先登录并打开画布"), { code: "CANVAS_NOT_READY", executionStarted: false, reason: "auth_required", retryable: false, nextAction: { type: "user_login" } });
+      if (!draftReady) throw Object.assign(new Error("正在恢复画布草稿，请稍后重试"), { code: "CANVAS_NOT_READY", executionStarted: false, reason: "draft_recovery", retryable: true, nextAction: { type: "wait" } });
+      return docRef.current;
+    },
     beforeWrite: () => { (document.activeElement as HTMLElement | null)?.blur(); viewportMotion.stop(); },
     commit,
+    setAgentWriteLock,
     persist: async (snapshot) => { await persist(snapshot, false); },
     canWrite: () => platformReadyRef.current && draftReady && !leaving.current && !removalTimer.current,
     getModels: () => models,
     isNodeBusy: (id) => activeRequests.current.has(id),
+    uploadImage: async (file, idempotencyKey, signal) => {
+      checkLocalAccount();
+      signal.throwIfAborted();
+      const uploaded = await uploadDurablePlatformAsset(client.api, {
+        file,
+        name: file.name,
+        category: "other",
+        idempotencyKey,
+      });
+      checkLocalAccount();
+      signal.throwIfAborted();
+      if (uploaded.url && /^https?:\/\//i.test(uploaded.url)) return uploaded;
+      if (!uploaded.id) throw new Error("图片上传后没有返回 COS 地址");
+      const refreshed = await readPlatformAsset(client.api, uploaded.id, { forceRefresh: true });
+      if (!refreshed.url || !/^https?:\/\//i.test(refreshed.url)) throw new Error("图片上传后没有返回 COS 地址");
+      return { ...uploaded, url: refreshed.url, thumbnail_url: uploaded.thumbnail_url || refreshed.thumbnailUrl };
+    },
     imageSize: async (dataUrl) => {
       const image = new Image();
       await new Promise<void>((resolve, reject) => { image.onload = () => resolve(); image.onerror = () => reject(Object.assign(new Error("图片内容无法解码"), { code: "CANVAS_MEDIA_INVALID", executionStarted: false })); image.src = dataUrl; });
@@ -6087,12 +7585,8 @@ export default function App({
           return blob;
         }
         let source = node.image || node.video || node.audio;
-        if (!source && node.localImage && !node.assetId && !node.taskId) {
-          const recoverable: { nodes: Array<{ image?: string; localImage?: string }> } = { nodes: [{ localImage: node.localImage }] };
-          source = (await restoreLocalImages(recoverable)).nodes[0]?.image || source;
-        }
         if (node.assetId && (!source || /^https?:/i.test(source))) source = (await readPlatformAsset(client.api, node.assetId)).url || source;
-        if (!source || !/^(https?:|blob:|data:(?:image|video|audio)\/)/i.test(source)) mediaFailure("CANVAS_MEDIA_UNAVAILABLE", "媒体暂时无法读取，请在应用内恢复资源后重试");
+        if (!source || !/^https?:\/\//i.test(source)) mediaFailure("CANVAS_MEDIA_UNAVAILABLE", "图片必须先上传到 COS 后才能读取");
         const response = await fetchCanvasResource(source!, { signal, credentials: "omit", referrerPolicy: "no-referrer" }, { gatewayURL: client.session()?.gateway_url });
         const blob = await boundedMediaBlob(response, signal);
         checkLocalAccount(); return blob;
@@ -6120,7 +7614,6 @@ export default function App({
         const cancelled = ["cancelled", "canceled"].includes(snapshot.status);
         if (cancelled) activeRequests.current.get(node.id)?.abort("cancelled");
         patchTask(node.id, { status: cancelled ? "failed" : "queued", taskDiagnostic: { ...current.taskDiagnostic, status: snapshot.status, code: snapshot.code || undefined, phase: snapshot.phase } });
-        if (!cancelled && !activeRequests.current.has(node.id)) void (isVoiceDesignNode(current) ? generateVoiceDesignTask(current) : generateMusicTask(current));
         return { status: snapshot.status || "unknown", cancelled };
       }
       const snapshot = await cancelVideo((path, init) => client.api.request(path, { ...init, signal }), node.taskId!, key);
@@ -6128,10 +7621,8 @@ export default function App({
       const current = docRef.current.nodes.find(item => item.id === node.id);
       if (docRef.current.id !== documentId || !current || current.taskId !== node.taskId) throw Object.assign(new Error("任务已变化，请重新读取 read_tasks"), { code: "CANVAS_DOCUMENT_CHANGED" });
       const cancelled = ["cancelled", "canceled"].includes(snapshot.status);
-      // Keep polling a cancellation acknowledgement; only a terminal provider response stops it.
       if (cancelled) activeRequests.current.get(node.id)?.abort("cancelled");
       if (!["completed", "succeeded", "success"].includes(snapshot.status)) patchTask(node.id, videoTaskSnapshotPatch(current, snapshot));
-      if (!cancelled && !activeRequests.current.has(node.id)) void generateVideoTask(current);
       return { status: snapshot.status || "unknown", cancelled };
     },
     startGeneration: (node) => {
@@ -6146,7 +7637,7 @@ export default function App({
         if (!activeRequests.current.has(node.id)) throw Object.assign(new Error("生成任务未被接受"), { code: "CANVAS_GENERATION_NOT_READY", executionStarted: false });
         return;
       }
-      const referenceCount = new Set(references.map(ref => ref.image || ref.localImage || ref.nodeId)).size;
+      const referenceCount = new Set(references.map(ref => ref.image || ref.nodeId)).size;
       const selectedModel = preferredModelForNode(models, kind, referenceCount, node);
       // Agent generation keeps its explicit-model contract. The interactive
       // CreatorPanel may use the platform default, but agent callers must
@@ -6162,7 +7653,6 @@ export default function App({
     },
   };
   React.useEffect(() => {
-    if (!platformReady || !draftReady) return;
     const capabilities = createCanvasAgent({
       getDocument: () => agentAdapterRef.current!.getDocument(),
       beforeWrite: () => agentAdapterRef.current!.beforeWrite(),
@@ -6177,8 +7667,9 @@ export default function App({
       readMedia: (node, signal) => agentAdapterRef.current!.readMedia!(node, signal),
       imageSize: (source) => agentAdapterRef.current!.imageSize!(source),
     });
-    return registerCanvasCapabilities(capabilities);
-  }, [platformReady, draftReady]);
+    registerAgentHandlers(capabilities as Record<string, AgentHandler>);
+    return () => registerAgentHandlers(null);
+  }, [registerAgentHandlers]);
   React.useEffect(() => {
     if (!platformReady) return;
     return agent.setStatus({
@@ -6216,19 +7707,39 @@ export default function App({
     return () => registerEditor(null);
   }, [editorHandle, registerEditor]);
   const save = async () => {
+    if (manualSaveInFlight.current || currentCloudSyncing || (
+      saveProgressRef.current.phase !== "idle" &&
+      saveProgressRef.current.revision === documentSaveRevision(docRef.current)
+    )) return;
+    setMessage("");
+    manualSaveInFlight.current = true;
+    setManualSavePending(true);
+    if (saveTimer.current !== null) {
+      window.clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    if (cloudSaveTimer.current !== null) {
+      window.clearTimeout(cloudSaveTimer.current);
+      cloudSaveTimer.current = null;
+    }
     const snapshot = docRef.current;
-    setStatus("正在保存…");
+    setStatus("正在保存到本机…");
     try {
       await persist(snapshot);
-      if (docRef.current.updatedAt === snapshot.updatedAt)
+      if (docRef.current.id === snapshot.id && docRef.current.updatedAt === snapshot.updatedAt)
         setStatus(savedStatus(syncEnabled && hydrated));
     } catch (error) {
-      setStatus(
-        lastLocalSave.current === snapshot.updatedAt
-          ? syncFailureStatus()
-          : "保存失败 · 请导出备份",
-      );
-      if (lastLocalSave.current !== snapshot.updatedAt) setMessage(errorText(error));
+      if (isSameDocumentRevision(docRef.current, snapshot)) {
+        setStatus(
+          isLocallySaved(snapshot)
+            ? syncFailureStatus()
+            : "保存失败 · 请导出备份",
+        );
+        if (!isLocallySaved(snapshot)) setMessage(errorText(error));
+      }
+    } finally {
+      manualSaveInFlight.current = false;
+      setManualSavePending(false);
     }
   };
   const canSwitch = () => {
@@ -6239,20 +7750,72 @@ export default function App({
     return true;
   };
   const useCloud = async () => {
-    if (!cloudCandidate || !canSwitch()) return;
+    if (!cloudCandidate || cloudMergePending || !canSwitch()) return;
+    cloudResolutionEpoch.current += 1;
+    setCloudMergePending(true);
+    setCloudMergeError("");
     try {
-      await rememberVersion(docRef.current);
-      clearConnection();
-      commit(() => clone(cloudCandidate));
-      void refreshPersistedImageUrls();
-      setSelected([]);
-      setInspectorOpen(false);
-      setSyncEnabled(true);
-      setCloudCandidate(null);
-      setOverlay(null);
-      setMessage(isSessionOnlyStorage() ? "已恢复云端画布。切换前的版本在当前页面内可找回。" : "已恢复云端画布。原本机版本可在画布菜单中找回。");
+      setSyncEnabled(false);
+      if (saveTimer.current !== null) {
+        window.clearTimeout(saveTimer.current);
+        saveTimer.current = null;
+      }
+      if (cloudSaveTimer.current !== null) {
+        window.clearTimeout(cloudSaveTimer.current);
+        cloudSaveTimer.current = null;
+      }
+      const queued = cloudSaveQueues.get(initialDocument.id);
+      if (queued) await queued.promise.catch(() => {});
+      const candidateSignature = documentSignature(cloudCandidate);
+      if (cloudMergeRecoveryRef.current?.candidateSignature !== candidateSignature) {
+        await rememberVersion(docRef.current);
+        cloudMergeRecoveryRef.current = { candidateSignature };
+      }
+      let mergeBase = cloudBaseRef.current;
+      let mergeLocal = normalize(docRef.current);
+      const resolvedConflicts = new Set<string>();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const latest = await readCanvasDocument(client.storage, initialDocument.id);
+        if (!latest) throw new Error("云端画布已不存在，请刷新画布列表后重试。");
+        const remote = normalize(latest);
+        const merged = mergeCloudDocuments(mergeBase, mergeLocal, remote, {
+          conflictResolution: "prefer-remote",
+        });
+        if (!merged.document) throw new Error("新版本合并失败，已保留当前版本，请重试。");
+        const next = normalize(merged.document);
+        merged.conflicts.forEach(conflict => resolvedConflicts.add(conflict));
+        clearConnection();
+        replaceDoc(next);
+        dirty.current = true;
+        try {
+          await persist(next, true, false);
+          await rememberCloudBase(next);
+          dirty.current = false;
+          lastLocalSave.current.set(next.id, documentSaveRevision(next));
+          void refreshPersistedImageUrls();
+          setSelected([]);
+          setInspectorOpen(false);
+          setSyncEnabled(true);
+          setCloudCandidate(null);
+          setOverlay(null);
+          cloudMergeRecoveryRef.current = null;
+          cloudResolutionEpoch.current += 1;
+          setMessage(resolvedConflicts.size
+            ? `新版本已加载并合并，${resolvedConflicts.size} 项重叠修改采用了云端内容。原本机版本可在恢复记录中找回。`
+            : "新版本已加载并自动合并，当前版本已保留在恢复记录中。");
+          return;
+        } catch (error) {
+          if (!isCanvasVersionConflict(error) || attempt === 2) throw error;
+          mergeBase = remote;
+          mergeLocal = next;
+        }
+      }
+      throw new Error("云端版本仍在变化，已保留当前内容，请稍后再次加载。");
     } catch (error) {
-      setMessage(errorText(error));
+      setSyncEnabled(false);
+      setCloudMergeError(cloudSyncErrorText(error));
+    } finally {
+      if (alive.current) setCloudMergePending(false);
     }
   };
   const enableSync = async () => {
@@ -6263,7 +7826,10 @@ export default function App({
     try {
       if (cloudCandidate) await rememberVersion(cloudCandidate);
       const snapshot = clone(docRef.current);
-      await persist(snapshot, true);
+      // This button is the explicit opt-in that resumes a canvas previously
+      // kept local-only, so it must reactivate the paused outbox revision.
+      await persist(snapshot, true, false);
+      await rememberCloudBase(snapshot);
       setSyncEnabled(true);
       setCloudCandidate(null);
       setOverlay(null);
@@ -6411,12 +7977,16 @@ export default function App({
   };
   const importImage = (input: File, destination = imageDestination.current) => {
     const documentId = destination?.documentId || docRef.current.id;
+    const uploadNodeId = destination?.uploadNodeId;
     const replacedNode = destination?.replace ? docRef.current.nodes.find(node => node.id === destination.replace) : undefined;
     const videoReplacement = destination?.videoReplacement || (replacedNode?.type === "video"
       ? videoSources.current.capture(documentId, replacedNode)
       : undefined);
     const isCurrentImport = () => alive.current && !leaving.current && docRef.current.id === documentId &&
       (!destination?.replace || docRef.current.nodes.some(node => node.id === destination.replace)) &&
+      (!uploadNodeId || docRef.current.nodes.some(node => node.id === uploadNodeId)) &&
+      (!destination?.sourceId || docRef.current.nodes.some(node => node.id === destination.sourceId)) &&
+      (!destination?.sourceGuard || destination.sourceGuard()) &&
       (!videoReplacement || videoSources.current.isCurrent(videoReplacement, docRef.current.id,
         docRef.current.nodes.find(node => node.id === videoReplacement.source.id)));
     if (!isCurrentImport()) return;
@@ -6435,6 +8005,7 @@ export default function App({
     if (destination?.targetId && mediaType !== "image" && !(mediaType === "video" && docRef.current.nodes.find(node => node.id === destination.targetId)?.mediaType === "video") && !(mediaType === "audio" && docRef.current.nodes.find(node => node.id === destination.targetId)?.mediaType === "video"))
       return reportError("图片模型只支持图片参考；视频模型可使用图片、音频或视频参考");
     const at = destination?.at || centerPoint();
+    let pendingNodeId: string | undefined = uploadNodeId;
     // Probe the file through a short-lived object URL first. Reading a large
     // video/audio file as Base64 before validation briefly duplicates its
     // memory footprint and is a common cause of local-upload failures.
@@ -6445,31 +8016,160 @@ export default function App({
       probeReleased = true;
       URL.revokeObjectURL(probeSource);
     };
+    const createPendingImageNode = (width: number, height: number, imageData?: string, initialState: "preparing" | "uploading" = "uploading") => {
+      if (mediaType !== "image" || !imageData || destination?.targetId || destination?.replace || videoReplacement) return;
+      const size = fitImageNodeSize(width, height);
+      const existingId = pendingNodeId || uploadNodeId;
+      const existing = existingId ? docRef.current.nodes.find(node => node.id === existingId) : undefined;
+      const nodeId = existing?.id || uploadNodeId || uid("image");
+      pendingNodeId = nodeId;
+      const uploadDestination = { at, ...(destination?.sourceId ? { sourceId: destination.sourceId } : {}) };
+      mediaUploadFiles.current.set(nodeId, {
+        input,
+        documentId,
+        nodeId,
+        width,
+        height,
+        destination: uploadDestination,
+      });
+      updateMediaUploadStates(current => ({
+        ...current,
+        [nodeId]: { state: initialState, progress: 0 },
+      }));
+      if (existing) {
+        update([existing.id], {
+          image: imageData,
+          imageAspectRatio: imageAspectRatioFromDimensions(width, height),
+          imageThumbnail: undefined,
+          assetId: undefined,
+          uploadState: initialState,
+          uploadProgress: 0,
+          uploadError: undefined,
+          status: undefined,
+          width: size.width,
+          height: size.height,
+          title: destination?.nodeMetadata?.title || input.name,
+          ...(destination?.nodeMetadata?.text !== undefined ? { text: destination.nodeMetadata.text } : {}),
+          ...(destination?.nodeMetadata?.resultOf ? { resultOf: destination.nodeMetadata.resultOf } : {}),
+          ...(destination?.nodeMetadata?.resultIndex !== undefined ? { resultIndex: destination.nodeMetadata.resultIndex } : {}),
+          ...(destination?.nodeMetadata?.operationId ? { operationId: destination.nodeMetadata.operationId } : {}),
+          ...(destination?.nodeMetadata?.operationParams ? { operationParams: destination.nodeMetadata.operationParams } : {}),
+          ...(destination?.nodeMetadata?.groupId ? { groupId: destination.nodeMetadata.groupId } : {}),
+        });
+        return;
+      }
+      const node: CanvasNode = {
+        id: nodeId,
+        type: "image",
+        title: input.name,
+        text: "",
+        ...findFreePosition(docRef.current.nodes, {
+          x: at.x - size.width / 2,
+          y: at.y - size.height / 2,
+          width: size.width,
+          height: size.height,
+        }),
+        width: size.width,
+        height: size.height,
+        color: COLORS[1],
+        image: imageData,
+        imageAspectRatio: imageAspectRatioFromDimensions(width, height),
+        // The node is a visual placeholder until the platform confirms its
+        // durable asset identity. Only the successful upload commit marks it
+        // completed.
+        status: undefined,
+        uploadState: initialState,
+        uploadProgress: 0,
+        ...(destination?.sourceId ? { groupId: docRef.current.nodes.find(node => node.id === destination.sourceId)?.groupId } : {}),
+        ...(destination?.nodeMetadata?.title ? { title: destination.nodeMetadata.title } : {}),
+        ...(destination?.nodeMetadata?.text !== undefined ? { text: destination.nodeMetadata.text } : {}),
+        ...(destination?.nodeMetadata?.resultOf ? { resultOf: destination.nodeMetadata.resultOf } : {}),
+        ...(destination?.nodeMetadata?.resultIndex !== undefined ? { resultIndex: destination.nodeMetadata.resultIndex } : {}),
+        ...(destination?.nodeMetadata?.operationId ? { operationId: destination.nodeMetadata.operationId } : {}),
+        ...(destination?.nodeMetadata?.operationParams ? { operationParams: destination.nodeMetadata.operationParams } : {}),
+        ...(destination?.nodeMetadata?.groupId ? { groupId: destination.nodeMetadata.groupId } : {}),
+      };
+      commit(value => ({
+        ...value,
+        nodes: [...value.nodes, node],
+        groups: node.groupId ? expandGroupFrames([...value.nodes, node], value.groups) : value.groups,
+        edges: destination?.sourceId && value.nodes.some(source => source.id === destination.sourceId)
+          ? [...value.edges, edgeForNodes(value.nodes.find(source => source.id === destination.sourceId)!, node)]
+          : value.edges,
+      }));
+      setSelected([node.id]);
+      setSelectedEdge(null);
+      reveal([node]);
+    };
     const readSource = (width: number, height: number, imageData?: string) => {
       if (!isCurrentImport()) return;
+      createPendingImageNode(width, height, imageData);
+      // Images have one durable source of truth. The object URL is only a
+      // short-lived placeholder while the direct COS upload is in flight; a
+      // local Data URL or IndexedDB key must never become the committed image.
       const localSave = mediaType === "audio" ? storeLocalAudio(input)
         : mediaType === "video" ? storeLocalVideo(input)
-          : Promise.resolve(imageData);
-      void Promise.allSettled([localSave, uploadPlatformAsset(client.api, { file: input, name: input.name, category: mediaType === "audio" ? "sound" : "other" })]).then(([localResult, uploadResult]) => {
+          : Promise.resolve(undefined);
+      const upload = uploadDurablePlatformAsset(client.api, {
+        file: input,
+        name: input.name,
+        category: mediaType === "audio" ? "sound" : "other",
+        ...(pendingNodeId ? { idempotencyKey: `canvas-paste-${pendingNodeId}`.slice(0, 128) } : {}),
+        onProgress: pendingNodeId ? update => {
+          const state = update.phase === "completing" ? "completing" : update.phase === "preparing" ? "preparing" : "uploading";
+          // Keep the completion-confirmation phase visually monotonic: the
+          // object-storage PUT owns 0-90%, while the API confirmation owns
+          // the final 10%.
+          const progress = state === "preparing" ? 0 : state === "completing"
+            ? (typeof update.percent === "number" ? update.percent : 95)
+            : typeof update.percent === "number" ? Math.round(update.percent * 0.9) : 0;
+          updateMediaUploadStates(current => current[pendingNodeId!] && current[pendingNodeId!].state !== "failed"
+            ? { ...current, [pendingNodeId!]: { state, progress } }
+            : current);
+        } : undefined,
+      }).then(async uploaded => {
+        if (mediaType !== "image" || uploaded.url || !uploaded.id) return uploaded;
+        const refreshed = await readPlatformAsset(client.api, uploaded.id, { forceRefresh: true });
+        return { ...uploaded, url: refreshed.url, thumbnail_url: uploaded.thumbnail_url || refreshed.thumbnailUrl };
+      });
+      void Promise.allSettled([localSave, upload]).then(async ([localResult, uploadResult]) => {
         const localSource = localResult.status === "fulfilled" ? localResult.value : undefined;
         const uploaded = uploadResult.status === "fulfilled" ? uploadResult.value : undefined;
         const cloudError = uploadResult.status === "rejected" ? uploadResult.reason : undefined;
-        if (!localSource && !uploaded) {
-          reportError(cloudError ? errorText(cloudError) : "素材未能保存到本机或云端，请检查存储空间和网络后重试。");
+        if (uploadResult.status === "rejected" || !uploaded?.id || (mediaType === "image" && (!uploaded.url || !/^https?:\/\//i.test(uploaded.url)))) {
+          const message = uploadResult.status === "rejected"
+            ? errorText(cloudError)
+            : mediaType === "image" ? "图片上传后没有返回 COS 地址" : "素材上传后没有返回稳定资产身份";
+          if (isCurrentImport()) {
+            if (pendingNodeId) {
+              // A direct image import is transactional. Do not leave a
+              // failed placeholder around and do not offer a Base64/local
+              // retry path; remove only the new node and its upload state.
+              rollbackPendingImageImport(pendingNodeId, message);
+            } else {
+              reportError(message);
+            }
+          }
+          if (typeof localSource === "string" && isLocalAudioKey(localSource)) await deleteLocalAudio(localSource).catch(() => {});
+          if (typeof localSource === "string" && isLocalVideoKey(localSource)) await deleteLocalVideo(localSource).catch(() => {});
+          releaseProbe();
           return;
         }
         if (!isCurrentImport()) {
           if (typeof localSource === "string" && isLocalAudioKey(localSource)) void deleteLocalAudio(localSource).catch(() => {});
           if (typeof localSource === "string" && isLocalVideoKey(localSource)) void deleteLocalVideo(localSource).catch(() => {});
+          releaseProbe();
           return;
         }
-        // Cloud assets are the canonical source for imported images. Keep the
-        // IndexedDB key only as a local fallback; cards can use the signed
-        // thumbnail while the gallery resolves the original asset URL.
-        const source = mediaType === "image" && uploaded?.url
-          ? uploaded.url
+        // Cloud assets are the only committed source for images. Local audio
+        // and video caches remain an offline editing aid for their existing
+        // workflows, but an imported image can never fall back to bytes that
+        // stay in this browser.
+        const source = mediaType === "image"
+          ? uploaded!.url!
           : typeof localSource === "string" ? localSource : uploaded?.url || "";
         finish(width, height, source, uploaded, cloudError);
+        releaseProbe();
       });
     };
     const finish = (width: number, height: number, source: string, uploaded?: StoredAsset, cloudError?: unknown) => {
@@ -6495,8 +8195,8 @@ export default function App({
             title: input.name,
             mediaType,
             ...(mediaType === "image" ? { image: source, ...(uploaded?.thumbnail_url ? { imageThumbnail: uploaded.thumbnail_url } : {}) } : mediaType === "video"
-              ? { ...(isLocalVideoKey(source) ? { localVideo: source } : {}), ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : !isLocalVideoKey(source) ? { video: source } : {}) }
-              : { ...(isLocalAudioKey(source) ? { localAudio: source } : {}), ...(uploaded?.url ? { audio: uploaded.url } : !isLocalAudioKey(source) ? { audio: source } : {}) }),
+              ? { ...(isLocalVideoKey(source) ? { localVideo: source } : {}), ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : !isLocalVideoKey(source) && source ? { video: source } : {}) }
+              : { ...(isLocalAudioKey(source) ? { localAudio: source } : {}), ...(uploaded?.url ? { audio: uploaded.url } : !isLocalAudioKey(source) && source ? { audio: source } : {}) }),
             ...(uploaded?.id ? { assetId: uploaded.id } : {}),
           };
           commit((value) => ({
@@ -6508,10 +8208,45 @@ export default function App({
           setSelected([target.id]);
           setInspectorOpen(true);
           setSelectedEdge(null);
-          if (!uploaded) setMessage(isStorageQuotaError(cloudError) ? errorText(cloudError) : "云端保存失败，该参考素材仅保存在本机，换设备后无法恢复。");
+          if (!uploaded) setMessage(errorText(cloudError));
           return;
         }
         const size = mediaType === "image" ? fitImageNodeSize(width, height) : mediaType === "video" ? fitImageNodeSize(width || 16, height || 9) : DEFAULT_AUDIO_NODE_SIZE;
+        if (pendingNodeId) {
+          const current = docRef.current.nodes.find(node => node.id === pendingNodeId);
+          if (!current) return;
+          update([pendingNodeId], {
+            image: source,
+            imageAspectRatio: imageAspectRatioFromDimensions(width, height),
+            imageThumbnail: uploaded?.thumbnail_url,
+            localImage: undefined,
+            assetId: uploaded?.id,
+            uploadState: undefined,
+            uploadProgress: undefined,
+            uploadError: undefined,
+            status: "completed",
+            width: size.width,
+            height: size.height,
+            title: destination?.nodeMetadata?.title || input.name,
+            ...(destination?.nodeMetadata?.text !== undefined ? { text: destination.nodeMetadata.text } : {}),
+            ...(destination?.nodeMetadata?.resultOf ? { resultOf: destination.nodeMetadata.resultOf } : {}),
+            ...(destination?.nodeMetadata?.resultIndex !== undefined ? { resultIndex: destination.nodeMetadata.resultIndex } : {}),
+            ...(destination?.nodeMetadata?.operationId ? { operationId: destination.nodeMetadata.operationId } : {}),
+            ...(destination?.nodeMetadata?.operationParams ? { operationParams: destination.nodeMetadata.operationParams } : {}),
+            ...(destination?.nodeMetadata?.groupId ? { groupId: destination.nodeMetadata.groupId } : {}),
+          });
+          mediaUploadFiles.current.delete(pendingNodeId);
+          updateMediaUploadStates(currentState => {
+            if (!(pendingNodeId! in currentState)) return currentState;
+            const next = { ...currentState };
+            delete next[pendingNodeId!];
+            return next;
+          });
+          setSelected([pendingNodeId]);
+          setSelectedEdge(null);
+          if (!target) setInspectorOpen(false);
+          return;
+        }
         const existing =
           destination?.replace &&
           docRef.current.nodes.find((node) => node.id === destination.replace);
@@ -6521,7 +8256,7 @@ export default function App({
         if (existing && videoReplacement) {
           const replacement = replaceVideoNodeMedia(existing, {
             ...(isLocalVideoKey(source) ? { localVideo: source } : {}),
-            ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : !isLocalVideoKey(source) ? { video: source } : {}),
+            ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : !isLocalVideoKey(source) && source ? { video: source } : {}),
             ...(uploaded?.id ? { assetId: uploaded.id } : {}),
             title: input.name,
             ...size,
@@ -6544,9 +8279,9 @@ export default function App({
           setSelected([existing.id]);
         } else if (existing)
           update([existing.id], {
-            ...(mediaType === "image" ? { image: source, imageThumbnail: uploaded?.thumbnail_url, localImage: undefined, video: undefined, localVideo: undefined, audio: undefined, localAudio: undefined } : mediaType === "video"
-              ? { ...(isLocalVideoKey(source) ? { localVideo: source } : { localVideo: undefined }), ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : !isLocalVideoKey(source) ? { video: source, videoContentUrl: undefined, videoContentUrlExpiresAt: undefined } : {}), image: undefined, imageThumbnail: undefined, localImage: undefined, audio: undefined, localAudio: undefined, taskId: undefined, status: "completed" }
-              : { ...(isLocalAudioKey(source) ? { localAudio: source } : { localAudio: undefined }), ...(uploaded?.url ? { audio: uploaded.url } : !isLocalAudioKey(source) ? { audio: source } : {}), image: undefined, imageThumbnail: undefined, localImage: undefined, video: undefined, videoContentUrl: undefined, localVideo: undefined, videoContentUrlExpiresAt: undefined, taskId: undefined, audioTaskType: undefined, voiceId: undefined, musicSubmission: undefined, voiceDesignSubmission: undefined, ttsSubmission: undefined, status: "completed" }),
+            ...(mediaType === "image" ? { image: source, imageAspectRatio: imageAspectRatioFromDimensions(width, height), imageThumbnail: uploaded?.thumbnail_url, localImage: undefined, video: undefined, localVideo: undefined, audio: undefined, localAudio: undefined } : mediaType === "video"
+              ? { ...(isLocalVideoKey(source) ? { localVideo: source } : { localVideo: undefined }), ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : !isLocalVideoKey(source) && source ? { video: source, videoContentUrl: undefined, videoContentUrlExpiresAt: undefined } : {}), image: undefined, imageThumbnail: undefined, localImage: undefined, audio: undefined, localAudio: undefined, taskId: undefined, status: "completed" }
+              : { ...(isLocalAudioKey(source) ? { localAudio: source } : { localAudio: undefined }), ...(uploaded?.url ? { audio: uploaded.url } : !isLocalAudioKey(source) && source ? { audio: source } : {}), image: undefined, imageThumbnail: undefined, localImage: undefined, video: undefined, videoContentUrl: undefined, localVideo: undefined, videoContentUrlExpiresAt: undefined, taskId: undefined, audioTaskType: undefined, voiceId: undefined, musicSubmission: undefined, voiceDesignSubmission: undefined, ttsSubmission: undefined, status: "completed" }),
             assetId: uploaded?.id,
             width: size.width,
             height: size.height,
@@ -6568,14 +8303,21 @@ export default function App({
             width: size.width,
             height: size.height,
             color: mediaType === "image" ? COLORS[1] : mediaType === "video" ? COLORS[4] : COLORS[3],
-            ...(mediaType === "image" ? { image: source, ...(uploaded?.thumbnail_url ? { imageThumbnail: uploaded.thumbnail_url } : {}) } : mediaType === "video"
-              ? { ...(isLocalVideoKey(source) ? { localVideo: source } : {}), ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : !isLocalVideoKey(source) ? { video: source } : {}), status: "completed" as const }
-              : { ...(isLocalAudioKey(source) ? { localAudio: source } : {}), ...(uploaded?.url ? { audio: uploaded.url } : !isLocalAudioKey(source) ? { audio: source } : {}), status: "completed" as const }),
+            ...(mediaType === "image" ? { image: source, imageAspectRatio: imageAspectRatioFromDimensions(width, height), ...(uploaded?.thumbnail_url ? { imageThumbnail: uploaded.thumbnail_url } : {}) } : mediaType === "video"
+              ? { ...(isLocalVideoKey(source) ? { localVideo: source } : {}), ...(uploaded?.url ? { video: uploaded.url, videoContentUrl: uploaded.url, videoContentUrlExpiresAt: uploaded.url_expires_at } : !isLocalVideoKey(source) && source ? { video: source } : {}), status: "completed" as const }
+              : { ...(isLocalAudioKey(source) ? { localAudio: source } : {}), ...(uploaded?.url ? { audio: uploaded.url } : !isLocalAudioKey(source) && source ? { audio: source } : {}), status: "completed" as const }),
             ...(uploaded?.id ? { assetId: uploaded.id } : {}),
             // Imported references are part of the same workspace as the
             // creator they are attached to, so they do not visually escape
             // an existing group.
             groupId: target?.groupId || sourceNode?.groupId,
+            ...(destination?.nodeMetadata?.title ? { title: destination.nodeMetadata.title } : {}),
+            ...(destination?.nodeMetadata?.text !== undefined ? { text: destination.nodeMetadata.text } : {}),
+            ...(destination?.nodeMetadata?.resultOf ? { resultOf: destination.nodeMetadata.resultOf } : {}),
+            ...(destination?.nodeMetadata?.resultIndex !== undefined ? { resultIndex: destination.nodeMetadata.resultIndex } : {}),
+            ...(destination?.nodeMetadata?.operationId ? { operationId: destination.nodeMetadata.operationId } : {}),
+            ...(destination?.nodeMetadata?.operationParams ? { operationParams: destination.nodeMetadata.operationParams } : {}),
+            ...(destination?.nodeMetadata?.groupId ? { groupId: destination.nodeMetadata.groupId } : {}),
           };
           commit((value) => ({
             ...value,
@@ -6604,11 +8346,7 @@ export default function App({
                   )
                 ? [
                     ...value.edges,
-                    {
-                      id: uid("edge"),
-                      from: destination.sourceId,
-                      to: node.id,
-                    },
+                    edgeForNodes(value.nodes.find(source => source.id === destination.sourceId)!, node),
                   ]
                 : value.edges,
           }));
@@ -6622,17 +8360,21 @@ export default function App({
         }
         if (!target) setInspectorOpen(false);
         setSelectedEdge(null);
-        if (!uploaded) setMessage(isStorageQuotaError(cloudError) ? errorText(cloudError) : "云端保存失败，该素材仅保存在本机，换设备后无法恢复。");
       };
     if (mediaType === "image") {
       const probe = new Image();
       probe.onload = () => {
-        releaseProbe();
-        const reader = new FileReader();
-        reader.onload = () => readSource(probe.naturalWidth, probe.naturalHeight, String(reader.result));
-        reader.onerror = () => reportError("读取图片失败，请重试或选择另一张图片。");
-        reader.onabort = () => reportError("本地上传已取消，请重试。");
-        reader.readAsDataURL(input);
+        const width = probe.naturalWidth;
+        const height = probe.naturalHeight;
+        // The Blob URL is available as soon as the browser has decoded the
+        // clipboard image. Show it while the direct COS upload starts, so
+        // large pastes never look like a dropped action.
+        createPendingImageNode(width, height, probeSource, "preparing");
+        // Keep the object URL mounted as the visual placeholder until the
+        // upload has either committed its COS URL or rolled the new node back.
+        // Reading the file as Base64 here used to create a second full-size
+        // copy and made the failed-upload path look successful.
+        readSource(width, height, probeSource);
       };
       probe.onerror = () => { releaseProbe(); reportError("无法解码此图片，请选择另一张图片。"); };
       probe.src = probeSource;
@@ -6650,17 +8392,34 @@ export default function App({
       probe.src = probeSource;
     }
   };
+  const retryMediaUpload = (nodeId: string) => {
+    const pending = mediaUploadFiles.current.get(nodeId);
+    const node = docRef.current.nodes.find(item => item.id === nodeId);
+    if (!pending || !node || node.uploadState !== "failed" || pending.documentId !== docRef.current.id) {
+      setMessage("本机图片已不可用，请重新选择或粘贴图片。", undefined, 3000);
+      return;
+    }
+    updateMediaUploadStates(current => ({ ...current, [nodeId]: { state: "preparing", progress: 0 } }));
+    patchTask(nodeId, { uploadState: "preparing", uploadProgress: 0, uploadError: undefined });
+    importImage(pending.input, {
+      at: pending.destination.at,
+      ...(pending.destination.sourceId ? { sourceId: pending.destination.sourceId } : {}),
+      documentId: pending.documentId,
+      uploadNodeId: nodeId,
+    });
+  };
   const reportTaskFailure = (node: CanvasNode, error: unknown, submissionKey?: string) => {
     const current = docRef.current.nodes.find(item => item.id === node.id);
     const requiresConfirmation = canvasTaskRetryPolicy(current || node).requiresConfirmation;
     const notice = notificationGate.current.generation({ canvasId: docRef.current.id, nodeId: node.id, title: node.title, outcome: "failed", taskId: current?.taskId, submissionKey,
-      failureText: `「${node.title}」生成失败${isStorageQuotaError(error) ? "：媒体空间已用完" : requiresConfirmation ? "，暂时无法重试，可继续编辑内容" : "，可调整输入后重试"}。` }, preferencesRef.current);
+      failureText: `「${node.title}」生成失败：${errorText(error)}。${requiresConfirmation ? "原任务仍待核对，暂不能重试。" : "可调整输入后重新生成。"}` }, preferencesRef.current);
     if (!notice) return;
-    const context = taskFeedbackContext.current;
-    // The selected node shows its failure status; details remain available in task records.
-    if (context.selected.length === 1 && context.selected[0] === node.id
-      && context.inspectorMode && !context.overlay && !context.preview) return;
     setMessage(notice.text);
+  };
+  const reportPendingTaskError = (node: CanvasNode, error: unknown, previousError?: string) => {
+    const message = errorText(error);
+    if (message === previousError) return;
+    setMessage(`「${node.title}」提交状态：${message}`);
   };
   const syncFailedVideoTask = async (node: CanvasNode) => {
     if (node.mediaType !== "video" || !node.taskId || pendingRemovalNodes.current.has(node.id)) return;
@@ -6688,7 +8447,7 @@ export default function App({
       taskStatusChecks.current.delete(checkKey);
     }
   };
-  const generateImageTask = async (requested = primary, inputChanged = false) => {
+  const generateImageTask = async (requested = primary, inputChanged = false, automaticRecovery = false) => {
     if (!requested || leaving.current || pendingRemovalNodes.current.has(requested.id)) return;
     const node = docRef.current.nodes.find((n) => n.id === requested.id);
     if (!node || node.type !== "prompt" || activeRequests.current.has(node.id))
@@ -6706,6 +8465,7 @@ export default function App({
       !taskId && resumable
         ? node.submission
         : undefined;
+    if (automaticRecovery && !taskId && !previousSubmission) return;
     const composition = composePrompt(
       docRef.current.nodes,
       docRef.current.edges,
@@ -6715,7 +8475,32 @@ export default function App({
       previousSubmission?.prompt ||
       (taskId && node.taskPrompt ? node.taskPrompt : composition.prompt);
     const references = node.ignoreImageRefs ? [] : composition.imageReferences;
-    const referenceCount = new Set(references.map(ref => ref.image || ref.localImage || ref.nodeId)).size;
+    // A restored submission may still contain a signed URL or a browser-local
+    // image key from an older draft. Resolve asset-backed inputs before the
+    // request is frozen again; local-only inputs are not valid generation
+    // inputs and must stop here instead of becoming a cloud-recovery hole.
+    const sourceImageReferences: Array<{ image?: string; assetId?: string }> = previousSubmission?.images
+      ? previousSubmission.images.map(({ image, assetId }) => ({ image, assetId }))
+      : references.map(({ image, assetId }) => ({ image, assetId }));
+    let resolvedImageReferences = sourceImageReferences;
+    let imageReferenceError = "";
+    if (!taskId && sourceImageReferences.length) {
+      try {
+        resolvedImageReferences = await Promise.all(sourceImageReferences.map(async reference => {
+          const url = typeof reference.image === "string" ? reference.image : undefined;
+          if (reference.assetId && (!url || !isDurableAssetUrl(url))) {
+            const asset = await readPlatformAsset(client.api, reference.assetId);
+            if (asset.storedAsset.type !== "image" || !asset.url) throw new Error("参考图片资产无法恢复，请从素材库重新选择。");
+            return { ...reference, image: asset.url };
+          }
+          if (hasStableMediaInput({ assetId: reference.assetId, url })) return { ...reference, ...(url ? { image: url } : {}) };
+          throw new Error("参考图片只有本地缓存或临时地址，请重新上传后再生成。");
+        }));
+      } catch (error) {
+        imageReferenceError = error instanceof Error ? error.message : "参考图片暂不可用，请重新上传后重试。";
+      }
+    }
+    const referenceCount = new Set(resolvedImageReferences.map(ref => ref.image || ref.assetId || "")).size;
     const selectedModel = preferredModelForNode(models, "image", referenceCount, node);
     // Resolve catalog defaults before freezing the submission. This keeps the
     // value shown by the quantity dropdown identical to the request sent to
@@ -6723,38 +8508,33 @@ export default function App({
     const resolvedImageSettings = resolveImageSettings(selectedModel, node.imageSettings);
     const reason = !composition.prompt.trim()
       ? "请先填写画面描述，或连接文本节点。"
-      : references.some((ref) => !ref.image)
-        ? "参考图片尚未恢复，请重新上传或改为仅使用文字。"
+      : imageReferenceError
+        ? imageReferenceError
+        : resolvedImageReferences.some((ref) => !ref.image)
+          ? "参考图片尚未恢复，请重新上传或改为仅使用文字。"
         : !selectedModel
           ? "没有符合当前创作方式的模型，请重新检测模型或调整参考图。"
           : mediaReferenceLimit(selectedModel) &&
-              new Set(references.map((ref) => ref.image || ref.localImage || ref.nodeId)).size >
+              new Set(resolvedImageReferences.map((ref) => ref.image || ref.assetId)).size >
                 mediaReferenceLimit(selectedModel)!
             ? `模型最多支持 ${mediaReferenceLimit(selectedModel)} 张参考图。`
             : "";
-    if (!taskId && !previousSubmission && reason) {
+    if (reason && !taskId && !previousSubmission) {
       setCreationError({ id: node.id, message: reason });
       setInspectorOpen(true);
-      return;
-    }
-    if (previousSubmission?.images.some((ref) => !ref.image)) {
-      patchTask(node.id, {
-        error: "原提交的参考图片缺失，请在原浏览器或完整备份中恢复后继续。",
-      });
       return;
     }
     const generationBatchId =
       node.generationBatchId || previousSubmission?.resultBatchId || uid("image-batch");
     const submission = taskId
       ? undefined
-      : previousSubmission || {
+      : previousSubmission
+        ? { ...previousSubmission, images: imageReferenceError ? previousSubmission.images : resolvedImageReferences }
+        : {
           key: uid("canvas-submit"),
           model: selectedModel!.id!,
           prompt: effectivePrompt,
-          images: references.map(({ image, localImage }) => ({
-            image,
-            localImage,
-          })),
+          images: resolvedImageReferences.map(({ image, assetId }) => ({ image, ...(assetId ? { assetId } : {}) })),
           count: resolvedImageSettings.count,
           size: resolvedImageSettings.size,
           resolution: resolvedImageSettings.resolution,
@@ -6778,20 +8558,20 @@ export default function App({
     patchTask(node.id, {
       status: "running",
       taskId,
-      error: undefined,
+      error: automaticRecovery ? node.error : undefined,
       taskPrompt: effectivePrompt,
       generationBatchId,
       // A fresh submission must not inherit an unknown/failed observation
       // from an older task. Resumed submissions keep the original diagnosis
       // so its task identity remains available during reconciliation.
-      taskDiagnostic: taskId || previousSubmission ? node.taskDiagnostic : undefined,
+      taskDiagnostic: previousSubmission ? submissionRetryStartedDiagnostic(node) : taskId ? node.taskDiagnostic : undefined,
       inputSignature:
         taskId || previousSubmission
           ? node.inputSignature
           : creationInputSignature({
               prompt: effectivePrompt,
               model: submission!.model,
-              references: composition.imageReferences,
+              references: resolvedImageReferences.map((reference, index) => ({ nodeId: `image-${index}`, image: reference.image, assetId: reference.assetId })),
               ignoreImageRefs: node.ignoreImageRefs,
               settings: resolvedImageSettings,
             }),
@@ -6818,7 +8598,7 @@ export default function App({
         {
           model: submission?.model || node.modelId || "",
           prompt: effectivePrompt,
-          images: submission?.images.map((ref) => ref.image!),
+          images: submission?.images.map((ref) => ref.image!).filter(Boolean),
           count: submission?.count ?? resolvedImageSettings.count,
           size: submission?.size ?? resolvedImageSettings.size,
           resolutionTier: submission?.resolution ?? resolvedImageSettings.resolution,
@@ -6830,11 +8610,14 @@ export default function App({
           taskId,
         },
         (id) => {
-          if (!currentRequestNode()) return;
+          const current = currentRequestNode();
+          if (!current) return;
           patchTask(node.id, {
             taskId: id,
             status: "running",
             submission: undefined,
+            error: undefined,
+            taskDiagnostic: submissionRetryStartedDiagnostic(current),
           });
           return persist(docRef.current, false);
         },
@@ -6843,7 +8626,7 @@ export default function App({
           // A restored frozen submission must be looked up before replaying
           // its creation request. New submissions do not pay for a lookup.
           recovery: previousSubmission
-            ? { inputReferencesAvailable: !previousSubmission.images.some((ref) => !ref.image) }
+            ? { inputReferencesAvailable: previousSubmission.images.every((ref) => hasStableMediaInput({ assetId: ref.assetId, url: ref.image })), allowResubmit: !automaticRecovery }
             : undefined,
         },
       );
@@ -6855,13 +8638,32 @@ export default function App({
         (image): image is string => typeof image === "string" && image.trim().length > 0,
       );
       if (!outputImages.length) throw new Error("生成完成但没有可用图片结果");
+      outputImages.forEach((image, index) => requireStableMediaIdentity({
+        url: image,
+        taskId: result.taskId,
+        assetId: result.assetIds?.[index],
+      }, "图片生成结果"));
+      // Keep the requested output ratio available while the platform's
+      // signed thumbnail is still being prepared. Without this hint a COS
+      // result falls back to a square frame and a portrait image appears
+      // boxed in by side gutters until a later probe repairs it.
+      const outputSettings = {
+        aspectRatio: submission?.aspectRatio || resolvedImageSettings.aspectRatio || node.imageSettings?.aspectRatio,
+        size: submission?.size || resolvedImageSettings.size || node.imageSettings?.size,
+      };
+      const requestedImageAspectRatio = imageAspectRatioFromSettings(outputSettings);
+      const outputPlaceholderSize = imageNodeSizeFromSettings(outputSettings) || fitImageNodeSize(480, 480);
       // Geometry probing must use the signed preview. The original URL is
       // retained for detail/download only and must never be fetched as a side
       // effect of placing a result card.
-      const outputSizes = await Promise.all(outputImages.map((image, index) => {
+      const outputSizes = await Promise.all(outputImages.map(async (image, index) => {
         const thumbnail = result.thumbnails?.[index];
-        if (thumbnail) return readImageNodeSize(thumbnail);
-        return isCosImageURL(image) ? Promise.resolve(fitImageNodeSize(480, 480)) : readImageNodeSize(image);
+        if (thumbnail) {
+          const measured = await readImageNodeSize(thumbnail);
+          if (measured) return measured;
+          return isCosImageURL(image) ? outputPlaceholderSize : (await readImageNodeSize(image)) || outputPlaceholderSize;
+        }
+        return isCosImageURL(image) ? outputPlaceholderSize : (await readImageNodeSize(image)) || outputPlaceholderSize;
       }));
       if (!currentRequestNode()) return;
       // Every submission gets a fresh batch. A single output is written back to
@@ -6901,6 +8703,9 @@ export default function App({
           x: batchPosition.x + xOffset,
           y: batchPosition.y + yOffset,
         };
+        const outputAspectRatio = (result.thumbnails?.[index] || !isCosImageURL(image))
+          ? imageAspectRatioFromDimensions(size.width, size.height)
+          : requestedImageAspectRatio;
         return {
           id: uid("image"), type: "image" as const,
           title: `${node.title} · 结果${outputImages.length > 1 ? ` ${index + 1}` : ""}`,
@@ -6911,6 +8716,7 @@ export default function App({
           text: effectivePrompt,
           ...position,
           width: size.width, height: size.height, color: COLORS[1], image,
+          ...(outputAspectRatio ? { imageAspectRatio: outputAspectRatio } : {}),
           ...(result.thumbnails?.[index] ? { imageThumbnail: result.thumbnails[index] } : {}),
           ...(result.taskId ? { taskId: result.taskId } : {}),
           ...(result.assetIds?.[index] ? { assetId: result.assetIds[index] } : {}),
@@ -6921,7 +8727,7 @@ export default function App({
         const oldResultIds = new Set(
           outputImages.length === 1
             ? value.nodes
-                .filter((candidate) => isGeneratedResult(node.id, candidate, value.edges, node.title))
+                .filter((candidate) => isGeneratedResult(node.id, candidate, value.edges, node.type, node.title))
                 .map((candidate) => candidate.id)
             : [],
         );
@@ -6949,6 +8755,13 @@ export default function App({
               else delete next.assetId;
               next.resultBatchId = generationBatchId;
               next.resultIndex = 0;
+              next.width = outputSizes[0].width;
+              next.height = outputSizes[0].height;
+              const outputAspectRatio = (result.thumbnails?.[0] || !isCosImageURL(outputImages[0]))
+                ? imageAspectRatioFromDimensions(outputSizes[0].width, outputSizes[0].height)
+                : requestedImageAspectRatio;
+              if (outputAspectRatio) next.imageAspectRatio = outputAspectRatio;
+              else delete next.imageAspectRatio;
               delete next.video;
               delete next.videoContentUrl;
               delete next.videoContentUrlExpiresAt;
@@ -6984,7 +8797,10 @@ export default function App({
       }
       void persist(docRef.current, false)
         .then(() => refreshPersistedImageUrls())
-        .catch(() => setStatus("图片已生成 · 保存失败，请导出备份"));
+        .catch(error => {
+          setStatus("保存状态待确认 · 建议导出备份");
+          setMessage(errorText(error));
+        });
       if (overlay === "settings") void loadStorage();
       setInspectorMode(null);
       setCreationError(null);
@@ -7003,16 +8819,17 @@ export default function App({
         activeRequests.current.get(node.id) !== controller) return;
       const failure = platformFailure(error);
       if (failure.kind === "login") requireAuthentication(failure.message);
-      if (isStorageQuotaError(error)) {
-        if (overlay === "settings") void loadStorage();
-        setOverlay("settings");
-      }
-      const pending =
-        error instanceof ImageGenerationError
+      const identityMissing = error && typeof error === "object" &&
+        "code" in error && String(error.code) === "CANVAS_MEDIA_IDENTITY_MISSING";
+      const pending = identityMissing
+        ? false
+        : error instanceof ImageGenerationError
           ? error.pending || Boolean(previousSubmission && !error.terminalTask)
           : Boolean(taskId || previousSubmission);
       const imageError = error instanceof ImageGenerationError;
-      const currentTaskDiagnostic = docRef.current.nodes.find(item => item.id === node.id)?.taskDiagnostic;
+      const currentNodeState = docRef.current.nodes.find(item => item.id === node.id);
+      const previousError = currentNodeState?.error;
+      const currentTaskDiagnostic = currentNodeState?.taskDiagnostic;
       patchTask(node.id, {
         status: pending ? "queued" : "failed",
         ...(!pending ? { submission: undefined } : {}),
@@ -7029,7 +8846,8 @@ export default function App({
           },
         } : {}),
       });
-      if (!pending) reportTaskFailure(node, error, submission?.key);
+      if (pending) reportPendingTaskError(node, error, previousError);
+      else reportTaskFailure(node, error, submission?.key);
     } finally {
       if (activeRequests.current.get(node.id) === controller) {
         activeRequests.current.delete(node.id);
@@ -7037,7 +8855,7 @@ export default function App({
       }
     }
   };
-  const generateVideoTask = async (requested = primary, inputChanged = false) => {
+  const generateVideoTask = async (requested = primary, inputChanged = false, automaticRecovery = false) => {
     if (!requested || leaving.current || pendingRemovalNodes.current.has(requested.id)) return;
     const node = docRef.current.nodes.find((n) => n.id === requested.id);
     if (!node || node.type !== "prompt" || node.mediaType !== "video") return;
@@ -7054,20 +8872,42 @@ export default function App({
     // A local input-recovery failure keeps its frozen identity. Even after
     // the node displays failure, check the original submission before replay.
     const previousSubmission = !taskId && resumable ? node.videoSubmission : undefined;
+    if (automaticRecovery && !taskId && !previousSubmission) return;
     const composition = composePrompt(docRef.current.nodes, docRef.current.edges, node.id);
     const effectivePrompt = previousSubmission?.prompt || (taskId && node.taskPrompt ? node.taskPrompt : composition.prompt);
     const references = node.ignoreImageRefs ? [] : composition.imageReferences;
     const videoReferences = node.ignoreImageRefs ? [] : composition.videoReferences;
-    const sourceImageReferences = previousSubmission?.images || references.map(({ image, localImage, assetId }) => ({ image, localImage, assetId }));
+    type FrozenVideoReference = {
+      type: "image_url" | "audio_url" | "video_url";
+      url?: string;
+      assetId?: string;
+      mediaType?: "image" | "audio" | "video";
+      nodeId?: string;
+    };
+    const frozenVideoReferences: FrozenVideoReference[] = previousSubmission?.references
+      ? previousSubmission.references.map(reference => ({ ...reference }))
+      : videoReferences.map(reference => ({
+          type: reference.mediaType === "audio" || reference.audio || reference.localAudio ? "audio_url" : "video_url",
+          url: reference.mediaType === "audio" || reference.audio || reference.localAudio
+            ? reference.audio
+            : reference.video || reference.videoContentUrl,
+          assetId: reference.assetId,
+          mediaType: reference.mediaType === "audio" || reference.audio || reference.localAudio ? "audio" : "video",
+          nodeId: reference.nodeId,
+        }));
+    const sourceImageReferences = previousSubmission?.images || references.map(({ image, assetId }) => ({ image, assetId }));
     let resolvedImageReferences = sourceImageReferences;
     let imageReferenceError = "";
-    if (!taskId && !previousSubmission && sourceImageReferences.some(reference => reference.assetId && !reference.image)) {
+    if (!taskId && sourceImageReferences.length) {
       try {
         resolvedImageReferences = await Promise.all(sourceImageReferences.map(async reference => {
-          if (reference.image || !reference.assetId) return reference;
-          const asset = await readPlatformAsset(client.api, reference.assetId);
-          if (asset.storedAsset.type !== "image" || !asset.url) throw new Error("参考图片无法恢复，请从素材库重新选择。");
-          return { ...reference, image: asset.url };
+          if (reference.assetId && (!reference.image || !isDurableAssetUrl(reference.image))) {
+            const asset = await readPlatformAsset(client.api, reference.assetId);
+            if (asset.storedAsset.type !== "image" || !asset.url) throw new Error("参考图片无法恢复，请从素材库重新选择。");
+            return { ...reference, image: asset.url };
+          }
+          if (hasStableMediaInput({ assetId: reference.assetId, url: reference.image })) return reference;
+          throw new Error("参考图片只有本地缓存或临时地址，请重新上传后再生成。");
         }));
       } catch (error) {
         imageReferenceError = error instanceof Error ? error.message : "参考图片暂不可用，请重新加载后重试。";
@@ -7077,38 +8917,30 @@ export default function App({
     // signed delivery URL expires. Resolve those inputs before freezing the
     // submission so the gateway receives a concrete video_url instead of a
     // reference that is counted by the UI but silently omitted from JSON.
-    let resolvedVideoReferences = videoReferences;
+    let resolvedVideoReferences = frozenVideoReferences;
     let videoReferenceError = "";
-    if (!taskId && !previousSubmission && videoReferences.some(reference => reference.assetId || reference.localVideo || reference.localAudio)) {
+    if (!taskId && frozenVideoReferences.length) {
       try {
-        resolvedVideoReferences = await Promise.all(videoReferences.map(async reference => {
-          if (reference.localVideo) {
-            const blob = await readLocalVideo(reference.localVideo);
-            if (!blob) throw new Error("本机视频参考已丢失，请重新提取或导入完整画布备份。");
-            return { ...reference, video: await localMediaDataUrl(blob, "video"), localVideo: undefined };
+        resolvedVideoReferences = await Promise.all(frozenVideoReferences.map(async reference => {
+          const expectedType = reference.mediaType === "audio" || reference.type === "audio_url" ? "audio" : "video";
+          if (reference.assetId) {
+            const asset = await readPlatformAsset(client.api, reference.assetId);
+            if (asset.storedAsset.type !== expectedType || !asset.url) throw new Error("参考素材类型或访问地址无效，请从素材库重新选择。");
+            return { ...reference, url: asset.url };
           }
-          if (reference.localAudio) {
-            const blob = await readLocalAudio(reference.localAudio);
-            if (!blob) throw new Error("本机音频参考已丢失，请重新提取或导入完整画布备份。");
-            return { ...reference, audio: await localMediaDataUrl(blob, "audio"), localAudio: undefined };
-          }
-          if (!reference.assetId) return reference;
-          const asset = await readPlatformAsset(client.api, reference.assetId);
-          const expectedType = reference.mediaType === "audio" ? "audio" : "video";
-          if (asset.storedAsset.type !== expectedType || !asset.url) throw new Error("参考素材类型或访问地址无效，请从素材库重新选择。");
-          return expectedType === "audio"
-            ? { ...reference, audio: asset.url, video: undefined, videoContentUrl: undefined, videoContentUrlExpiresAt: undefined }
-            : { ...reference, video: asset.url, audio: undefined, videoContentUrl: undefined, videoContentUrlExpiresAt: undefined };
+          const url = reference.url;
+          if (!hasStableMediaInput({ url })) throw new Error("参考素材只有本地缓存或临时地址，请重新上传后再生成。");
+          return reference;
         }));
       } catch (error) {
         videoReferenceError = error instanceof Error ? error.message : "参考素材暂不可用，请重新加载后重试。";
       }
     }
-    const referenceCount = new Set([...references.map(ref => ref.image || ref.localImage || ref.nodeId), ...resolvedVideoReferences.map(ref => ref.video || ref.localVideo || ref.audio || ref.localAudio || ref.videoContentUrl || ref.assetId || ref.nodeId)]).size;
+    const referenceCount = new Set([...resolvedImageReferences.map(ref => ref.image || ref.assetId), ...resolvedVideoReferences.map(ref => ref.url || ref.assetId || ref.nodeId)]).size;
     const compatible = compatibleModels(models, "video", referenceCount);
     const selectedModel = preferredModelForNode(models, "video", referenceCount, node);
-    const reason = !effectivePrompt.trim() ? "请先填写视频提示词。" : imageReferenceError || (resolvedImageReferences.some(ref => !ref.image && !ref.localImage && !ref.assetId) ? "参考图片尚未恢复，请重新上传。" : videoReferenceError || (resolvedVideoReferences.some(ref => !ref.video && !ref.audio && !ref.videoContentUrl && !ref.assetId) ? "参考素材尚未恢复，请重新加载资产后重试。" : !selectedModel ? "请选择支持当前输入的视频模型。" : ""));
-    if (!taskId && !previousSubmission && reason) {
+    const reason = !effectivePrompt.trim() ? "请先填写视频提示词。" : imageReferenceError || (resolvedImageReferences.some(ref => !ref.image && !ref.assetId) ? "参考图片尚未恢复，请重新上传。" : videoReferenceError || (resolvedVideoReferences.some(ref => !ref.url && !ref.assetId) ? "参考素材尚未恢复，请重新加载资产后重试。" : !selectedModel ? "请选择支持当前输入的视频模型。" : ""));
+    if (reason && !taskId && !previousSubmission) {
       setCreationError({ id: node.id, message: reason });
       setInspectorOpen(true);
       return;
@@ -7121,26 +8953,21 @@ export default function App({
       generate_audio: node.videoSettings?.generate_audio ?? node.videoAudio,
     });
     const submission = taskId ? undefined : previousSubmission
-      ? { ...previousSubmission }
+      ? {
+          ...previousSubmission,
+          images: imageReferenceError ? previousSubmission.images : resolvedImageReferences,
+          references: imageReferenceError || videoReferenceError
+            ? previousSubmission.references
+            : resolvedVideoReferences.map(({ type, url, assetId, mediaType }) => ({ type, ...(url ? { url } : {}), ...(assetId ? { assetId } : {}), ...(mediaType ? { mediaType } : {}) })),
+        }
       : {
           key: uid("canvas-video-submit"), model: selectedModel!.id!, prompt: effectivePrompt,
-          images: resolvedImageReferences.map(({ image, localImage, assetId }) => ({ image, localImage, assetId })),
+          images: resolvedImageReferences.map(({ image, assetId }) => ({ image, assetId })),
           references: [
-            ...resolvedImageReferences.filter(reference => reference.image || reference.assetId || reference.localImage).map(reference => ({ type: "image_url" as const, ...(reference.image ? { url: reference.image } : {}), ...(reference.assetId ? { assetId: reference.assetId } : {}), ...(reference.localImage ? { localImage: reference.localImage } : {}), mediaType: "image" as const })),
+            ...resolvedImageReferences.filter(reference => reference.image || reference.assetId).map(reference => ({ type: "image_url" as const, ...(reference.image ? { url: reference.image } : {}), ...(reference.assetId ? { assetId: reference.assetId } : {}), mediaType: "image" as const })),
             ...resolvedVideoReferences
-              .filter(reference => reference.audio || reference.localAudio || reference.video || reference.localVideo || reference.videoContentUrl || reference.assetId)
-              .map(reference => {
-                const mediaType = reference.mediaType === "audio" || reference.audio || reference.localAudio ? "audio" as const : "video" as const;
-                const url = mediaType === "audio" ? reference.audio : reference.video || reference.videoContentUrl;
-                return {
-                  type: mediaType === "audio" ? "audio_url" as const : "video_url" as const,
-                  ...(url ? { url } : {}),
-                  ...(reference.assetId ? { assetId: reference.assetId } : {}),
-                  ...(reference.localVideo ? { localVideo: reference.localVideo } : {}),
-                  ...(reference.localAudio ? { localAudio: reference.localAudio } : {}),
-                  mediaType,
-                };
-              }),
+              .filter(reference => reference.url || reference.assetId)
+              .map(({ type, url, assetId, mediaType }) => ({ type, ...(url ? { url } : {}), ...(assetId ? { assetId } : {}), ...(mediaType ? { mediaType } : {}) })),
           ],
           ...resolvedVideoSettings,
         };
@@ -7164,7 +8991,7 @@ export default function App({
     patchTask(node.id, {
       // Resuming observation must preserve an unknown result until the server
       // actually reports progress. It does not start another generation.
-      ...(!taskId ? { status: "running" as const, error: undefined, videoPollingPaused: false, videoPollingReason: undefined }
+      ...(!taskId ? { status: "running" as const, error: automaticRecovery ? node.error : undefined, videoPollingPaused: false, videoPollingReason: undefined }
         : node.videoPollingReason === "user" ? { videoPollingPaused: false, videoPollingReason: undefined } : {}),
       taskId, taskPrompt: effectivePrompt, videoSubmission: submission,
       ...(!taskId && !previousSubmission && selectedModel?.id
@@ -7176,11 +9003,14 @@ export default function App({
           : creationInputSignature({
               prompt: effectivePrompt,
               model: submission!.model,
-              references: [...references, ...videoReferences],
+              references: [
+                ...resolvedImageReferences.map((reference, index) => ({ nodeId: `image-${index}`, image: reference.image, assetId: reference.assetId })),
+                ...resolvedVideoReferences.map((reference, index) => ({ nodeId: reference.nodeId || `video-${index}`, image: reference.url, assetId: reference.assetId })),
+              ],
               ignoreImageRefs: node.ignoreImageRefs,
               settings: resolvedVideoSettings,
             }),
-      taskDiagnostic: taskId || previousSubmission ? node.taskDiagnostic : {
+      taskDiagnostic: previousSubmission ? submissionRetryStartedDiagnostic(node) : taskId ? node.taskDiagnostic : {
         createdAt: new Date().toISOString(),
         summary: { model: submission?.model, reference_count: submission?.references?.length || submission?.images?.length || 0,
           duration: submission?.duration, resolution: submission?.resolution, aspect_ratio: submission?.aspect_ratio },
@@ -7199,9 +9029,9 @@ export default function App({
       const submittedReferences = [
         ...(submission?.references || []),
         ...(submission?.images || [])
-          .filter(reference => reference.image || reference.assetId || reference.localImage)
+          .filter(reference => reference.image || reference.assetId)
           .filter(reference => !(submission?.references || []).some(existing => existing.type === "image_url" && (existing.assetId && existing.assetId === reference.assetId || existing.url && existing.url === reference.image)))
-          .map(reference => ({ type: "image_url" as const, ...(reference.image ? { url: reference.image } : {}), ...(reference.assetId ? { assetId: reference.assetId } : {}), ...(reference.localImage ? { localImage: reference.localImage } : {}), mediaType: "image" as const })),
+          .map(reference => ({ type: "image_url" as const, ...(reference.image ? { url: reference.image } : {}), ...(reference.assetId ? { assetId: reference.assetId } : {}), mediaType: "image" as const })),
       ];
       if (!currentRequestNode()) return;
       const result = await generateVideo(
@@ -7219,7 +9049,7 @@ export default function App({
           images: submission?.images?.map((reference) => reference.image!).filter(Boolean), references: submittedReferences,
           resolveReferences: async (referenceInputs: VideoReferenceInput[]): Promise<VideoReference[]> => Promise.all(referenceInputs.map(async reference => {
             let url = reference.url;
-            const needsAssetRefresh = reference.assetId && (!url || mediaUrlNeedsRefresh(url));
+            const needsAssetRefresh = reference.assetId && (!url || !isDurableAssetUrl(url));
             if (needsAssetRefresh && reference.assetId) {
               const asset = await readPlatformAsset(client.api, reference.assetId);
               const expectedType = reference.type === "image_url" ? "image" : reference.type === "audio_url" ? "audio" : "video";
@@ -7227,20 +9057,7 @@ export default function App({
                 throw new Error("视频任务引用素材无法恢复，请从素材库重新选择后重试。");
               url = asset.url;
             }
-            if (!url && reference.localImage) {
-              const imageDocument: { nodes: Array<{ image?: string; localImage?: string }> } = { nodes: [{ localImage: reference.localImage }] };
-              const restored = await restoreLocalImages(imageDocument);
-              url = restored.nodes[0]?.image;
-            }
-            if (!url && reference.localVideo) {
-              const blob = await readLocalVideo(reference.localVideo);
-              if (blob) url = await localMediaDataUrl(blob, "video");
-            }
-            if (!url && reference.localAudio) {
-              const blob = await readLocalAudio(reference.localAudio);
-              if (blob) url = await localMediaDataUrl(blob, "audio");
-            }
-            if (!url) throw new Error("视频任务引用素材缺少可访问地址，请从素材库重新选择后重试。");
+            if (!url || !hasStableMediaInput({ assetId: reference.assetId, url })) throw new Error("视频任务引用素材只有本地缓存或临时地址，请重新上传后重试。");
             return { type: reference.type, url };
           })),
           taskId, idempotencyKey: submission?.key,
@@ -7251,7 +9068,7 @@ export default function App({
           const current = currentRequestNode(true);
           if (!current) { controller.abort("replaced"); return; }
           if (current.taskId === id && !current.videoSubmission) return;
-          patchTask(node.id, { taskId: id, videoSubmission: undefined });
+          patchTask(node.id, { taskId: id, status: "running", videoSubmission: undefined, error: undefined, taskDiagnostic: submissionRetryStartedDiagnostic(current) });
           observedTaskId = id;
           return persist(docRef.current, false);
         },
@@ -7260,8 +9077,9 @@ export default function App({
           observeUnknown: true,
           recovery: previousSubmission ? {
             inputReferencesAvailable:
-              !previousSubmission.images?.some(reference => !reference.image && !reference.assetId && !reference.localImage && !reference.localVideo && !reference.localAudio) &&
-              !previousSubmission.references?.some(reference => !reference.url && !reference.assetId && !reference.localImage && !reference.localVideo && !reference.localAudio),
+              !previousSubmission.images?.some(reference => !hasStableMediaInput({ assetId: reference.assetId, url: reference.image })) &&
+              !previousSubmission.references?.some(reference => !hasStableMediaInput({ assetId: reference.assetId, url: reference.url })),
+            allowResubmit: !automaticRecovery,
           } : undefined,
           onStatus: (snapshot) => {
             const current = currentRequestNode();
@@ -7275,6 +9093,11 @@ export default function App({
       if (!currentRequestNode()) return;
       const source = currentRequestNode();
       if (!source) return;
+      requireStableMediaIdentity({
+        taskId: result.taskId,
+        assetId: result.assetId,
+        url: result.contentUrl,
+      }, "视频生成结果");
       const outputAspectRatio = videoAspectRatio(resolvedVideoSettings.aspect_ratio);
       const outputSize = fitVideoNodeSize(outputAspectRatio, 1);
       const output: CanvasNode = {
@@ -7284,7 +9107,7 @@ export default function App({
         videoContentUrlExpiresAt: result.contentUrlExpiresAt, assetId: result.assetId, taskId: result.taskId, status: "completed",
       };
       commit((value) => {
-        const oldResultIds = new Set(value.nodes.filter((candidate) => isGeneratedResult(node.id, candidate, value.edges, node.title)).map((candidate) => candidate.id));
+        const oldResultIds = new Set(value.nodes.filter((candidate) => isGeneratedResult(node.id, candidate, value.edges, node.type, node.title)).map((candidate) => candidate.id));
         const inlineVideo = {
           ...completedVideoMedia(result),
           resultBatchId: uid("video-batch"),
@@ -7313,7 +9136,10 @@ export default function App({
             : value.groups,
         };
       });
-      void persist(docRef.current, false).catch(() => setStatus("视频已生成 · 本机保存失败，请导出备份"));
+      void persist(docRef.current, false).catch(error => {
+        setStatus("保存状态待确认 · 建议导出备份");
+        setMessage(errorText(error));
+      });
       // Resolve direct delivery and extract a lightweight cover after commit;
       // completion feedback never waits on a full-video download.
       const savedVideo = docRef.current.nodes.find((candidate) => candidate.id === node.id);
@@ -7329,18 +9155,16 @@ export default function App({
         !docRef.current.nodes.some((candidate) => candidate.id === node.id) ||
         controller.signal.reason === "cancelled" || controller.signal.reason === "replaced") return;
       const failure = platformFailure(error); if (failure.kind === "login") requireAuthentication(failure.message);
-      if (isStorageQuotaError(error)) {
-        if (overlay === "settings") void loadStorage();
-        setOverlay("settings");
-      }
       const videoError = error instanceof VideoGenerationError;
       const inputMissing = videoError && error.code === "VIDEO_SUBMISSION_INPUT_MISSING";
       // Network ambiguity is wrapped by generateVideo as VideoGenerationError
       // and keeps its explicit pending decision. A local failure before the
       // POST still keeps the frozen idempotent submission for a safe retry.
-      const pending = !inputMissing && (videoError
+      const identityMissing = error && typeof error === "object" && "code" in error && String(error.code) === "CANVAS_MEDIA_IDENTITY_MISSING";
+      const pending = !identityMissing && !inputMissing && (videoError
         ? error.pending || Boolean(previousSubmission && !error.terminalTask)
         : Boolean(taskId || submission));
+      const previousError = docRef.current.nodes.find(item => item.id === node.id)?.error;
       const statusUnavailable = videoError && (error.status === "unknown" || ["VIDEO_TASK_STATUS_MISSING", "VIDEO_TASK_UNKNOWN", "VIDEO_TASK_READ_UNAVAILABLE"].includes(error.code));
       patchTask(node.id, {
         status: pending ? "queued" : "failed", ...(!pending && !inputMissing ? { videoSubmission: undefined } : {}), error: errorText(error),
@@ -7348,8 +9172,12 @@ export default function App({
         taskDiagnostic: { ...docRef.current.nodes.find(item => item.id === node.id)?.taskDiagnostic,
           ...(videoError ? { code: error.code, ...(error.requestId ? { requestId: error.requestId } : {}), ...(error.status ? { status: error.status } : {}), ...(error.terminalTask && !error.status ? { status: "failed" } : {}) } : {}) },
       });
-      void persist(docRef.current, false).catch(() => setStatus("任务恢复信息保存失败 · 请保留页面并导出备份"));
-      if (!pending && !(videoError && ["cancelled", "canceled"].includes(error.status || ""))) reportTaskFailure(node, error, submission?.key);
+      void persist(docRef.current, false).catch(error => {
+        setStatus("保存状态待确认 · 建议导出备份");
+        setMessage(errorText(error));
+      });
+      if (pending) reportPendingTaskError(node, error, previousError);
+      else if (!(videoError && ["cancelled", "canceled"].includes(error.status || ""))) reportTaskFailure(node, error, submission?.key);
     } finally {
       if (activeRequests.current.get(node.id) === controller) {
         activeRequests.current.delete(node.id);
@@ -7368,6 +9196,9 @@ export default function App({
     const timers: ReturnType<typeof setTimeout>[] = [];
     for (const node of docRef.current.nodes) {
       if (pendingRemovalNodes.current.has(node.id) || node.type !== "prompt" || !isPending(node)) continue;
+      // A lookup miss is now an actionable, persisted state. Keep recovery
+      // read-only and quiet until the user explicitly retries the frozen key.
+      if (isSubmissionLookupMiss(node)) continue;
       const video = node.mediaType === "video";
       const music = node.mediaType === "audio";
       // Retired TTS tasks keep their original identity, but Canvas must never
@@ -7387,7 +9218,7 @@ export default function App({
         const currentKey = taskRecoveryKey(docRef.current.id, current.id, current.taskId, video ? current.videoSubmission?.key : music ? voice ? current.voiceDesignSubmission?.key : current.musicSubmission?.key : current.submission?.key);
         if (currentKey !== restoreKey) return;
         taskRecovery.current.started(restoreKey);
-        void (video ? generateVideoTask(current) : music ? voice ? generateVoiceDesignTask(current) : generateMusicTask(current) : generateImageTask(current)).finally(() => {
+        void (video ? generateVideoTask(current, false, true) : music ? voice ? generateVoiceDesignTask(current, false, true) : generateMusicTask(current, false, true) : generateImageTask(current, false, true)).finally(() => {
           taskRecovery.current.finished(restoreKey);
           if (alive.current && !leaving.current) setRecoveryRevision(value => value + 1);
         });
@@ -7480,27 +9311,33 @@ export default function App({
   const canConnect = (
     from: string,
     to: string,
-    options: { allowCompletedPrompt?: boolean } = {},
+    options: { allowCompletedPrompt?: boolean; forceWorkflow?: boolean } = {},
   ) => {
     const nodes = docRef.current.nodes;
     const source = nodes.find((node) => node.id === from);
     const target = nodes.find((node) => node.id === to);
     if (!source || !target || from === to) return false;
+    const mediaValue = source.type === "image" || source.type === "video" || source.type === "audio" ||
+      source.type === "prompt" && (hasMediaContent(source) || isCompletedMediaValue(source));
+    // A media source must have a durable input identity. This is the same
+    // requirement for every connection now that references and workflow edges
+    // share one relation type.
+    if (mediaValue && !hasStableCanvasMediaInput(source)) return false;
     if (source.type === "audio" || source.mediaType === "audio") {
-      if (!canLoadAudioContent(source) || target.type !== "prompt" || target.mediaType !== "audio" || (target.audioMode || "music") !== "music" || target.musicReference || hasPendingNodeTask(target)) return false;
+      const videoReference = target.type === "prompt" && target.mediaType === "video";
+      const musicReference = target.type === "prompt" && target.mediaType === "audio" && (target.audioMode || "music") === "music";
+      if (!canLoadAudioContent(source) || (!videoReference && !musicReference)) return false;
+      if (musicReference && (target.musicReference || hasPendingNodeTask(target))) return false;
     }
     // Keep source eligibility in the same policy used by the rendered output
     // port. Empty media placeholders must not create edges that can never be
     // composed into a request.
     if (!canStartNodeConnection(source, { hasMediaContent: hasMediaContent(source) })) return false;
-    // Connections flow into editable workflow nodes. Media cards are values
-    // (source assets or generated outputs), so accepting input there creates
-    // ambiguous image-to-image wires and makes the graph look misconnected.
-    // The explicit reference picker may opt a completed prompt back in so a
-    // user can extend an existing creator without changing normal port rules.
-    const canReceive = options.allowCompletedPrompt && target.type === "prompt"
-      ? true
-      : canReceiveNodeConnection(target, { hasMediaContent: hasMediaContent(target) });
+    // A connection always terminates at a note or creator node. A completed
+    // creator remains a creator underneath its rendered result, so it can
+    // accept another reference and keep the graph closed after regeneration.
+    const canReceive = (target.type === "note" || target.type === "prompt") &&
+      canReceiveNodeConnection(target, { hasMediaContent: hasMediaContent(target), allowCompletedMediaInput: true });
     if (!canReceive) return false;
     if (docRef.current.edges.some((edge) => edge.from === from && edge.to === to)) return false;
     // Prevent cycles before they can make prompt composition ambiguous.
@@ -7509,14 +9346,17 @@ export default function App({
       if (current === from) return true;
       if (visiting.has(current)) return false;
       visiting.add(current);
-      return docRef.current.edges.filter((edge) => edge.from === current).some((edge) => reaches(edge.to));
+      return docRef.current.edges
+        .filter((edge) => edge.from === current)
+        .some((edge) => reaches(edge.to));
     };
     return !reaches(to);
   };
   const finishConnection = (from: string, to: string) => {
     const accepted = canConnect(from, to);
     const source = docRef.current.nodes.find(node => node.id === from);
-    const audioReference = accepted && source && (source.type === "audio" || source.mediaType === "audio");
+    const target = docRef.current.nodes.find(node => node.id === to);
+    const audioReference = accepted && source && target?.type === "prompt" && target.mediaType === "audio" && (target.audioMode || "music") === "music" && (source.type === "audio" || source.mediaType === "audio");
     if (audioReference) {
       void selectMusicReference(to, from).then(() => {
         commit(value => ({ ...value, edges: [...value.edges, { id: uid("edge"), from, to }] }));
@@ -7535,7 +9375,6 @@ export default function App({
     setTool("select");
     wireDrag.current = null;
     if (!accepted) return;
-    const target = docRef.current.nodes.find((node) => node.id === to);
     const targetInteraction = target
       ? nodeInteraction(target, docRef.current.nodes, docRef.current.edges, {
           hasPendingTask: isPending(target),
@@ -7556,7 +9395,7 @@ export default function App({
       !canUseCanvasReferenceFor(source, target) ||
       target?.type !== "prompt" ||
       [...composition.imageReferences, ...composition.videoReferences].some(reference => sameCanvasReferenceValue(source, reference)) ||
-      !canConnect(sourceId, targetId, { allowCompletedPrompt: true })
+      !canConnect(sourceId, targetId, { allowCompletedPrompt: true, forceWorkflow: true })
     ) return false;
     commit((value) => ({
       ...value,
@@ -7644,6 +9483,8 @@ export default function App({
   // Capture navigation before ports, node buttons, or edges can claim the press.
   const pointerDownCapture = (event: React.PointerEvent<HTMLDivElement>) => {
     const target = event.target as Element;
+    pointerScreen.current = screenPoint(event.clientX, event.clientY);
+    pointerInside.current = true;
     if (target.closest(".minimap")) return;
     if (event.button !== 0 && event.button !== 1) return;
     const mediaPlayer = target.closest('[data-canvas-video-player],[data-canvas-media-player]');
@@ -7976,15 +9817,21 @@ export default function App({
       finishConnection(connecting, node.id);
       return;
     }
-    // Alt/Option is the explicit escape hatch from a group. Command/Ctrl and
-    // Shift keep their existing multi-select semantics, while an unmodified
-    // click treats the group as one interaction target.
+    // A grouped card remains a first-class interaction target. The group
+    // frame owns whole-group selection and movement; pressing a card selects
+    // that card so its editor, preview, toolbar and resize handle remain
+    // available. A plain drag on a grouped card therefore moves only that
+    // node. The padded frame is the explicit whole-group drag surface, which
+    // keeps the two interaction scopes from competing with one another.
+    // Alt/Option remains a force-single escape hatch for a multi-selection.
     const singleNode = event.altKey;
-    const grouped = Boolean(node.groupId) && !singleNode && !event.shiftKey && !event.metaKey && !event.ctrlKey;
-    const ids = singleNode
+    const groupedMemberClick = Boolean(node.groupId) &&
+      !singleNode &&
+      !event.shiftKey &&
+      !event.metaKey &&
+      !event.ctrlKey;
+    const ids = singleNode || groupedMemberClick
       ? [node.id]
-      : grouped
-        ? selectionForGroupMember(canvasNodes, node.id, selected, event.shiftKey)
       : event.shiftKey
         ? selected.includes(node.id)
           ? selected.filter((id) => id !== node.id)
@@ -7992,9 +9839,10 @@ export default function App({
         : selected.includes(node.id)
           ? selected
           : [node.id];
-    const logicalIds = grouped
-      ? docRef.current.nodes.filter((candidate) => candidate.groupId === node.groupId).map((candidate) => candidate.id)
-      : ids;
+    // Only the group frame expands a gesture to hidden task metadata. Node
+    // drags intentionally stay at node scope so generated task state cannot
+    // make a visible member feel locked to its siblings.
+    const logicalIds = ids;
     const interaction = nodeInteraction(node, docRef.current.nodes, docRef.current.edges, {
       hasPendingTask: isPending(node),
     });
@@ -8024,7 +9872,6 @@ export default function App({
       inspectId:
         !event.shiftKey &&
         opensCreator
-          && (!node.groupId || event.altKey)
           ? node.id
           : undefined,
       deferInspect: Boolean(
@@ -8033,9 +9880,9 @@ export default function App({
         interaction.canPreview,
       ),
       clickId: !event.shiftKey ? node.id : undefined,
-      keepSelectionOnClick: !grouped,
-      groupId: grouped ? node.groupId : undefined,
-      groupOrigin: grouped ? normalizeGroupFrames(docRef.current.nodes, undefined).find((frame) => frame.id === node.groupId) : undefined,
+      keepSelectionOnClick: true,
+      groupId: undefined,
+      groupOrigin: undefined,
     };
     // Capture on the article so a click/double-click still belongs to its node.
     claimPointer(event, event.currentTarget);
@@ -8488,10 +10335,11 @@ export default function App({
         }
         if (preview) {
           event.preventDefault();
-          setPreview(null);
+          closePreview();
           return;
         }
         if (overlay) {
+          if (overlay === "restore") return;
           event.preventDefault();
           setOverlay(null);
           return;
@@ -8512,7 +10360,7 @@ export default function App({
         closeMenus();
         closeInspector();
         setOverlay(null);
-        setPreview(null);
+        closePreview();
         setEditing(null);
         cancelGesture();
         return;
@@ -8572,9 +10420,6 @@ export default function App({
       } else if (cmd && k === "c") {
         event.preventDefault();
         copyNodes();
-      } else if (cmd && k === "v") {
-        event.preventDefault();
-        pasteNodes();
       } else if (cmd && k === "g") {
         event.preventDefault();
         event.shiftKey ? ungroupSelection() : groupSelection();
@@ -8624,35 +10469,39 @@ export default function App({
     };
   }, []);
   React.useEffect(() => {
-    if (!picker && !zoomMenu && !toolMenu && !layoutMenu) return;
+    if (!picker && !zoomMenu && !toolMenu) return;
     const outside = (event: PointerEvent) => {
       if (
         !(event.target as Element).closest(
-          ".popover,.canvas-controls,.canvas-utilities,.selection-layout-control",
+          ".popover,.canvas-controls,.canvas-utilities",
         )
       )
         closeMenus();
     };
     window.addEventListener("pointerdown", outside);
     return () => window.removeEventListener("pointerdown", outside);
-  }, [picker, zoomMenu, toolMenu, layoutMenu]);
+  }, [picker, zoomMenu, toolMenu]);
   React.useEffect(() => {
     if (overlay !== "restore" && !preview) return;
     const previous = document.activeElement as HTMLElement | null,
-      el = modal.current;
+      el = overlay === "restore" ? cloudVersionModal.current : modal.current;
     const focusable = () =>
       Array.from(
         el?.querySelectorAll<HTMLElement>(
           'button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),summary,a[href],[tabindex="0"]',
         ) || [],
       ).filter(element => element.getClientRects().length > 0);
-    focusable()[0]?.focus({ preventScroll: true });
+    if (overlay === "restore") el?.focus({ preventScroll: true });
+    else focusable()[0]?.focus({ preventScroll: true });
     const trap = (event: KeyboardEvent) => {
       if (event.key !== "Tab") return;
       const all = focusable(),
         first = all[0],
         last = all.at(-1);
-      if (event.shiftKey && document.activeElement === first) {
+      if (document.activeElement === el) {
+        event.preventDefault();
+        (event.shiftKey ? last : first)?.focus();
+      } else if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last?.focus();
       } else if (!event.shiftKey && document.activeElement === last) {
@@ -8705,24 +10554,32 @@ export default function App({
     if (!targetId || !docRef.current.nodes.some(node => node.id === targetId && node.type === "prompt")) return false;
     const existing = docRef.current.nodes.find(node => node.id === candidateId);
     const embedded = docRef.current.nodes.flatMap(node => node.embeddedReferences || []).find(reference => reference.id === candidateId);
-    const candidateFromReference = (reference: { id: string; title: string; image?: string; imageThumbnail?: string; localImage?: string; assetId?: string; video?: string }) => ({
+    const candidateFromReference = (reference: { id: string; title: string; image?: string; imageThumbnail?: string; assetId?: string; video?: string }) => ({
       id: reference.id,
       title: reference.title,
       type: "image" as const,
       source: "canvas" as const,
       image: reference.image,
       imageThumbnail: reference.imageThumbnail,
-      localImage: reference.localImage,
       assetId: reference.assetId,
     });
-    if (existing && existing.id !== targetId && (hasUsableCanvasReferenceImage(existing) || existing.localImage)) {
+    if (existing && existing.id !== targetId && hasUsableCanvasReferenceImage(existing)) {
       commit(value => ({
         ...value,
         nodes: value.nodes.map(node => node.id === targetId ? { ...node, ignoreImageRefs: false } : node),
       }));
-      return candidateFromReference({ id: existing.id, title: existing.title, image: existing.image, imageThumbnail: existing.imageThumbnail, localImage: existing.localImage, assetId: existing.assetId });
+      return candidateFromReference({ id: existing.id, title: existing.title, image: existing.image, imageThumbnail: existing.imageThumbnail, assetId: existing.assetId });
     }
-    if (embedded) {
+    const embeddedImageIsStable = Boolean(
+      embedded &&
+      (embedded.mediaType === "image" || !embedded.mediaType && Boolean(embedded.image)) &&
+      hasStableMediaInput({ assetId: embedded.assetId, url: embedded.image }),
+    );
+    if (embedded && !embeddedImageIsStable) {
+      setMessage("这张参考图只有本机缓存或临时地址，请重新上传后再引用。");
+      return false;
+    }
+    if (embedded && embeddedImageIsStable) {
       commit(value => ({
         ...value,
         nodes: value.nodes.map(node => node.id === targetId ? { ...node, ignoreImageRefs: false } : node),
@@ -8750,7 +10607,7 @@ export default function App({
     if (!target) return false;
     const content = nodeFromLibraryAsset(row.asset, resolved.image, undefined, resolved.imageThumbnail);
     const imageProbe = resolved.imageThumbnail;
-    const size = imageProbe ? await readImageNodeSize(imageProbe) : fitImageNodeSize(480, 480);
+    const size = imageProbe ? (await readImageNodeSize(imageProbe)) || fitImageNodeSize(480, 480) : fitImageNodeSize(480, 480);
     checkSession();
     if (!targetIsCurrent()) return false;
     const node: CanvasNode = {
@@ -8769,7 +10626,7 @@ export default function App({
     }));
     setSelected([targetId]);
     setSelectedEdge(null);
-    return candidateFromReference({ id: node.id, title: node.title, image: node.image, imageThumbnail: node.imageThumbnail, localImage: node.localImage, assetId: node.assetId });
+    return candidateFromReference({ id: node.id, title: node.title, image: node.image, imageThumbnail: node.imageThumbnail, assetId: node.assetId });
   }, [commit, doc.id, platformRevision, primaryCreator?.id, promptMentionAssets, setMessage]);
   // A closed task stays a user-facing failure. Opening its editor performs
   // one silent read so an operator's later resolution can unlock retry,
@@ -8794,7 +10651,6 @@ export default function App({
     const images = new Set<string>();
     for (const reference of referencePickComposition?.imageReferences || []) {
       if (reference.image) images.add(`image:${reference.image}`);
-      if (reference.localImage) images.add(`local:${reference.localImage}`);
     }
     return images;
   }, [referencePickComposition]);
@@ -8809,10 +10665,7 @@ export default function App({
     return videos;
   }, [referencePickComposition]);
   const referencePickHasImage = (node: CanvasNode) =>
-    Boolean(
-      (node.image && referencePickImages.has(`image:${node.image}`)) ||
-      (node.localImage && referencePickImages.has(`local:${node.localImage}`)),
-    );
+    Boolean(node.image && referencePickImages.has(`image:${node.image}`));
   const referencePickHasVideo = (node: CanvasNode) => Boolean(
     (node.video && referencePickVideos.has(`video:${node.video}`)) ||
     (node.localVideo && referencePickVideos.has(`local:${node.localVideo}`)) ||
@@ -8866,7 +10719,7 @@ export default function App({
         : composition.imageReferences;
       const musicCompatible = isMusicNode ? compatibleMusicModels(models as any, node.musicReference ? "reference_audio" : "text") : [];
       const audioInputs = isMusicNode ? audioCreationInputs(node, models as any) : undefined;
-      const compatible = isMusicNode ? [] : compatibleModels(models, node.mediaType === "video" ? "video" : "image", new Set(refs.map(ref => ref.image || ref.localImage || ref.video || ref.localVideo || ref.audio || ref.localAudio || ref.videoContentUrl || ref.assetId || ref.nodeId)).size);
+      const compatible = isMusicNode ? [] : compatibleModels(models, node.mediaType === "video" ? "video" : "image", new Set(refs.map(ref => ref.image || ref.video || ref.localVideo || ref.audio || ref.localAudio || ref.videoContentUrl || ref.assetId || ref.nodeId)).size);
       const selectedMediaModel = isMusicNode ? undefined : preferredModelForNode(models, node.mediaType === "video" ? "video" : "image", refs.length, node);
       const effectiveModel =
         (isMusicNode ? audioInputs?.model : selectedMediaModel?.id) ||
@@ -8896,8 +10749,8 @@ export default function App({
           previous.refs.every(
             (ref, index) =>
               ref.nodeId === refs[index].nodeId &&
-              (ref.image || ref.localImage || ref.video || ref.localVideo || ref.audio || ref.localAudio || ref.assetId || ref.videoContentUrl) ===
-                (refs[index].image || refs[index].localImage || refs[index].video || refs[index].localVideo || refs[index].audio || refs[index].localAudio || refs[index].assetId || refs[index].videoContentUrl),
+              (ref.image || ref.video || ref.localVideo || ref.audio || ref.localAudio || ref.assetId || ref.videoContentUrl) ===
+                (refs[index].image || refs[index].video || refs[index].localVideo || refs[index].audio || refs[index].localAudio || refs[index].assetId || refs[index].videoContentUrl),
           );
         const signature = matches
           ? previous.signature
@@ -8952,7 +10805,13 @@ export default function App({
         boardSize,
         // Audio creation uses a compact control rail, so give its footer enough
         // room while keeping image and video editors aligned to their nodes.
-        { width: primaryCreator.mediaType === "audio" ? 600 : 480 },
+        {
+          width: primaryCreator.mediaType === "audio" ? 600 : 480,
+          // ResizeObserver can deliver the board's old size for one render
+          // while a mobile viewport is settling. Read the viewport as the
+          // immediate responsive signal so the editor never opens off-screen.
+          clampToBoard: window.innerWidth <= 560 || boardSize.width <= 560,
+        },
       )
     : null;
   // `gesturing` covers both navigation and object manipulation. Keep the
@@ -9070,10 +10929,9 @@ export default function App({
     picker.screen.y,
   )) : 64;
   const storageUsedBytes = Math.max(0, storageUsage?.used_bytes || 0);
-  const storageReservedBytes = Math.max(0, storageUsage?.reserved_bytes || 0);
   const storageQuotaBytes = Math.max(0, storageUsage?.quota_bytes || 0);
   const storageAvailableBytes = Math.max(0, storageUsage?.available_bytes || 0);
-  const storageConsumedBytes = storageUsedBytes + storageReservedBytes;
+  const storageConsumedBytes = storageUsedBytes;
   const storagePercent = storageQuotaBytes
     ? Math.min(100, storageConsumedBytes / storageQuotaBytes * 100)
     : 0;
@@ -9095,6 +10953,39 @@ export default function App({
         viewportMotion.stop();
         cancelDeferredCreator();
       }}>
+      {cloudCandidate && createPortal(
+        <PresenceLayer
+          open={overlay === "restore"}
+          className={`modal-backdrop cloud-version-backdrop canvas-accent-${canvasPreferences.accent}${canvasPreferences.reduceMotion ? " canvas-reduce-motion" : ""}`}
+        >
+          <div
+            ref={cloudVersionModal}
+            className="modal cloud-version-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="云端新版本"
+            tabIndex={-1}
+            onMouseDown={event => event.stopPropagation()}
+          >
+            <button
+              className={`cloud-version-reload${cloudMergePending ? " is-pending" : ""}`}
+              disabled={cloudMergePending}
+              onClick={() => void useCloud()}
+              data-testid="load-merge-cloud-version"
+              aria-label="重新加载"
+              aria-busy={cloudMergePending}
+            >
+              <span className="cloud-version-reload-icon" aria-hidden="true">
+                {cloudMergePending ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}
+              </span>
+              <span className="cloud-version-reload-label">{cloudMergePending ? "重新加载中…" : "重新加载"}</span>
+              <ArrowRight className="cloud-version-reload-arrow" size={17} aria-hidden="true" />
+            </button>
+            {cloudMergeError && <p className="cloud-version-error" role="alert">{cloudMergeError}</p>}
+          </div>
+        </PresenceLayer>,
+        document.body,
+      )}
       {assetLibrary.draft && <AssetSaveModal
         key={assetLibrary.draft.row.asset.id}
         value={assetLibrary.draft.row.asset}
@@ -9103,12 +10994,11 @@ export default function App({
         error={assetLibrary.draftError}
         preview={assetLibrary.draftPreview}
         knownTags={assetLibrary.knownTags}
-        knownFolders={assetLibrary.knownFolders}
         onNotice={(text, action) => setMessage(text, action)}
         onSave={value => void assetLibrary.save(value)}
         onClose={assetLibrary.closeDraft}
       />}
-      {navigating && (
+      {navigating && !isSwitchingCanvas && (
         <div className="navigation-saving" role="status">
           <LoaderCircle className="spin" size={20} />
           正在保存画布…
@@ -9152,23 +11042,46 @@ export default function App({
         </div>
       </div>
       <header className="topbar">
-        <div className={`top-actions${cloudSync.error ? " has-save-error" : ""}`}>
+        <div className="topbar-leading">
           <button
-            className={`save-status${cloudSync.error ? " is-error" : ""}`}
+            type="button"
+            className={`canvas-library-toggle${libraryOpen ? " is-active" : ""}`}
+            aria-label={libraryOpen ? "收起画布列表" : "我的画布"}
+            aria-expanded={libraryOpen}
+            aria-controls="canvas-library-panel"
+            disabled={navigating}
+            onClick={() => {
+              closeMenus();
+              onToggleLibrary();
+            }}
+          >
+            {libraryOpen ? <PanelLeftClose size={17} /> : <PanelLeftOpen size={17} />}
+            <span>我的画布</span>
+          </button>
+          <span className="canvas-context-divider" aria-hidden="true" />
+          <span className="canvas-context-name" title={doc.name} aria-label={`当前画布：${doc.name}`}>
+            {doc.name}
+          </span>
+        </div>
+        <div className="top-actions">
+          <button
+            className="save-status"
             title={saveStatus + " · 点击查看保存与恢复"}
             aria-label={saveStatus + "，查看保存与恢复"}
             onClick={() => setOverlay("settings")}
           >
-            {cloudSync.error ? <CircleAlert size={14} /> : <i className={hydrated ? "online" : ""} />}
+            {saveBusy ? <LoaderCircle className="spin" size={14} /> : <i className={hydrated ? "online" : ""} />}
             <span className="save-status-text">{saveStatus}</span>
           </button>
           <button
             className="button"
-            aria-label="保存画布"
+            aria-label={saveBusy ? currentSaveProgress === "cloud" || currentCloudSyncing ? "同步中" : "保存中" : "保存画布"}
+            aria-busy={saveBusy}
+            disabled={saveBusy}
             onClick={() => void save()}
           >
-            <Save size={14} />
-            <span>保存</span>
+            {saveBusy ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}
+            <span>{saveBusy ? currentSaveProgress === "cloud" || currentCloudSyncing ? "同步中" : "保存中" : "保存"}</span>
           </button>
           <button
             className="button"
@@ -9187,6 +11100,7 @@ export default function App({
           className={`canvas-board tool-${space ? "hand" : tool} ${gesturing ? "gesturing" : ""} ${gesturing && (pan.current || pinch.current) ? "is-panning" : ""} ${viewportMoving ? "is-viewport-moving" : ""} ${connecting ? "is-connecting" : ""} ${referencePickTarget ? `is-reference-picking${referencePickKind === "text" ? " is-reference-picking-text" : ""}` : ""} ${fileDragActive ? "is-file-dragging" : ""}`}
           aria-label={referencePickTarget ? `无限创作画布，${referencePickKind === "text" ? "文本引用" : "参考图"}拾取模式` : "无限创作画布"}
           onPointerDownCapture={pointerDownCapture}
+          onPaste={pasteClipboard}
           onPointerMoveCapture={(event) => {
             if (referencePickTarget) event.stopPropagation();
           }}
@@ -9279,10 +11193,12 @@ export default function App({
             const id = (event.target as Element).closest<HTMLElement>(
               "[data-node-id]",
             )?.dataset.nodeId;
-            if (id && !selected.includes(id)) {
-              setSelected(event.altKey
-                ? [id]
-                : selectionForGroupMember(canvasNodes, id, selected, false));
+            if (id) {
+              // A context menu is a node-level command surface. Resolve the
+              // exact card under the pointer even when a whole group was
+              // selected previously; otherwise the menu only exposes group
+              // actions and makes the node appear inoperable.
+              setSelected(selectionForGroupMember(canvasNodes, id, selected, false));
             }
             openPicker(
               screenPoint(event.clientX, event.clientY),
@@ -9368,20 +11284,20 @@ export default function App({
               if (referencePickKind === "text") {
                 return isCanvasTextReference(candidate) &&
                   !referencePickComposition?.textReferences.some((reference) => reference.nodeId === candidate.id) &&
-                  canConnect(candidate.id, referencePickTarget, { allowCompletedPrompt: true });
+                  canConnect(candidate.id, referencePickTarget, { allowCompletedPrompt: true, forceWorkflow: true });
               }
               return canUseCanvasReferenceFor(candidate, pickTarget) &&
                 (!hasUsableCanvasReferenceImage(candidate) || imageLoadStates[candidate.id]?.status !== "failed") &&
                 (!hasUsableCanvasReferenceImage(candidate) || imageLoadStates[candidate.id]?.status !== "recovering") &&
                 !(hasUsableCanvasReferenceImage(candidate) ? referencePickHasImage(candidate) : hasUsableCanvasReferenceVideo(candidate) ? referencePickHasVideo(candidate) : referencePickHasAudio(candidate)) &&
-                canConnect(candidate.id, referencePickTarget, { allowCompletedPrompt: true });
+                canConnect(candidate.id, referencePickTarget, { allowCompletedPrompt: true, forceWorkflow: true });
             }).length;
             return (
               <div className="reference-pick-banner" role="status" aria-live="polite">
                 {referencePickKind === "text" ? <Type size={14} aria-hidden="true" /> : <Link2 size={14} aria-hidden="true" />}
                 <span className="reference-pick-banner-copy">
                   <strong>{referencePickKind === "text" ? "引用文本" : "选择参考素材"}</strong>
-                  <span>{referencePickKind === "text" ? "点击画布中高亮的文本节点" : "点击可用的图片、视频或音频节点"}</span>
+                  <span>{referencePickKind === "text" ? "点击画布中高亮的文本节点" : pickTarget?.mediaType === "video" ? "点击可用的图片、视频或音频节点" : "点击可用的图片节点"}</span>
                 </span>
                 <span className="reference-pick-banner-count" aria-label={availableReferenceCount > 0 ? `${availableReferenceCount} 个可选${referencePickKind === "text" ? "文本" : "素材"}` : `暂无可选${referencePickKind === "text" ? "文本" : "素材"}`}>
                   {availableReferenceCount > 0 ? `${availableReferenceCount} 个可选` : "暂无可选"}
@@ -9415,6 +11331,7 @@ export default function App({
             className="world"
             style={{
               transform: `translate(${doc.viewport.x}px, ${doc.viewport.y}px) scale(${doc.viewport.zoom})`,
+              ["--canvas-zoom" as string]: doc.viewport.zoom,
               // Keep the invisible click affordance usable while the visible
               // handle itself follows the world scale.
               ["--port-hit-scale" as string]: 1 / clampZoom(doc.viewport.zoom),
@@ -9480,6 +11397,17 @@ export default function App({
                 style={{ left: group.x, top: group.y, width: group.width, height: group.height }}
                 aria-label={`节点组 · ${group.count} 个节点`}
                 onPointerDown={(event) => groupFrameDown(event, group)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const ids = visibleGroupMembers(docRef.current.nodes, group.id).map((node) => node.id);
+                  setSelected(ids);
+                  openPicker(
+                    screenPoint(event.clientX, event.clientY),
+                    point(event.clientX, event.clientY),
+                    ids[0],
+                  );
+                }}
               >
                 <span>{group.label}</span>
               </div>
@@ -9581,7 +11509,7 @@ export default function App({
               const inputExitPosition = inputExit ? exitingNearConnection : null;
               const outputExitPosition = outputExit ? exitingNearConnection : null;
               const hasNearPort = inputNear || outputNear;
-              const isPrimaryToolbarNode = interaction.showToolbar && primary?.id === node.id && !gesturing && !editing;
+              const isPrimaryToolbarNode = interaction.showToolbar && primary?.id === node.id && !gesturing && !editing && !(node.operationId === "extract-audio" && videoProcessBusyIds.has(node.id));
               const activeOrigin = connecting === node.id ? wireOrigin : null;
               const activeOriginSide: PortSide = activeOrigin
                 ? activeOrigin.x <= node.x + node.width / 2 ? "left" : "right"
@@ -9637,7 +11565,7 @@ export default function App({
               const taskState = canvasTaskState(node, taskActive);
               const taskLabel = pendingTaskLabel(node, taskActive);
               const taskFailure = taskState === "failed"
-                  ? mediaTaskUserFailure({
+                ? mediaTaskUserFailure({
                     code: node.taskDiagnostic?.code,
                     message: node.error,
                     status: node.taskDiagnostic?.status || node.status,
@@ -9648,9 +11576,11 @@ export default function App({
                   })
                 : undefined;
               const mediaLabel = node.mediaType === "video" ? "视频" : node.mediaType === "audio" ? "音频" : "图片";
+              const submissionNeedsUserAction = !taskActive && canRetryMissedSubmission(node);
               const isTaskInProgress = ["queued", "running", "unknown", "reconciliation", "no_task_id"].includes(taskState);
               const videoUrl = runtimeVideoUrls[node.id] || [node.videoContentUrl, node.video].find(url => url && !videoSourceNeedsRefresh({ url, urlExpiresAt: node.videoContentUrlExpiresAt }));
               const audioUrl = audioSources.urls[node.id];
+              const audioExtractProcessing = visualType === "audio" && node.operationId === "extract-audio" && videoProcessBusyIds.has(node.id) && !audioUrl;
               const canRefetchVideo = Boolean(node.taskId || node.assetId) && canLoadVideoContent(node) && !/^(?:data|blob):/i.test(node.video || "");
               const videoInteractive = !referencePickTarget && tool === "select" && !space;
               const videoLoading = videoLoadingIds.includes(node.id);
@@ -9662,23 +11592,52 @@ export default function App({
               const imageUnavailable = imageLoadState?.status === "recovering" ||
                 imageLoadState?.status === "failed";
               const imageThumbnail = displayImageThumbnail(node.image, node.imageThumbnail);
-              const canRecoverImage = Boolean(
-                node.taskId || node.localImage || isTemporaryMediaUrl(node.image),
+              const imagePreviewReady = Boolean(
+                imageThumbnail && loadedImageSources.current.get(node.id) === imageThumbnail,
               );
+              const imagePreviewLoading = Boolean(
+                imageThumbnail && !imagePreviewReady && imageLoadState?.status !== "failed",
+              );
+              const imageStatusScale = Math.min(
+                Math.max(1, 1 / clampZoom(doc.viewport.zoom)),
+                Math.max(1, Math.min(node.width, node.height) / 96),
+              );
+              const imageStatusStyle = { ["--node-status-scale" as string]: imageStatusScale } as React.CSSProperties;
+              const uploadRuntime = mediaUploadStates[node.id];
+              const uploadState = uploadRuntime || (node.uploadState
+                ? { state: node.uploadState, progress: node.uploadProgress || 0, error: node.uploadError }
+                : undefined);
+              // During a transactional upload the source COS image itself is
+              // the placeholder. It is replaced by the newly uploaded COS
+              // URL after completion; local/blob/Data URLs are never used as
+              // the committed fallback.
+              const uploadPlaceholder = imageThumbnail || (uploadState && /^(?:blob:|https?:\/\/)/i.test(node.image || "") ? node.image : undefined);
               const actionTarget = node.type === "prompt"
                 ? latestResults.get(node.id) || node
                 : node;
+              const voiceIdTarget = actionTarget.voiceId ? actionTarget : node.voiceId ? node : undefined;
               const canPreviewTarget = interaction.canPreview && hasMediaContent(actionTarget);
               const primaryActionLabel = interaction.primaryAction === "preview" ? "预览" : "上传媒体";
+              const directDownload = (() => {
+                const type = assetType(actionTarget);
+                if (type === "image" && (actionTarget.image || actionTarget.assetId)) {
+                  return { label: "下载图片", run: () => void downloadImage(actionTarget) };
+                }
+                if (type === "video" && canLoadVideoContent(actionTarget)) {
+                  return { label: "下载视频", run: () => void downloadVideo(actionTarget) };
+                }
+                if (type === "audio" && canLoadAudioContent(actionTarget)) {
+                  return { label: "下载音频", run: () => void downloadAudio(actionTarget) };
+                }
+                return null;
+              })();
               const mediaActions: MediaToolMenuGroup["items"] = [
-                ...((actionTarget.mediaType || actionTarget.type) === "image" && (actionTarget.image || actionTarget.assetId || actionTarget.localImage) ? [{ id: "download-image", label: "下载图片", icon: Download, onSelect: () => void downloadImage(actionTarget) }] : []),
-                ...(canLoadVideoContent(actionTarget) ? [{ id: "download-video", label: "下载视频", icon: Download, onSelect: () => void downloadVideo(actionTarget) }] : []),
-                ...(canLoadAudioContent(actionTarget) ? [{ id: "download-audio", label: "下载音频", icon: Download, onSelect: () => void downloadAudio(actionTarget) }] : []),
+                ...(visualType === "audio" && voiceIdTarget ? [{ id: "copy-voice-id", label: "复制音色 ID", icon: Copy, onSelect: () => void copyVoiceId(voiceIdTarget) }] : []),
+                ...(visualType === "audio" && audioUrl && canPreviewTarget ? [{ id: "preview-audio", label: "放大预览", icon: Scan, onSelect: () => selectPreview(actionTarget) }] : []),
                 ...(visualType === "audio" && canLoadAudioContent(actionTarget) ? [{ id: "validate-audio", label: "校验音频", icon: ShieldCheck, disabled: audioSources.loading.includes(actionTarget.id) || validatingAudioIds.has(actionTarget.id), onSelect: () => void validateAudio(actionTarget) }] : []),
               ];
               const nodeActionGroups: MediaToolMenuGroup[] = [
                 { label: "节点", items: [
-                  ...(reusableNodeKind(actionTarget) ? [{ id: "save", label: reusableNodeKind(actionTarget) === "prompt" ? "保存提示词" : "保存为资产", icon: Save, onSelect: () => void assetLibrary.openNode(actionTarget) }] : []),
                   { id: "duplicate", label: "复制节点", icon: Copy, onSelect: () => duplicate([node.id]) },
                 ] },
                 ...(mediaActions.length ? [{ label: "媒体", items: mediaActions }] : []),
@@ -9693,8 +11652,8 @@ export default function App({
               );
               const referencePickCandidate = Boolean(referencePickTarget && (
                 referencePickKind === "image"
-                  ? canUseCanvasReferenceFor(node, docRef.current.nodes.find(item => item.id === referencePickTarget)) && (!hasUsableCanvasReferenceImage(node) || !imageUnavailable) && !referencePickDuplicate && canConnect(node.id, referencePickTarget, { allowCompletedPrompt: true })
-                  : isCanvasTextReference(node) && !referencePickDuplicate && canConnect(node.id, referencePickTarget, { allowCompletedPrompt: true })
+                  ? canUseCanvasReferenceFor(node, docRef.current.nodes.find(item => item.id === referencePickTarget)) && (!hasUsableCanvasReferenceImage(node) || !imageUnavailable) && !referencePickDuplicate && canConnect(node.id, referencePickTarget, { allowCompletedPrompt: true, forceWorkflow: true })
+                  : isCanvasTextReference(node) && !referencePickDuplicate && canConnect(node.id, referencePickTarget, { allowCompletedPrompt: true, forceWorkflow: true })
               ));
               // Older creator cards used a wide 480×270 task layout. Once a
               // result is attached, give the persisted node the same default
@@ -9716,7 +11675,13 @@ export default function App({
                   width: node.width,
                   height: node.height,
                 }}
-                onPointerDown={(event) => nodeDown(event, node)}
+                onPointerDown={(event) => {
+                  if (audioExtractProcessing) {
+                    event.stopPropagation();
+                    return;
+                  }
+                  nodeDown(event, node);
+                }}
                 onKeyDown={(event) => {
                   if (!referencePickTarget || (!referencePickCandidate && !referencePickDuplicate)) return;
                   if (event.key !== "Enter" && event.key !== " ") return;
@@ -9728,6 +11693,10 @@ export default function App({
                 onDoubleClick={event => {
                   event.stopPropagation();
                   cancelDeferredCreator();
+                  if (node.operationId === "extract-audio" && videoProcessBusyIds.has(node.id)) return;
+                  // Audio already has full playback controls inside its canvas
+                  // node; the larger listening view stays an explicit More action.
+                  if (visualType === "audio") return;
                   if ((event.target as Element).closest('button,textarea,input,video[controls],audio[controls],[data-canvas-video-player],[data-canvas-media-player]') || tool !== "select" || spacePressed.current || event.detail !== 2) return;
                   const doubleClickAction = interaction.doubleClickAction;
                   performNodeAction(node, { action: doubleClickAction });
@@ -9801,8 +11770,9 @@ export default function App({
                         source={displayImageSource(actionTarget.image) || actionTarget.image}
                         title={displayNodeTitle(actionTarget)}
                         resolveSource={() => resolveImageToolSource(actionTarget)}
-                        onNotice={(text) => setMessage(text)}
+                        onNotice={(text, action) => setMessage(text, action)}
                         onApply={(outputs) => applyImageOperation(actionTarget, outputs)}
+                        onCreatePrompt={(request) => createCharacterTurnaround(actionTarget, request)}
                       />
                     )}
                     {visualType === "video" && <VideoTools
@@ -9813,12 +11783,16 @@ export default function App({
                       currentTime={videoPlaybackStates[actionTarget.id]?.time || 0}
                       processBusy={videoProcessBusyIds.has(actionTarget.id)}
                       processProgress={videoProcessProgress[actionTarget.id] || 0}
+                      processStatus={videoProcessStatus[actionTarget.id]}
                       processError={videoProcessErrors[actionTarget.id]}
+                      inlineQuickProcess
                       onNotice={(text) => setMessage(text)}
                       onCapture={() => setVideoCaptureRequests(current => ({ ...current, [actionTarget.id]: (current[actionTarget.id] || 0) + 1 }))}
+                      onCaptureFrameAt={frame => insertCapturedVideoFrame(actionTarget, doc.id, frame)}
                       onProcess={options => startVideoProcess(actionTarget.id, options)}
                       onCancelProcess={() => cancelVideoProcess(actionTarget.id)}
                       onClearProcessError={() => clearVideoProcessError(actionTarget.id)}
+                      onPlaybackLockChange={locked => onVideoToolPlaybackLockChange(node.id, locked)}
                     />}
                     {visualType === "audio" && canLoadAudioContent(actionTarget) && <AudioTools
                       duration={audioPlaybackStates[actionTarget.id]?.duration || 0}
@@ -9830,7 +11804,13 @@ export default function App({
                       onClearError={() => clearAudioEditError(actionTarget.id)}
                       onNotice={(text) => setMessage(text)}
                     />}
-                    {interaction.primaryAction !== "none" && interaction.primaryAction !== "task" && interaction.primaryAction !== "create" && interaction.primaryAction !== "edit" && <button
+                    {directDownload && <IconButton
+                      label={directDownload.label}
+                      onClick={directDownload.run}
+                    >
+                      <Download size={15} />
+                    </IconButton>}
+                    {interaction.primaryAction !== "none" && interaction.primaryAction !== "task" && interaction.primaryAction !== "create" && interaction.primaryAction !== "edit" && !(visualType === "audio" && audioUrl) && <button
                       className="node-generate"
                       onClick={() => performNodeAction(node)}
                     >
@@ -9843,6 +11823,12 @@ export default function App({
                     >
                       <Sparkles size={15} />
                     </IconButton>}
+                    {reusableNodeKind(actionTarget) && <IconButton
+                      label={`${reusableNodeKind(actionTarget) === "prompt" ? "保存提示词" : "保存为资产"}：${displayNodeTitle(actionTarget)}`}
+                      onClick={() => void assetLibrary.openNode(actionTarget)}
+                    >
+                      <BookmarkPlus size={15} />
+                    </IconButton>}
                     <MediaToolMenu
                       label="节点操作"
                       triggerLabel="更多"
@@ -9854,11 +11840,24 @@ export default function App({
                 )}
                 <div className="node-surface">
                   {visualType === "audio" ? (
-                    audioUrl ? <CanvasMediaPlayer kind="audio" shellClassName="node-audio" src={audioUrl} label={displayNodeTitle(node)} audioFormat={audioFormatForNode(node)} playbackScope={doc.id} preload="metadata" waveform={audioWaveform?.id === node.id && audioWaveform.identity === audioSourceIdentity(node) ? audioWaveform.peaks : undefined} onError={() => { audioSources.fail(node.id, "音频解码失败，可重试加载或下载原文件。"); setMessage("音频播放失败，可重试加载或下载原文件。"); }} onLoadedMetadata={event => { const audio = event.currentTarget as HTMLAudioElement; onAudioPlaybackStateChange(node.id, { duration: Number.isFinite(audio.duration) ? audio.duration : 0, time: audio.currentTime || 0 }); markMediaNodeLoaded(node.id); }} onTimeUpdate={event => { const audio = event.currentTarget as HTMLAudioElement; onAudioPlaybackStateChange(node.id, { duration: Number.isFinite(audio.duration) ? audio.duration : 0, time: audio.currentTime || 0 }); }} onPointerDown={(event) => { event.stopPropagation(); setSelected([node.id]); setSelectedEdge(null); }} /> : canLoadAudioContent(node) ? audioSources.loading.includes(node.id) ? <div className="image-empty audio-empty is-loading" role="status"><LoaderCircle size={22} className="spin" /><span>正在加载音频</span><small>读取完整文件后即可播放</small></div> : <button className="image-empty audio-empty" onPointerDown={event => event.stopPropagation()} onClick={() => void audioSources.load(node)}><Music2 size={30} /><span>{audioSources.errors[node.id] ? "重试加载" : "加载音频"}</span><small>{audioSources.errors[node.id] || "选中后加载完整音频"}</small></button> : <div className="image-empty audio-empty is-static" role="status"><Music2 size={30} /><span>暂无音频内容</span><small>上传音频或完成生成后可在这里播放</small></div>
+                    audioUrl ? <CanvasMediaPlayer kind="audio" shellClassName="node-audio" src={audioUrl} label={displayNodeTitle(node)} audioFormat={audioFormatForNode(node)} playbackScope={doc.id} preload="metadata" waveform={audioWaveform?.id === node.id && audioWaveform.identity === audioSourceIdentity(node) ? audioWaveform.peaks : undefined} onError={() => { audioSources.fail(node.id, "音频解码失败，可重试加载或下载原文件。"); setMessage("音频播放失败，可重试加载或下载原文件。", undefined, 3000); }} onLoadedMetadata={event => { const audio = event.currentTarget as HTMLAudioElement; onAudioPlaybackStateChange(node.id, { duration: finiteMediaDuration(audio), time: Number.isFinite(audio.currentTime) ? audio.currentTime : 0 }); markMediaNodeLoaded(node.id); }} onTimeUpdate={event => { const audio = event.currentTarget as HTMLAudioElement; onAudioPlaybackStateChange(node.id, { duration: finiteMediaDuration(audio), time: Number.isFinite(audio.currentTime) ? audio.currentTime : 0 }); }} onPointerDown={(event) => { event.stopPropagation(); setSelected([node.id]); setSelectedEdge(null); }} /> : audioExtractProcessing ? <div className="audio-extract-process" role="status" aria-busy="true" onPointerDown={event => event.stopPropagation()}>
+                      <Music2 size={30} aria-hidden="true" />
+                      <strong>正在提取音频</strong>
+                      <span className="audio-extract-process-status">{videoProcessStatus[node.id] || "正在准备音频提取…"}</span>
+                      <div className={`audio-extract-process-track${(videoProcessProgress[node.id] || 0) <= 0 ? " is-indeterminate" : ""}`} role="progressbar" aria-label="音频提取进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(Math.max(0, Math.min(100, videoProcessProgress[node.id] || 0)))}>
+                        <span style={{ width: `${Math.max(0, Math.min(100, videoProcessProgress[node.id] || 0))}%` }} />
+                      </div>
+                      <button type="button" onClick={() => cancelVideoProcess(node.id)}>取消提取</button>
+                    </div> : canLoadAudioContent(node) ? audioSources.loading.includes(node.id) ? <div className="image-empty audio-empty is-loading" role="status"><LoaderCircle size={22} className="spin" /><span>正在加载音频</span><small>读取完整文件后即可播放</small></div> : <button className="image-empty audio-empty" onPointerDown={event => event.stopPropagation()} onClick={() => void audioSources.load(node)}><Music2 size={30} /><span>{audioSources.errors[node.id] ? "重试加载" : "加载音频"}</span>{!audioSources.errors[node.id] && <small>选中后加载完整音频</small>}</button> : <div className="image-empty audio-empty is-static" role="status"><Music2 size={30} /><span>暂无音频内容</span><small>上传音频或完成生成后可在这里播放</small></div>
                   ) : visualType === "video" ? (
                     videoUrl ? <CanvasVideo
                       hoverPreview={canvasPreferences.hoverVideoAutoplay}
-                      selected={selected.includes(node.id)}
+                      selected={primary?.id === node.id}
+                      // A detail view or an open video tool owns playback.
+                      // Keep the canvas decoder mounted, but pause it until
+                      // that owner closes so two previews never play together.
+                      playbackSuspended={Boolean(preview) || videoToolPlaybackLocks.has(node.id)}
+                      processing={videoProcessBusyIds.has(node.id)}
                       src={videoUrl}
                       poster={node.videoPoster}
                       label={displayNodeTitle(node)}
@@ -9894,26 +11893,72 @@ export default function App({
                         if (current[node.id]?.id !== request) return current;
                         const next = { ...current }; delete next[node.id]; return next;
                       })}
-                      onProcessProgress={(progress, request) => setVideoProcessProgress(current => videoProcessJobs.current.get(node.id) === request ? ({ ...current, [node.id]: progress }) : current)}
+                      onProcessProgress={(progress, request) => setVideoProcessProgress(current => videoProcessJobs.current.get(node.id) === request ? ({ ...current, [request.targetNodeId || node.id]: progress * 0.55 }) : current)}
+                      onProcessStatus={(status, request) => setVideoProcessStatus(current => videoProcessJobs.current.get(node.id) === request ? ({ ...current, [request.targetNodeId || node.id]: status }) : current)}
                       onProcessResult={saveVideoProcessResult}
                       onProcessError={(error, request) => {
                         if (videoProcessJobs.current.get(node.id) !== request) return;
                         clearVideoProcess(node.id, request);
-                        if (error instanceof DOMException && error.name === "AbortError") return;
+                        if (request.options.operation === "extract-audio") removePendingAudioProcessNode(request);
+                        if (error instanceof DOMException && error.name === "AbortError") {
+                          if (request.options.operation === "extract-audio") setMessage("已取消音频提取。", undefined, 2200);
+                          return;
+                        }
                         const message = error instanceof Error ? error.message : "视频处理失败，请稍后重试。";
-                        setVideoProcessErrors(current => ({ ...current, [node.id]: message }));
+                        // Parameterized editors own their error state and show
+                        // it in the existing editor flow. The one-click audio
+                        // action has no dialog, so surface the failure through
+                        // the shared notice and offer a direct retry instead.
+                        if (request.options.operation === "extract-audio") {
+                          setMessage(message, {
+                            label: "重试提取",
+                            run: () => startVideoProcess(node.id, request.options),
+                          });
+                        } else {
+                          setVideoProcessErrors(current => ({ ...current, [node.id]: message }));
+                        }
                       }}
                       onReplace={node.type === "video" ? () => pickVideoReplacement(node) : undefined}
                       onRetry={canRefetchVideo ? () => retryVideoNode(node.id) : undefined}
                       onAutoRetry={canRefetchVideo ? () => autoRetryVideoNode(node.id, videoAutoRecoveryKey(node)) : undefined}
                       onNotice={(text, action) => setMessage(text, action)}
                       recoveryKey={videoAutoRecoveryKey(node)}
-                    /> : node.videoPoster ? <button className="video-poster-button" aria-label={`选择视频节点，双击进入画廊：${displayNodeTitle(node)}`} title={videoLoadError ? "点击重试加载视频，双击打开画廊" : "双击打开画廊"} tabIndex={videoInteractive ? 0 : -1} style={{ pointerEvents: videoInteractive ? undefined : "none" }} onPointerDown={() => { if (videoInteractive) cancelDeferredCreator(); }} onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); cancelDeferredCreator(); if (!referencePickTarget && tool === "select" && !spacePressed.current) selectPreview(node); }} onClick={(event) => { if (!videoInteractive) return; if (event.detail === 0) selectPreview(node); else if (videoLoadError) void loadVideoNode(node, true); }}><img className="node-video-poster" src={node.videoPoster} alt="视频首帧" draggable={false} onLoad={() => markMediaNodeLoaded(node.id)} /><span className="video-poster-play"><Film size={18} /></span><span className="video-poster-caption">{videoLoading ? "正在加载视频…" : videoLoadError ? "点击重试" : "视频预览"}</span></button> : (node.taskId || node.assetId || node.localVideo) ? <button className="image-empty video-empty" title={videoLoadError ? "点击重试加载视频，双击打开画廊" : "双击打开画廊"} aria-label={`选择视频节点，双击进入画廊：${displayNodeTitle(node)}`} tabIndex={videoInteractive ? 0 : -1} style={{ pointerEvents: videoInteractive ? undefined : "none" }} onPointerDown={() => { if (videoInteractive) cancelDeferredCreator(); }} onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); cancelDeferredCreator(); if (!referencePickTarget && tool === "select" && !spacePressed.current && canLoadVideoContent(node)) selectPreview(node); }} onClick={(event) => { if (!videoInteractive) return; if (event.detail === 0 && canLoadVideoContent(node)) selectPreview(node); else if (videoLoadError) void loadVideoNode(node, true); }}><Film size={30} /><span>{videoLoading ? "正在加载视频…" : videoLoadError ? "视频加载失败" : "视频预览"}</span><small>{videoLoadError || "视频预览自动加载"}</small></button> : node.type === "video" ? <button className="image-empty video-empty" aria-label="上传视频" tabIndex={videoInteractive ? 0 : -1} style={{ pointerEvents: videoInteractive ? undefined : "none" }} onPointerDown={() => { if (videoInteractive) cancelDeferredCreator(); }} onClick={() => { if (videoInteractive) pickVideoReplacement(node); }}><Upload size={30} /><span>上传视频</span><small>MP4、WEBM、MOV、OGG · 最大 64 MB</small></button> : <div className="image-empty video-empty is-static" role="status"><Film size={30} /><span>暂无视频内容</span><small>完成视频生成后可在这里预览</small></div>
+                    /> : node.videoPoster ? <button className="video-poster-button" aria-label={`选择视频节点，双击进入画廊：${displayNodeTitle(node)}`} title={videoLoadError ? "点击重试加载视频，双击打开画廊" : "双击打开画廊"} tabIndex={videoInteractive ? 0 : -1} style={{ pointerEvents: videoInteractive ? undefined : "none" }} onPointerDown={() => { if (videoInteractive) cancelDeferredCreator(); }} onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); cancelDeferredCreator(); if (!referencePickTarget && tool === "select" && !spacePressed.current) selectPreview(node); }} onClick={(event) => { if (!videoInteractive) return; if (event.detail === 0) selectPreview(node); else if (videoLoadError) void loadVideoNode(node, true); }}><img className="node-video-poster" src={node.videoPoster} alt="视频首帧" draggable={false} onLoad={() => markMediaNodeLoaded(node.id)} /><span className="video-poster-play"><Film size={18} /></span><span className="video-poster-caption">{videoLoading ? "正在加载视频…" : videoLoadError ? "点击重试" : "视频预览"}</span></button> : (node.taskId || node.assetId || node.localVideo) ? <button className="image-empty video-empty" title={videoLoadError ? "点击重试加载视频，双击打开画廊" : "双击打开画廊"} aria-label={`选择视频节点，双击进入画廊：${displayNodeTitle(node)}`} tabIndex={videoInteractive ? 0 : -1} style={{ pointerEvents: videoInteractive ? undefined : "none" }} onPointerDown={() => { if (videoInteractive) cancelDeferredCreator(); }} onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); cancelDeferredCreator(); if (!referencePickTarget && tool === "select" && !spacePressed.current && canLoadVideoContent(node)) selectPreview(node); }} onClick={(event) => { if (!videoInteractive) return; if (event.detail === 0 && canLoadVideoContent(node)) selectPreview(node); else if (videoLoadError) void loadVideoNode(node, true); }}><Film size={30} /><span>{videoLoading ? "正在加载视频…" : videoLoadError ? "视频暂不可用" : "视频预览"}</span><small>{videoLoadError ? "点击重试加载" : "视频预览自动加载"}</small></button> : node.type === "video" ? <button className="image-empty video-empty" aria-label="上传视频" tabIndex={videoInteractive ? 0 : -1} style={{ pointerEvents: videoInteractive ? undefined : "none" }} onPointerDown={() => { if (videoInteractive) cancelDeferredCreator(); }} onClick={() => { if (videoInteractive) pickVideoReplacement(node); }}><Upload size={30} /><span>上传视频</span><small>MP4、WEBM、MOV、OGG · 最大 64 MB</small></button> : <div className="image-empty video-empty is-static" role="status"><Film size={30} /><span>暂无视频内容</span><small>完成视频生成后可在这里预览</small></div>
                   ) : visualType === "image" ? (
-                    node.image && imageThumbnail && !imageUnavailable ? (
+                    uploadState ? (
+                      <div className={`node-image-upload node-image-upload--${uploadState.state}`} role="status" aria-live="polite">
+                        {uploadPlaceholder ? <img className="node-image" src={uploadPlaceholder} alt={displayNodeTitle(node)} draggable={false} /> : <ImageIcon size={30} />}
+                        <div className="node-image-upload-scrim" />
+                        <div className="node-image-upload-content">
+                          {uploadState.state === "failed" ? <ImageOff size={20} /> : <LoaderCircle size={20} className="spin" />}
+                          <span>{uploadState.state === "preparing" ? "准备上传图片" : uploadState.state === "completing" ? "确认图片已上传" : uploadState.state === "failed" ? "图片上传失败" : "正在上传图片"}</span>
+                          {uploadState.state === "failed" ? (
+                            <button
+                              type="button"
+                              className="node-image-upload-retry"
+                              onPointerDown={event => event.stopPropagation()}
+                              onClick={event => {
+                                event.stopPropagation();
+                                if (mediaUploadFiles.current.has(node.id)) retryMediaUpload(node.id);
+                                else pickImage(node.id, { x: node.x + node.width / 2, y: node.y + node.height / 2 });
+                              }}
+                            >
+                              {mediaUploadFiles.current.has(node.id) ? "重试上传" : "重新选择"}
+                            </button>
+                          ) : (
+                            <div className="node-image-upload-progress" role="progressbar" aria-label="图片上传进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(uploadState.progress)}>
+                              <span style={{ width: `${Math.max(0, Math.min(100, uploadState.progress))}%` }} />
+                            </div>
+                          )}
+                          {uploadState.state !== "failed" && <small>{Math.round(uploadState.progress)}%</small>}
+                          {uploadState.state === "failed" && uploadState.error && <small title={uploadState.error}>{uploadState.error}</small>}
+                        </div>
+                      </div>
+                    ) : node.image && imageThumbnail && !imageUnavailable ? (
                       <button
                         type="button"
-                        className="node-image-preview"
+                        className={`node-image-preview${imagePreviewReady ? " is-image-loaded" : ""}${imagePreviewLoading ? " is-image-loading" : ""}`}
+                        aria-busy={imagePreviewLoading}
                         aria-label={`选择图片节点，双击进入画廊：${displayNodeTitle(node)}`}
                         title="单击选择，双击打开画廊"
                         onPointerDown={() => cancelDeferredCreator()}
@@ -9941,56 +11986,90 @@ export default function App({
                           draggable={false}
                           loading="lazy"
                           decoding="async"
-                          onLoad={(event) => imageLoaded(
-                            node.id,
-                            node.image!,
-                            event.currentTarget.naturalWidth,
-                            event.currentTarget.naturalHeight,
-                          )}
+                          onLoad={(event) => {
+                              event.currentTarget.parentElement?.classList.add("is-image-loaded");
+                              event.currentTarget.parentElement?.classList.remove("is-image-loading");
+                              imageLoaded(
+                                node.id,
+                                node.image!,
+                                event.currentTarget.naturalWidth,
+                                event.currentTarget.naturalHeight,
+                                event.currentTarget.getAttribute("src") || undefined,
+                              );
+                            }}
                           onError={(event) => {
                             // Hide the browser's broken-image glyph immediately. The
                             // recovery state is rendered on the next commit and must
                             // never leave a failed thumbnail looking like an empty card.
                             event.currentTarget.style.visibility = "hidden";
+                            loadedImageSources.current.delete(node.id);
+                            event.currentTarget.parentElement?.classList.remove("is-image-loaded");
+                            event.currentTarget.parentElement?.classList.add("is-image-loading");
                             void recoverImageNode(node, node.image!);
                           }}
                         />
+                        <span className="node-image-load-placeholder" role="status" aria-live="polite">
+                          <span className="node-image-load-content" style={{ transform: `scale(${imageStatusScale})` }}>
+                            <span className="node-image-load-icon"><LoaderCircle className="spin" size={22} /></span>
+                            <span>正在加载图片</span>
+                          </span>
+                        </span>
                         <span className="node-image-preview-indicator" aria-hidden="true">
                           <Scan size={15} />
                         </span>
                       </button>
                     ) : imageLoadState?.status === "recovering" ? (
-                      <div className="image-empty image-load-state is-static is-recovering" role="status" aria-live="polite">
-                        <span className="image-load-state-icon"><LoaderCircle className="spin" size={24} /></span>
-                        <span className="image-load-state-title">正在恢复图片</span>
-                        <small>正在重新获取可用预览</small>
+                      <div className="image-empty image-load-state is-static is-recovering" style={imageStatusStyle} role="status" aria-live="polite">
+                        <span className="image-load-state-content" style={{ transform: `scale(${imageStatusScale})` }}>
+                          <span className="image-load-state-icon"><LoaderCircle className="spin" size={24} /></span>
+                          <span className="image-load-state-title">正在恢复图片</span>
+                          <small>正在重新获取可用预览</small>
+                        </span>
                       </div>
                     ) : imageLoadState?.status === "failed" && node.image ? (
                       <button
                         type="button"
                         className="image-empty image-load-state is-failed"
-                        aria-label={`${imageLoadState.message || "图片加载失败"}，点击重试`}
+                        style={imageStatusStyle}
+                        aria-label="图片预览暂不可用，点击重试"
                         onPointerDown={(event) => event.stopPropagation()}
-                        onClick={() => canRecoverImage
-                          ? void recoverImageNode(node, node.image!, true)
-                          : pickImage(node.id, {
-                              x: node.x + node.width / 2,
-                              y: node.y + node.height / 2,
-                            })}
+                        onClick={() => void recoverImageNode(node, node.image!, true)}
                       >
-                        <span className="image-load-state-icon">{canRecoverImage ? <ImageOff size={24} /> : <ImagePlus size={24} />}</span>
-                        <span className="image-load-state-title">{imageLoadState.message || "图片加载失败"}</span>
-                        <small>{canRecoverImage ? "点击重新获取缩略图" : "点击重新上传图片"}</small>
+                        <span className="image-load-state-content" style={{ transform: `scale(${imageStatusScale})` }}>
+                          <span className="image-load-state-icon"><ImageOff size={24} /></span>
+                          <span className="image-load-state-title">图片预览暂不可用</span>
+                          <small>点击重新获取图片</small>
+                        </span>
                       </button>
                     ) : node.image && isCosImageURL(node.image) && !imageThumbnail ? (
-                      <div className="image-empty image-load-state is-static is-thumbnail-pending" role="status" aria-live="polite">
-                        <span className="image-load-state-icon"><LoaderCircle className="spin" size={24} /></span>
-                        <span className="image-load-state-title">正在获取缩略图</span>
-                        <small>仅加载轻量预览，不会请求原图</small>
-                      </div>
+                      imageLoadState?.status === "loading" ? (
+                        <div className="image-empty image-load-state is-static is-thumbnail-pending" style={imageStatusStyle} role="status" aria-live="polite">
+                          <span className="image-load-state-content" style={{ transform: `scale(${imageStatusScale})` }}>
+                            <span className="image-load-state-icon"><LoaderCircle className="spin" size={24} /></span>
+                            <span className="image-load-state-title">正在获取缩略图</span>
+                            <small>正在读取可用图片预览</small>
+                          </span>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          className={`image-empty image-load-state is-failed is-thumbnail-pending${imageLoadState?.status === "failed" ? " has-error" : ""}`}
+                          style={imageStatusStyle}
+                          aria-label="图片缩略图暂不可用，点击重试"
+                          onPointerDown={(event) => event.stopPropagation()}
+                          onClick={() => void recoverImageNode(node, node.image!, true)}
+                        >
+                          <span className="image-load-state-content" style={{ transform: `scale(${imageStatusScale})` }}>
+                            <span className="image-load-state-icon"><ImageOff size={24} /></span>
+                            <span className="image-load-state-title">{imageLoadState?.status === "failed" ? "图片预览暂不可用" : "图片预览尚未就绪"}</span>
+                            <small>点击重新获取缩略图</small>
+                          </span>
+                        </button>
+                      )
                     ) : (
                       <button
                         className="image-empty"
+                        style={imageStatusStyle}
                         onPointerDown={(event) => event.stopPropagation()}
                         onClick={() =>
                           pickImage(node.id, {
@@ -10016,38 +12095,55 @@ export default function App({
                           <span>此创作类型已停用</span>
                           <small>原有文本与任务信息已保留</small>
                         </div>
-                      ) : taskState === "failed" ? (
+                      ) : taskState === "failed" || submissionNeedsUserAction ? (
                         <TaskFailureNotice
                           mediaLabel={mediaLabel}
-                          title={taskFailure?.title || "生成任务未完成"}
-                          advice={taskFailure?.advice || "可调整输入后重新生成。"}
+                          title={submissionNeedsUserAction ? "提交暂未确认" : taskFailure?.title || `${mediaLabel}任务未完成`}
+                          advice={submissionNeedsUserAction
+                            ? "自动重试已停止。点击重试后会先核查原提交，再使用原参数和请求编号继续。"
+                            : taskFailure?.advice || (node.taskDiagnostic?.code === "unknown_resolution_expired"
+                              ? "生成超时。结果暂时无法确认，请稍后联系平台处理。"
+                              : "可调整输入后重新生成。")}
+                          onRetry={submissionNeedsUserAction ? () => void generate(node, false) : undefined}
+                          retryLabel={submissionNeedsUserAction ? "重试原提交" : undefined}
+                          onCreateNewTask={submissionNeedsUserAction ? () => createNewTaskFromCreator(node.id) : undefined}
                         />
                       ) : latestResults.get(node.id) ? (
                         latestResults.get(node.id)?.id === node.id && node.image && imageThumbnail ? (
                           <button
-                            className="creation-inline-media"
-                            title="单击选择，双击打开画廊"
+                            className={`creation-inline-media${imagePreviewLoading ? " is-loading" : ""}${imageLoadState?.status === "failed" ? " is-failed" : ""}`}
+                            aria-busy={imagePreviewLoading}
+                            aria-label={imageLoadState?.status === "failed" ? "图片预览暂不可用，点击重试" : imagePreviewLoading ? "图片结果已生成，正在加载预览" : "图片结果已生成，点击预览"}
+                            title={imageLoadState?.status === "failed" ? "单击重新加载，双击打开画廊" : "单击选择，双击打开画廊"}
                             onPointerDown={(event) => { event.stopPropagation(); cancelDeferredCreator(); }}
                             onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); cancelDeferredCreator(); if (event.detail === 2 && !referencePickTarget && tool === "select" && !spacePressed.current) selectPreview(node); }}
                             onClick={(event) => {
                               event.stopPropagation();
-                              if (event.detail === 0) selectPreview(node);
+                              if (imageLoadState?.status === "failed") void recoverImageNode(node, node.image!, true);
+                              else if (event.detail === 0) selectPreview(node);
                               else if (event.detail === 1) { setSelected([node.id]); setSelectedEdge(null); }
                             }}
                           >
                             <img
+                              key={`${node.image}:${imageLoadState?.attempt || 0}`}
                               src={imageThumbnail}
                               alt="生成结果"
                               draggable={false}
                               loading="lazy"
                               decoding="async"
-                              onLoad={(event) => { event.currentTarget.style.visibility = ""; imageLoaded(node.id, node.image!); }}
+                              onLoad={(event) => { event.currentTarget.style.visibility = ""; event.currentTarget.parentElement?.classList.add("is-image-loaded"); event.currentTarget.parentElement?.classList.remove("is-loading"); imageLoaded(node.id, node.image!, event.currentTarget.naturalWidth, event.currentTarget.naturalHeight, event.currentTarget.getAttribute("src") || undefined); }}
                               onError={(event) => {
                                 event.currentTarget.style.visibility = "hidden";
+                                event.currentTarget.parentElement?.classList.remove("is-image-loaded");
+                                event.currentTarget.parentElement?.classList.add("is-loading");
                                 void recoverImageNode(node, node.image!);
                               }}
                             />
-                            <span><Check size={14} /> 成功 · 点击预览</span>
+                            {imagePreviewLoading && <span className="creation-inline-media-load" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />正在加载预览</span>}
+                            {imageLoadState?.status === "failed" && <span className="creation-inline-media-error" role="status"><ImageOff size={15} />预览暂不可用 · 点击重试</span>}
+                            <span className={`creation-inline-media-status${imageLoadState?.status === "failed" ? " is-error" : ""}`}>
+                              {imageLoadState?.status === "failed" ? <><ImageOff size={14} />结果已生成 · 点击重试</> : <><Check size={14} /> {imagePreviewLoading ? "结果已生成" : "成功 · 点击预览"}</>}
+                            </span>
                           </button>
                         ) : latestResults.get(node.id)?.id === node.id && node.videoContentUrl ? (
                           <button
@@ -10062,7 +12158,7 @@ export default function App({
                             }}
                           >
                             <span className="creation-inline-video"><Film size={24} /></span>
-                            <span><Check size={14} /> 成功 · 点击播放</span>
+                            <span className="creation-inline-media-status"><Check size={14} /> 成功 · 点击播放</span>
                           </button>
                         ) : (
                           <button
@@ -10091,7 +12187,7 @@ export default function App({
                                 src={displayImageThumbnail(latestResults.get(node.id)!.image, latestResults.get(node.id)!.imageThumbnail)}
                                 alt="最新生成结果"
                                 draggable={false}
-                                onLoad={(event) => { event.currentTarget.style.visibility = ""; imageLoaded(latestResults.get(node.id)!.id, latestResults.get(node.id)!.image!); }}
+                                onLoad={(event) => { event.currentTarget.style.visibility = ""; imageLoaded(latestResults.get(node.id)!.id, latestResults.get(node.id)!.image!, event.currentTarget.naturalWidth, event.currentTarget.naturalHeight, event.currentTarget.getAttribute("src") || undefined); }}
                                 onError={(event) => {
                                   event.currentTarget.style.visibility = "hidden";
                                   const result = latestResults.get(node.id);
@@ -10176,8 +12272,8 @@ export default function App({
                     </div>
                   )}
                   {taskState === "failed" && node.type !== "prompt" && (
-                    <div className="node-task failed">
-                      失败
+                    <div className="node-task">
+                      未完成
                     </div>
                   )}
                 </div>
@@ -10309,29 +12405,14 @@ export default function App({
             />
           )}
           {canvasNodes.length === 0 && (
-            <div
-              className="empty-canvas"
-              onPointerDown={(e) => e.stopPropagation()}
-            >
-              <h1>开始创作</h1>
-              <div className="empty-actions" role="group" aria-label="快速开始">
-                <button className="button" onClick={() => add("prompt")}>
-                  <Sparkles size={15} />
-                  创建图片
-                </button>
-                <button className="button" onClick={() => add("prompt", undefined, undefined, "", "video")}>
-                  <Film size={15} />
-                  创建视频
-                </button>
-                <button className="button" onClick={() => add("prompt", undefined, undefined, "", "audio")}>
-                  <Music2 size={15} />
-                  创建音乐
-                </button>
-                <button className="button" onClick={() => pickMedia()}>
-                  <Upload size={15} />
-                  导入媒体
-                </button>
-              </div>
+            <div className="empty-canvas" role="status">
+              <span className="empty-canvas-mark" aria-hidden="true">
+                <Plus size={30} strokeWidth={1.5} />
+              </span>
+              <p className="empty-canvas-title">
+                {canvasPreferences.blankAreaAction === "double" ? "双击画布开始创作" : "右键画布开始创作"}
+              </p>
+              <p className="empty-canvas-subtitle">也可点击底部「添加节点」</p>
             </div>
           )}
         </div>
@@ -10346,7 +12427,7 @@ export default function App({
                 ? "生成任务"
                 : drawer === "layers"
                   ? "图层面板"
-                  : "素材面板"
+                  : assetView === "library" ? "资产库面板" : "画布素材面板"
             }
           >
             <div className="panel-head">
@@ -10361,7 +12442,7 @@ export default function App({
                   className={drawer === "assets" && assetView === "canvas" ? "active" : ""}
                   onClick={() => { setDrawer("assets"); setAssetView("canvas"); }}
                 >
-                  素材
+                  画布素材
                 </button>
                 <button className={drawer === "assets" && assetView === "library" ? "active" : ""} onClick={() => { setDrawer("assets"); setAssetView("library"); }}>资产库</button>
               </div>
@@ -10382,6 +12463,8 @@ export default function App({
               knownTags={assetLibrary.knownTags} knownFolders={assetLibrary.knownFolders}
               onInsert={row => void assetLibrary.insert(row)} onEdit={row => void assetLibrary.edit(row)} onSave={row => void assetLibrary.saveMembership(row)} onRemove={row => void assetLibrary.remove(row)}
               resolvePreview={assetLibrary.resolvePreview}
+              available={authState === "connected" && platformReady}
+              onOpenCanvasAssets={() => setAssetView("canvas")}
               onBackToCreator={assetReferenceTarget.current ? returnToCreatorFromAssetLibrary : undefined}
               audioReferenceSelection={assetReferenceTarget.current?.kind === "audio"}
             /> : <><label className="search-box">
@@ -10427,7 +12510,7 @@ export default function App({
                           if (boardSize.width < 700) setDrawer(null);
                         }}
                       >
-                        {imageThumbnail ? <img src={imageThumbnail} alt="" onLoad={(event) => { event.currentTarget.style.visibility = ""; imageLoaded(node.id, node.image!); }} onError={(event) => { event.currentTarget.style.visibility = "hidden"; void recoverImageNode(node, node.image!); }} /> : node.image ? <ImageOff size={18} aria-hidden="true" /> : node.video ? <video src={node.video} muted preload="metadata" controls={false} tabIndex={-1} aria-hidden="true" /> : node.audio ? <Music2 size={18} /> : icon(node.type)}
+                        {imageThumbnail ? <img src={imageThumbnail} alt="" onLoad={(event) => { event.currentTarget.style.visibility = ""; imageLoaded(node.id, node.image!, event.currentTarget.naturalWidth, event.currentTarget.naturalHeight, event.currentTarget.getAttribute("src") || undefined); }} onError={(event) => { event.currentTarget.style.visibility = "hidden"; void recoverImageNode(node, node.image!); }} /> : node.image ? <ImageOff size={18} aria-hidden="true" /> : node.video ? <video src={node.video} muted preload="metadata" controls={false} tabIndex={-1} aria-hidden="true" /> : node.audio ? <Music2 size={18} /> : icon(node.type)}
                         <span>
                           {node.title}
                           <small>{assetType(node) === "video" ? "视频" : assetType(node) === "audio" ? "音频" : "图片"}{taskDisplay.active ? ` · ${taskDisplay.label}` : taskDisplay.state === "failed" ? " · 失败" : ""}</small>
@@ -10450,7 +12533,7 @@ export default function App({
                         if (boardSize.width < 700) setDrawer(null);
                       }}
                     >
-                      {imageThumbnail ? <img src={imageThumbnail} alt="" onLoad={(event) => { event.currentTarget.style.visibility = ""; imageLoaded(node.id, node.image!); }} onError={(event) => { event.currentTarget.style.visibility = "hidden"; void recoverImageNode(node, node.image!); }} /> : node.image ? <ImageOff size={18} aria-hidden="true" /> : icon(node.type)}
+                      {imageThumbnail ? <img src={imageThumbnail} alt="" onLoad={(event) => { event.currentTarget.style.visibility = ""; imageLoaded(node.id, node.image!, event.currentTarget.naturalWidth, event.currentTarget.naturalHeight, event.currentTarget.getAttribute("src") || undefined); }} onError={(event) => { event.currentTarget.style.visibility = "hidden"; void recoverImageNode(node, node.image!); }} /> : node.image ? <ImageOff size={18} aria-hidden="true" /> : icon(node.type)}
                       <span>
                         {node.title}
                         <small>
@@ -10466,7 +12549,7 @@ export default function App({
                   {drawer === "tasks"
                     ? "提交创作后，结果会自动回到画布。"
                     : drawer === "assets"
-                      ? "导入的图片和生成结果会显示在这里"
+                      ? "当前画布的图片、视频和音频会显示在这里。点击节点旁的保存按钮，可加入资产库并跨画布复用。"
                       : "没有匹配的节点"}
                 </p>
               )}
@@ -10481,7 +12564,7 @@ export default function App({
             )}
             <div className="panel-foot">
               {drawer === "assets"
-                ? `${doc.nodes.filter(isCanvasAsset).length} 个画布资产 · 单张结果收纳在创作节点`
+                ? `${doc.nodes.filter(isCanvasAsset).length} 个本画布素材 · 保存到资产库后可跨画布复用`
                 : `${doc.nodes.length} 个节点 · ${doc.edges.length} 条连接`}
             </div></>}
           </aside>
@@ -10519,7 +12602,7 @@ export default function App({
                   ![...primaryComposition.imageReferences, ...primaryComposition.videoReferences].some(ref => sameCanvasReferenceValue(node, ref)),
               )}
               mentionCandidates={doc.nodes.filter(
-                (node) => isCanvasReferenceImage(node) && Boolean(node.image || node.localImage) && node.id !== primaryCreator.id,
+                (node) => isCanvasReferenceImage(node) && Boolean(node.image) && node.id !== primaryCreator.id,
               )}
               mentionAssetCandidates={promptMentionAssets.candidates}
               mentionAssetsLoading={promptMentionAssets.loading}
@@ -10555,7 +12638,13 @@ export default function App({
                 setCreationError(null);
                 const previousReference = primaryCreator.musicReference?.nodeId;
                 if ("musicReference" in patch && previousReference && patch.musicReference?.nodeId !== previousReference) {
-                  commit(value => ({ ...value, nodes: value.nodes.map(node => node.id === primaryCreator.id ? { ...node, ...patch } as CanvasNode : node), edges: value.edges.filter(edge => edge.from !== previousReference || edge.to !== primaryCreator.id) }));
+                  commit(value => ({
+                    ...value,
+                    nodes: value.nodes.map(node => node.id === primaryCreator.id ? { ...node, ...patch } as CanvasNode : node),
+                    edges: value.edges.filter(edge =>
+                      edge.from !== previousReference || edge.to !== primaryCreator.id,
+                    ),
+                  }));
                 } else update([primaryCreator.id], patch as Partial<CanvasNode>);
               }}
               onGenerate={(inputChanged) => void generate(primaryCreator, inputChanged)}
@@ -10610,44 +12699,23 @@ export default function App({
           ))}
         </PresenceLayer>
         <div
-          className={`canvas-utilities${zoomMenu || (layoutMenu && layoutMenuAnchor === "utility") ? " has-zoom-menu" : ""}`}
+          className={`canvas-utilities${zoomMenu ? " has-zoom-menu" : ""}`}
           role="toolbar"
           aria-label="画布视图工具"
         >
           <IconButton label="适应画布 · ⌘0" onClick={() => { focusNodes(); closeZoomMenu(); }}>
             <Maximize2 size={16} />
           </IconButton>
-          <div className="layout-control">
-            <IconButton
-              label="整理布局 · ⌥⇧F"
-              active={layoutMenu}
-              aria-haspopup="dialog"
-              aria-expanded={layoutMenu}
-              onClick={() => {
-                closeDockPanels();
-                closeMenus();
-                setLayoutMenuAnchor("utility");
-                setLayoutMenu(!layoutMenu);
-                setPicker(null);
-                closeZoomMenu();
-              }}
-            >
-              <LayoutGrid size={15} />
-            </IconButton>
-            {layoutMenu && layoutMenuAnchor === "utility" && (
-              <LayoutPopover
-                scope={chosen.length > 1 ? "selected" : "all"}
-                count={chosen.length > 1 ? chosen.length : doc.nodes.length}
-                rows={layoutRows}
-                sort={layoutSort}
-                onRowsChange={setLayoutRows}
-                onSortChange={setLayoutSort}
-                onFlow={() => applyLayout("flow")}
-                onGrid={() => applyLayout("grid")}
-                onCustom={() => applyLayout("grid", chosen.length > 1 ? "selected" : "all", "custom")}
-              />
-            )}
-          </div>
+          <IconButton
+            label="智能整理画布 · ⌥⇧F"
+            onClick={() => {
+              closeDockPanels();
+              closeMenus();
+              arrange();
+            }}
+          >
+            <LayoutGrid size={15} />
+          </IconButton>
           <IconButton
             label="小地图"
             active={showMinimap}
@@ -10800,30 +12868,24 @@ export default function App({
           <span className="divider" />
           <div className="canvas-control-group canvas-control-workspace" role="group" aria-label="工作区">
             <IconButton
-              label={libraryOpen ? "收起画布列表" : "我的画布"}
-              active={libraryOpen}
-              aria-expanded={libraryOpen}
-              aria-controls="canvas-library-panel"
-              disabled={navigating}
-              onClick={() => {
-                closeMenus();
-                onToggleLibrary();
-              }}
-            >
-              {libraryOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
-            </IconButton>
-            <IconButton
-              label="素材与图层"
+              label="资产库与图层"
               active={drawer === "assets" || drawer === "layers"}
               aria-expanded={drawer === "assets" || drawer === "layers"}
               aria-controls="canvas-asset-panel"
-              onClick={() => drawer
-                ? drawer === "assets" && assetReferenceTarget.current
-                  ? returnToCreatorFromAssetLibrary()
-                  : setDrawer(null)
-                : toggleDockPanel(lastAssetTab.current)}
+              onClick={() => {
+                closeMenus();
+                setOverlay(null);
+                if (drawer === "assets") {
+                  if (assetReferenceTarget.current) returnToCreatorFromAssetLibrary();
+                  else setDrawer(null);
+                  return;
+                }
+                assetReferenceTarget.current = undefined;
+                setAssetView("library");
+                setDrawer("assets");
+              }}
             >
-              <Layers size={18} />
+              <Library size={18} />
             </IconButton>
             <IconButton label="自定义画布" active={overlay === "settings"} aria-expanded={overlay === "settings"} aria-haspopup="dialog" onClick={() => toggleDockPanel("settings")}>
               <Settings2 size={18} />
@@ -10850,7 +12912,7 @@ export default function App({
         {(chosen.length > 1 || selectedEdge) && (
           <div
             ref={selectionActions}
-            className={`selection-actions ${layoutMenu && layoutMenuAnchor === "selection" ? "has-layout-menu" : ""}`}
+            className="selection-actions"
             data-positioned={chosen.length > 1 ? "false" : "true"}
           >
             <span>
@@ -10867,30 +12929,20 @@ export default function App({
                     <X size={15} />
                   </IconButton>
                 )}
-                <div className="selection-layout-control">
-                  <button className="selection-action-button" onClick={() => {
-                    setLayoutMenuAnchor("selection");
-                    setLayoutMenu((open) => !open);
-                    setPicker(null);
-                    closeZoomMenu();
-                  }} disabled={chosen.length < 2} aria-haspopup="dialog" aria-expanded={layoutMenu && layoutMenuAnchor === "selection"}>
-                    <LayoutGrid size={15} />
-                    整理布局
-                  </button>
-                  {layoutMenu && layoutMenuAnchor === "selection" && (
-                    <LayoutPopover
-                      scope="selected"
-                      count={chosen.length}
-                      rows={layoutRows}
-                      sort={layoutSort}
-                      onRowsChange={setLayoutRows}
-                      onSortChange={setLayoutSort}
-                      onFlow={() => applyLayout("flow")}
-                      onGrid={() => applyLayout("grid")}
-                      onCustom={() => applyLayout("grid", "selected", "custom")}
-                    />
-                  )}
-                </div>
+                <button
+                  className="selection-action-button"
+                  title={selectedWholeGroup ? "整理当前分组内的节点" : "智能整理所选节点"}
+                  onClick={() => {
+                    closeMenus();
+                    arrangeChosenNodes();
+                  }}
+                  disabled={selectedWholeGroup
+                    ? visibleGroupMembers(doc.nodes, chosen[0]?.groupId || "").length < 2
+                    : layoutUnitCount(layoutSourceNodes(doc.nodes, chosen.map((node) => node.id), "selected")) < 2}
+                >
+                  <LayoutGrid size={15} />
+                  {selectedWholeGroup ? "整理组内" : "整理所选"}
+                </button>
                 <IconButton label="定位选中节点" onClick={() => focusNodes(chosen)}>
                   <LocateFixed size={15} />
                 </IconButton>
@@ -10980,11 +13032,11 @@ export default function App({
             </svg>
           </div>
         )}
-        <div className="canvas-hint">
+        {canvasNodes.length > 0 && <div className="canvas-hint">
           {connecting
             ? "拖至目标节点连接 · Esc 取消"
             : `${canvasPreferences.blankAreaAction === "double" ? "双击" : "右键"}创建节点 · 空格拖动画布`}
-        </div>
+        </div>}
         {picker && (
           <div
             ref={dockPicker}
@@ -11098,9 +13150,9 @@ export default function App({
                       <X size={16} />
                       取消分组
                     </button>}
-                    <button role="menuitem" onClick={() => { arrangeSelection(); setPicker(null); }}>
+                    <button role="menuitem" onClick={() => { arrangeChosenNodes(); setPicker(null); }}>
                       <LayoutGrid size={16} />
-                      整理选中节点
+                      {selectedWholeGroup ? "整理组内" : "整理选中节点"}
                     </button>
                     <button role="menuitem" onClick={() => { exportSelection(); setPicker(null); }}>
                       <ArrowDownToLine size={16} />
@@ -11116,13 +13168,13 @@ export default function App({
                 {chosen.length === 1 && primary && (() => {
                   const mediaTarget = primary.type === "prompt" ? latestResults.get(primary.id) || primary : primary;
                   const hasImage = (mediaTarget.mediaType || mediaTarget.type) === "image" &&
-                    (mediaTarget.image || mediaTarget.assetId || mediaTarget.localImage || mediaTarget.taskId);
+                    (mediaTarget.image || mediaTarget.assetId || mediaTarget.taskId);
                   return <>
                     {hasImage && <button role="menuitem" onClick={() => void copyImage(mediaTarget)}>
                       <FileImage size={16} />
                       复制图片
                     </button>}
-                    {((mediaTarget.mediaType || mediaTarget.type) === "image" && (mediaTarget.image || mediaTarget.assetId || mediaTarget.localImage)) && <button role="menuitem" onClick={() => { setPicker(null); void downloadImage(mediaTarget); }}>
+                    {((mediaTarget.mediaType || mediaTarget.type) === "image" && (mediaTarget.image || mediaTarget.assetId)) && <button role="menuitem" onClick={() => { setPicker(null); void downloadImage(mediaTarget); }}>
                       <Download size={16} />
                       下载图片
                     </button>}
@@ -11229,12 +13281,12 @@ export default function App({
         }}
       />
       <PresenceLayer
-        open={Boolean(overlay || preview)}
+        open={Boolean((overlay && overlay !== "restore") || preview)}
         className={overlayPresentation.current ? "canvas-floating-layer" : preview ? "modal-backdrop media-preview-backdrop" : "modal-backdrop"}
         onMouseDown={() => {
-          if (overlayPresentation.current) return;
+          if (overlayPresentation.current || cloudMergePending) return;
           setOverlay(null);
-          setPreview(null);
+          closePreview();
         }}
       >
           <div
@@ -11276,7 +13328,7 @@ export default function App({
                   label="关闭画廊"
                   onClick={() => {
                     setOverlay(null);
-                    setPreview(null);
+                    closePreview();
                   }}
                 >
                   <X size={17} />
@@ -11300,7 +13352,7 @@ export default function App({
                   label={floatingOverlay ? "关闭浮窗" : "关闭对话框"}
                   onClick={() => {
                     setOverlay(null);
-                    setPreview(null);
+                    closePreview();
                   }}
                 >
                   <X size={17} />
@@ -11337,7 +13389,7 @@ export default function App({
                 onLocate={id => {
                   const source = docRef.current.nodes.find(node => node.id === id);
                   if (!source) return;
-                  setPreview(null);
+                  closePreview();
                   setInspectorMode(null);
                   setSelected([id]);
                   setSelectedEdge(null);
@@ -11346,43 +13398,6 @@ export default function App({
                   reveal([source], true);
                 }}
               />
-            ) : overlay === "restore" ? (
-              <div className="settings-content restore-options">
-                <p>
-                  选择继续哪份画布。切换前的版本会保留，可在项目菜单中恢复。
-                </p>
-                <article>
-                  <h3>{isSessionOnlyStorage() ? "当前画布" : "本机画布"} · {doc.name}</h3>
-                  <p>
-                    {doc.nodes.length} 个节点 ·{" "}
-                    {new Date(doc.updatedAt).toLocaleString()}
-                  </p>
-                  <button className="button" onClick={() => void enableSync()}>
-                    继续当前画布并同步到云端
-                  </button>
-                </article>
-                {cloudCandidate && (
-                  <article>
-                    <h3>云端画布 · {cloudCandidate.name}</h3>
-                    <p>
-                      {cloudCandidate.nodes.length} 个节点 ·{" "}
-                      {new Date(cloudCandidate.updatedAt).toLocaleString()}
-                    </p>
-                    <button className="button" onClick={() => void useCloud()}>
-                      恢复云端画布
-                    </button>
-                  </article>
-                )}
-                <button
-                  className="text-button"
-                  onClick={() => {
-                    setOverlay(null);
-                    setSyncEnabled(false);
-                  }}
-                >
-                  {isSessionOnlyStorage() ? "暂时仅在当前页面继续（关闭前请导出）" : "暂时只在本机继续"}
-                </button>
-              </div>
             ) : overlay === "help" ? (
               <div className="help-content">
                 <p className="help-intro">常用操作按场景整理，按下对应快捷键即可。</p>
@@ -11430,7 +13445,7 @@ export default function App({
                   ) : null}
                   <p className={`platform-account-status${authState === "connected" ? " is-connected" : authState === "required" ? " is-required" : ""}`} role="status">
                     {authState === "connected"
-                      ? platformLoading ? "正在检查连接并更新账户和模型…" : platformProfileError || "已连接平台账户"
+                      ? platformLoading ? "正在检查连接并更新账户和模型…" : platformProfileError ? "账户资料暂不可用" : "已连接平台账户"
                       : authState === "required"
                         ? "登录已失效，请重新登录后继续当前画布。"
                         : platformLoading
@@ -11462,29 +13477,26 @@ export default function App({
                       {storageLoading ? "刷新中…" : "刷新"}
                     </button>
                   </div>
-                  <p className="storage-description">当前账户的所有应用共用此容量；下方仅列出 Canvas 生成媒体。删除媒体才会释放容量，从资产库移除只会取消收藏。</p>
+                  <p className="storage-description">用量按当前账户的所有应用汇总；下方仅列出 Canvas 生成媒体。此处容量仅作统计，不会限制新媒体生成或上传。普通 App 资产保留一个月；会员期间创建的资产长期保留，收录到资产库不会延长期限。</p>
                   {storageUsage ? (
                     <>
                       <div className="storage-summary" aria-label="媒体空间使用情况">
                         <strong>{formatBytes(storageAvailableBytes)}</strong>
-                        <span>可用空间</span>
+                        <span>参考余量</span>
                       </div>
                       <div className={`storage-meter${storageUsage.status === "full" ? " is-full" : storageUsage.status === "warning" ? " is-warning" : ""}`} role="progressbar" aria-label="媒体空间使用量" aria-valuemin={0} aria-valuemax={Math.max(storageQuotaBytes, 1)} aria-valuenow={Math.min(storageConsumedBytes, storageQuotaBytes)}>
                         <span style={{ width: `${storagePercent}%` }} />
                       </div>
                       <div className="storage-stats">
                         <span>已使用 <strong>{formatBytes(storageUsedBytes)}</strong></span>
-                        <span>处理中预留 <strong>{formatBytes(storageReservedBytes)}</strong></span>
                         <span>总空间 <strong>{formatBytes(storageQuotaBytes)}</strong></span>
                       </div>
                       <p className={`storage-status storage-status-${storageUsage.status}`} role="status">
-                        {storageUsage.status === "full" ? "空间已用满，暂时无法生成新媒体。" : storageUsage.status === "warning" ? "空间即将用满，建议及时清理或升级。" : "空间充足，可继续生成。"}
+                        {storageUsage.status === "full" ? "当前用量达到显示容量；新媒体仍可生成和上传。" : storageUsage.status === "warning" ? "当前用量接近显示容量；此统计不会限制生成或上传。" : "当前用量低于显示容量；新媒体生成和上传不受此统计限制。"}
                       </p>
                       <div className="panel-action-row">
                         <button className="button" onClick={() => { assetReferenceTarget.current = undefined; setOverlay(null); setDrawer("assets"); setAssetView("library"); }}>打开资产库</button>
-                        {storageUsage.storage_pack_url
-                          ? <button className="button" onClick={() => openStoragePortal("storage")}>购买存储包</button>
-                          : <button className="button" onClick={() => openStoragePortal("subscription")}>查看会员方案</button>}
+                        <button className="button" onClick={openStoragePortal}>查看会员长期保留方案</button>
                       </div>
                     </>
                   ) : <p>{storageActionError
@@ -11494,20 +13506,25 @@ export default function App({
                       : authState === "connected"
                         ? "平台连接就绪后即可读取媒体空间。"
                         : "登录后可查看当前账户的媒体空间。Canvas 生成的图片、视频和音频都会计入此处。"}</p>}
-                  {authState === "connected" && <ApplicationMediaManager key={platformRevision} storageStatus={storageUsage?.status} connected={authState === "connected" && platformReady} onUsageRefresh={() => loadStorage(true)} onNotice={(text, action) => setMessage(text, action)} />}
+                  {authState === "connected" && <ApplicationMediaManager key={platformRevision} connected={authState === "connected" && platformReady} onUsageRefresh={() => loadStorage(true)} onNotice={(text, action) => setMessage(text, action)} />}
                 </div>
                 </section>
                 <section className="save-details">
                   <h3>保存与恢复</h3>
                   <p role="status">{saveStatus}</p>
                   <p>
-                    画布会自动保存；登录后自动同步云端。跨设备使用时，系统会按版本时间自动保留较新的内容。
+                    画布会自动保存并同步。协作修改会自动合并不同节点和字段；同一字段同时修改时，会保留本机副本并提示重新加载。
                   </p>
                   <p>导出的画布包含节点结构和本地图片；网络图片保留原地址。需要长期备份时，请同时下载原图。</p>
                   {recovery && <p>切换或同步前保留的版本可在这里恢复。</p>}
                   <div className="panel-action-row">
-                    <button className="button" onClick={() => void save()}>
-                      立即保存
+                    {currentCloudSyncError && <button className="button" disabled={saveBusy} onClick={() => retryCloudSyncRef.current()}>
+                      {saveBusy ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
+                      <span>{saveBusy ? "正在同步…" : "重试云端同步"}</span>
+                    </button>}
+                    <button className="button" disabled={saveBusy} onClick={() => void save()}>
+                      {saveBusy ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}
+                      <span>{saveBusy ? currentSaveProgress === "cloud" || currentCloudSyncing ? "同步中" : "保存中" : "立即保存"}</span>
                     </button>
                     <button className="button" onClick={exportCanvas}>
                       导出完整画布

@@ -17,7 +17,42 @@ type TaskNode = Omit<Pick<CanvasNode, "type" | "mediaType" | "taskId" | "assetId
 };
 const isVideo = (node: TaskNode) => node.type === "video" || node.mediaType === "video";
 
-export type CanvasTaskState = "idle" | "queued" | "running" | "unknown" | "reconciliation" | "no_task_id" | "failed" | "completed";
+export type CanvasTaskState = "idle" | "queued" | "running" | "unknown" | "reconciliation" | "no_task_id" | "action_required" | "failed" | "completed";
+
+const submissionLookupMissCodes = new Set([
+  "image_submission_not_found",
+  "video_submission_not_found",
+  "music_submission_not_found",
+  "voice_design_submission_not_found",
+]);
+
+/** A lookup miss is unresolved, but automatic recovery has nothing useful to retry. */
+export function isSubmissionLookupMiss(node: Pick<TaskNode, "taskDiagnostic">): boolean {
+  return submissionLookupMissCodes.has(token(node.taskDiagnostic?.code));
+}
+
+/** The explicit retry button is only offered when the frozen request can be replayed intact. */
+export function canRetryMissedSubmission(node: {
+  taskId?: string;
+  taskDiagnostic?: CanvasNode["taskDiagnostic"];
+  submission?: { key?: string };
+  videoSubmission?: { key?: string };
+  musicSubmission?: { key?: string };
+  voiceDesignSubmission?: { key?: string };
+}): boolean {
+  if (node.taskId || !isSubmissionLookupMiss(node)) return false;
+  const code = token(node.taskDiagnostic?.code);
+  if (code === "image_submission_not_found") return Boolean(node.submission?.key);
+  if (code === "video_submission_not_found") return Boolean(node.videoSubmission?.key);
+  if (code === "music_submission_not_found") return Boolean(node.musicSubmission?.key);
+  return Boolean(node.voiceDesignSubmission?.key);
+}
+
+/** Clear only the local lookup-miss marker after the user explicitly starts replaying it. */
+export function submissionRetryStartedDiagnostic(node: Pick<TaskNode, "taskDiagnostic">): CanvasNode["taskDiagnostic"] {
+  if (!isSubmissionLookupMiss(node)) return node.taskDiagnostic;
+  return { ...node.taskDiagnostic, code: undefined, status: "running", phase: "submitting" };
+}
 
 function token(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -51,6 +86,7 @@ export function canvasTaskState(node: TaskNode, active = false): CanvasTaskState
 
   if (status === "completed") return "completed";
   if (lifecycle.isTerminal) return publicState === "succeeded" ? "completed" : "failed";
+  if (isSubmissionLookupMiss(node)) return "action_required";
   if (lifecycle.requiresReconciliation) return unknown ? "unknown" : "reconciliation";
   if (publicState === "failed") return "failed";
   if ((status === "running" || status === "queued" || active) && !node.taskId) return "no_task_id";
@@ -109,17 +145,18 @@ export type VideoTaskControls = {
 
 /**
  * Gate destructive/observer controls on the internal lifecycle, not only the
- * public "生成中" label. An unknown create result may already exist upstream;
- * sending a second cancel or stopping the only observer can leave the durable
- * task unreconciled and invite a duplicate submission.
+ * public "生成中" label. Cancellation is a queue operation: once execution
+ * starts, the platform rejects it with a conflict and does not call upstream.
+ * An unknown create result also stays under reconciliation and never exposes
+ * a destructive control.
  */
 export function videoTaskControls(node: TaskNode, active = false): VideoTaskControls {
   const input = lifecycleInput(node);
   const lifecycle = mediaTaskState(input);
   const publicState = mediaTaskPublicState(input);
   const resultUnknown = !lifecycle.isTerminal && lifecycle.requiresReconciliation;
-  const canControl = isVideo(node) && Boolean(node.taskId) && (publicState === "queued" || publicState === "running") && !lifecycle.isTerminal && !resultUnknown;
-  return { canPause: canControl && active, canCancel: canControl };
+  const canObserve = isVideo(node) && Boolean(node.taskId) && (publicState === "queued" || publicState === "running") && !lifecycle.isTerminal && !resultUnknown;
+  return { canPause: canObserve && active, canCancel: canObserve && publicState === "queued" };
 }
 
 export function isTaskCancelled(node: TaskNode): boolean {
@@ -127,6 +164,7 @@ export function isTaskCancelled(node: TaskNode): boolean {
 }
 
 export function pendingTaskLabel(node: TaskNode, active = false): string {
+  if (isSubmissionLookupMiss(node)) return "需要操作";
   const publicState = mediaTaskPublicState(lifecycleInput(node));
   // Keep a single four-state vocabulary on every Canvas surface. The
   // underlying canvas state still distinguishes unknown/reconciliation for

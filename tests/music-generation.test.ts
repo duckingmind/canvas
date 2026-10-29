@@ -11,7 +11,7 @@ import {
   type MusicRequest,
 } from "../src/music-generation.ts";
 
-test("submission freezes the exact request and keeps the authenticated content URL", async () => {
+test("submission freezes the exact request and returns the signed object-storage URL", async () => {
   const input = {
     model: " minimax-music-3.0 ", prompt: "  warm ambient  ", lyrics: " first line\nsecond line ", audio_base64: "SUQzAA==",
     audio_mode: "song" as const, lyrics_optimizer: false, duration: 31, output_format: "wav", idempotencyKey: "frozen-key",
@@ -24,7 +24,7 @@ test("submission freezes the exact request and keeps the authenticated content U
     requestBody = JSON.parse(String(init?.body));
     return {
       id: "music-task-1", status: "completed", asset_id: "music-asset-1",
-      data: [{ url: "/v1/music/tasks/music-task-1/content", format: "wav" }],
+      data: [{ url: "https://objects.example/music.mp3?signature=temporary", format: "wav" }],
     };
   }, input);
 
@@ -33,37 +33,47 @@ test("submission freezes the exact request and keeps the authenticated content U
     lyrics_optimizer: false, duration: 31, output_format: "wav",
   });
   assert.deepEqual(result, {
-    taskId: "music-task-1", contentUrl: "/v1/music/tasks/music-task-1/content", assetId: "music-asset-1",
+    taskId: "music-task-1", contentUrl: "https://objects.example/music.mp3?signature=temporary", assetId: "music-asset-1",
   });
 });
 
-test("authenticated task content route is used with the current request session", async () => {
+test("music bytes are fetched directly from object storage without a Gateway content request", async () => {
   const audio = new Blob([new Uint8Array([0x49, 0x44, 0x33, 0x04])], { type: "audio/mpeg" });
   const controller = new AbortController();
-  const result = await readMusicContent(async (path, init) => {
-    assert.equal(path, "/music/tasks/music-task-2/content?index=0");
-    assert.equal(init?.responseType, "blob");
-    assert.equal(init?.signal, controller.signal);
-    return audio;
-  }, "music-task-2", { contentUrl: "/v1/music/tasks/music-task-2/content?index=0", signal: controller.signal });
-  assert.equal(result, audio);
+  const signedUrl = "https://objects.example/music-2.mp3?signature=temporary";
+  let fetched = "";
+  const result = await readMusicContent(async () => assert.fail("A valid signed URL must not require a Gateway request"), "music-task-2", {
+    contentUrl: signedUrl,
+    signal: controller.signal,
+    fetchResource: async (url, init) => {
+      fetched = url;
+      assert.equal(init?.credentials, "omit");
+      assert.equal(init?.signal, controller.signal);
+      return new Response(audio);
+    },
+  });
+  assert.equal(result.size, audio.size);
+  assert.equal(fetched, signedUrl);
 });
 
-test("real gateway delivery URLs do not displace authenticated music content", async () => {
+test("task details preserve the Gateway's signed storage URL for direct delivery", async () => {
   const taskId = "gateway-music-task", assetId = "gateway-music-asset";
   const deliveryUrl = "https://objects.example/music.mp3?signature=temporary";
   const result = await generateMusic(async () => ({
     id: taskId, status: "completed", task_status: "succeeded", phase: "completed", asset_status: "ready",
     asset_id: assetId, content_url: deliveryUrl, content_url_expires_at: "2026-10-14T12:00:00Z",
     assets: [{ id: assetId, type: "audio", content_type: "audio/mpeg", url: deliveryUrl, url_expires_at: "2026-10-14T12:00:00Z" }],
-    data: [{ asset_id: assetId, url: `/v1/music/tasks/${taskId}/content`, content_type: "audio/mpeg", content_url: deliveryUrl }],
+    data: [{ asset_id: assetId, url: deliveryUrl, content_type: "audio/mpeg" }],
   }), { model: "minimax-music-3.0", prompt: "summer song" });
-  assert.deepEqual(result, { taskId, assetId, contentUrl: `/v1/music/tasks/${taskId}/content` });
+  assert.deepEqual(result, { taskId, assetId, contentUrl: deliveryUrl, contentUrlExpiresAt: "2026-10-14T12:00:00Z" });
   const audio = new Blob(["ID3audio"], { type: "audio/mpeg" });
-  assert.equal(await readMusicContent(async (path) => {
-    assert.equal(path, `/music/tasks/${taskId}/content`);
-    return audio;
-  }, taskId, { contentUrl: result.contentUrl }), audio);
+  let fetched = "";
+  const downloaded = await readMusicContent(async () => assert.fail("Direct delivery must not call a Gateway byte endpoint"), taskId, {
+    contentUrl: result.contentUrl,
+    fetchResource: async url => { fetched = url; return new Response(audio); },
+  });
+  assert.equal(downloaded.size, audio.size);
+  assert.equal(fetched, deliveryUrl);
 });
 
 test("music task recovery can use its durable route when only delivery URLs remain", async () => {
@@ -73,16 +83,23 @@ test("music task recovery can use its durable route when only delivery URLs rema
     assets: [{ id: "delivery-only-asset", type: "audio", url: "https://objects.example/music.mp3?signature=expired" }],
   }), "delivery-only-task");
   assert.equal(snapshot.assetId, "delivery-only-asset");
-  assert.equal(snapshot.contentUrl, "/music/tasks/delivery-only-task/content");
-  assert.equal(snapshot.contentUrlExpiresAt, undefined);
+  assert.equal(snapshot.contentUrl, "https://objects.example/music.mp3?signature=expired");
 });
 
-test("a task URL cannot redirect authenticated content reads to another task or route", async () => {
-  let calls = 0;
-  await assert.rejects(readMusicContent(async () => { calls += 1; return new Blob(["audio"], { type: "audio/mpeg" }); }, "music-task-3", {
+test("a legacy Gateway content URL is discarded and refreshed from the intended task", async () => {
+  const apiPaths: string[] = [], objectURLs: string[] = [];
+  const audio = new Blob(["audio"], { type: "audio/mpeg" });
+  const signedUrl = "https://objects.example/music-3.mp3?signature=temporary";
+  const downloaded = await readMusicContent(async path => {
+    apiPaths.push(path);
+    return { id: "music-task-3", status: "completed", content_url: signedUrl };
+  }, "music-task-3", {
     contentUrl: "https://gateway.example/v1/music/tasks/other-task/content",
-  }), error => error instanceof MusicGenerationError && error.code === "MUSIC_CONTENT_URL_INVALID");
-  assert.equal(calls, 0);
+    fetchResource: async url => { objectURLs.push(url); return new Response(audio); },
+  });
+  assert.equal(downloaded.size, audio.size);
+  assert.deepEqual(apiPaths, ["/music/tasks/music-task-3"]);
+  assert.deepEqual(objectURLs, [signedUrl]);
 });
 
 test("resume with a durable task id reads it without creating a replacement", async () => {
@@ -94,10 +111,11 @@ test("resume with a durable task id reads it without creating a replacement", as
     reads += 1;
     return reads === 1
       ? { id: "music-task-4", status: "in_progress" }
-      : { id: "music-task-4", status: "completed", data: [{ url: "/v1/music/tasks/music-task-4/content" }] };
+      : { id: "music-task-4", status: "completed", data: [{ url: "https://objects.example/music-task-4.mp3?signature=temporary" }] };
   }, { model: "", prompt: "", taskId: "music-task-4" }, undefined, { intervalMs: 0, delay: async () => {} });
   assert.deepEqual(paths, ["/music/tasks/music-task-4", "/music/tasks/music-task-4"]);
   assert.equal(result.taskId, "music-task-4");
+  assert.equal(result.contentUrl, "https://objects.example/music-task-4.mp3?signature=temporary");
 });
 
 test("a late create response persists its task id before an Abort becomes a resumable pause", async () => {
@@ -214,7 +232,7 @@ test("recovery resolves the original task by idempotency key before replaying", 
   assert.deepEqual(paths, ["/music/by-idempotency-key/frozen-key"]);
   assert.deepEqual(saved, ["recovered-by-key"]);
   assert.deepEqual(result, {
-    taskId: "recovered-by-key", contentUrl: "/music/tasks/recovered-by-key/content", assetId: "asset-by-key",
+    taskId: "recovered-by-key", contentUrl: "", assetId: "asset-by-key",
   });
 });
 
@@ -360,19 +378,34 @@ test("task identity mismatches and unknown states keep the original identity", a
   await assert.rejects(readMusicTask(async () => ({ id: "wrong-task", status: "completed" }), "original-task"), error => error instanceof MusicGenerationError && error.code === "MUSIC_TASK_INVALID_RESPONSE");
 });
 
-test("content reads retry only asset-not-ready and reject a non-audio successful body", async () => {
+test("content reads refresh an expired signed URL and reject a non-audio successful body", async () => {
   const waits: number[] = [];
-  let calls = 0;
+  let detailReads = 0, fetches = 0;
   const blob = new Blob([new Uint8Array([0xff, 0xfb, 0x90, 0x00])], { type: "audio/mpeg" });
-  assert.equal(await readMusicContent(async () => {
-    calls++;
-    if (calls < 3) throw { status: 409, code: "media_asset_not_ready" };
-    return blob;
-  }, "content-task", { delay: async milliseconds => { waits.push(milliseconds); } }), blob);
-  assert.equal(calls, 3);
-  assert.deepEqual(waits, [400, 800]);
+  const refreshedUrl = "https://objects.example/current.mp3?signature=renewed";
+  const result = await readMusicContent(async path => {
+    detailReads++;
+    assert.equal(path, "/music/tasks/content-task");
+    return { id: "content-task", content_url: refreshedUrl };
+  }, "content-task", {
+    contentUrl: "https://objects.example/expired.mp3?signature=old",
+    attempts: 2,
+    delay: async milliseconds => { waits.push(milliseconds); },
+    fetchResource: async url => {
+      fetches++;
+      if (fetches === 1) return new Response("expired", { status: 403 });
+      assert.equal(url, refreshedUrl);
+      return new Response(blob);
+    },
+  });
+  assert.equal(result.size, blob.size);
+  assert.equal(detailReads, 1);
+  assert.equal(fetches, 2);
+  assert.deepEqual(waits, [400]);
   let invalidCalls = 0;
-  await assert.rejects(readMusicContent(async () => { invalidCalls++; return new Blob(["<html>login</html>"], { type: "audio/mpeg" }); }, "content-task"), /不是音频内容/);
+  await assert.rejects(readMusicContent(async () => { invalidCalls++; return { id: "content-task", content_url: "https://objects.example/invalid.mp3?signature=x" }; }, "content-task", {
+    fetchResource: async () => new Response("<html>login</html>", { headers: { "content-type": "audio/mpeg" } }),
+  }), /不是音频内容/);
   assert.equal(invalidCalls, 1);
 });
 
@@ -398,7 +431,7 @@ test("Cover recovery looks up the accepted task without reading local reference 
   const paths: string[] = [];
   const result = await generateMusic(async path => {
     paths.push(path);
-    return { id: "cover-recovered", status: "completed", data: [{ url: "/music/tasks/cover-recovered/content" }] };
+    return { id: "cover-recovered", status: "completed", data: [{ url: "https://objects.example/cover-recovered.mp3?signature=temporary" }] };
   }, { model: "cover", prompt: "frozen", idempotencyKey: "cover-key" }, undefined, {
     recovery: true,
     loadReferenceAudio: async () => assert.fail("Accepted tasks never require the original local file"),
@@ -430,4 +463,16 @@ test("Cover replay reports a missing local file only after explicit task-not-fou
     loadReferenceAudio: async () => { throw new MusicGenerationError("reference missing", { terminalTask: true, code: "MUSIC_REFERENCE_MISSING" }); },
   }), error => error instanceof MusicGenerationError && error.code === "MUSIC_REFERENCE_MISSING" && error.terminalTask);
   assert.deepEqual(calls, ["/music/by-idempotency-key/cover-original"]);
+});
+
+test("automatic recovery never recreates a music task after an idempotency lookup miss", async () => {
+  const paths: string[] = [];
+  await assert.rejects(generateMusic(async path => {
+    paths.push(path);
+    if (path === "/music/by-idempotency-key/auto-music") throw { status: 404, code: "music_task_not_found" };
+    assert.fail(`automatic recovery must not submit to ${path}`);
+  }, { model: "m", prompt: "p", idempotencyKey: "auto-music" }, undefined, {
+    recovery: true, allowResubmit: false,
+  }), error => error instanceof MusicGenerationError && error.pending && !error.terminalTask && error.code === "MUSIC_SUBMISSION_NOT_FOUND");
+  assert.deepEqual(paths, ["/music/by-idempotency-key/auto-music"]);
 });

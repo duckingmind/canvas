@@ -5,7 +5,7 @@ import { mediaTaskPublicState, mediaTaskState, type MediaTaskStateInput } from "
 /** Client for the gateway's asynchronous `/videos` contract. */
 export type VideoRequest = (path: string, init?: { method?: string; body?: BodyInit; headers?: Record<string, string>; responseType?: "blob" | "arrayBuffer" | "json" | "auto"; signal?: AbortSignal }) => Promise<unknown>;
 export type VideoReference = { type: "image_url" | "audio_url" | "video_url"; url: string };
-export type VideoReferenceInput = { type: "image_url" | "audio_url" | "video_url"; url?: string; assetId?: string; mediaType?: "image" | "video" | "audio"; localImage?: string; localVideo?: string; localAudio?: string };
+export type VideoReferenceInput = { type: "image_url" | "audio_url" | "video_url"; url?: string; assetId?: string; mediaType?: "image" | "video" | "audio"; localVideo?: string; localAudio?: string };
 export type VideoGenerationInput = { model: string; prompt: string; images?: string[]; references?: VideoReferenceInput[]; resolveReferences?: (references: VideoReferenceInput[]) => Promise<VideoReference[]>; duration?: number; size?: string; resolution?: string; aspect_ratio?: string; generate_audio?: boolean; taskId?: string; idempotencyKey?: string };
 export type VideoGenerationResult = { taskId: string; contentUrl: string; assetId?: string; contentUrlExpiresAt?: string };
 export type VideoGenerationOptions = {
@@ -18,9 +18,9 @@ export type VideoGenerationOptions = {
   reconciliationIntervalMs?: number;
   onStatus?: (snapshot: VideoTaskSnapshot) => void | Promise<void>;
   /** Frozen submissions are looked up before any replay, including after lost local media. */
-  recovery?: { inputReferencesAvailable: boolean };
+  recovery?: { inputReferencesAvailable: boolean; allowResubmit?: boolean };
 };
-export type VideoContentOptions = { attempts?: number; delay?: (milliseconds: number) => Promise<void> };
+export type VideoContentOptions = { attempts?: number; delay?: (milliseconds: number) => Promise<void>; contentUrl?: string; signal?: AbortSignal; fetchResource?: (url: string, init?: RequestInit) => Promise<Response> };
 type VideoContainer = { mime: string; name: string };
 export type VideoContentDiagnostic = { contentType: string; size: number; container: string; codec: string; signature: string };
 const videoContentDiagnostics = new WeakMap<Blob, VideoContentDiagnostic>();
@@ -96,7 +96,7 @@ function contentFrom(value: unknown, taskId: string): VideoGenerationResult {
   // Prefer delivered object-store URLs even when an older wrapper still sets
   // content_url to the legacy authenticated content proxy.
   const direct = /^https?:\/\//i.test(url) && !/(?:^|\/)videos\/[^/?]+\/content(?:[?#]|$)/.test(url);
-  const contentUrl = direct ? url : string(asset.url) || url || `/videos/${taskId}/content`;
+  const contentUrl = direct ? url : /^https?:\/\//i.test(string(asset.url)) ? string(asset.url) : "";
   const selectedId = assetId || string(asset.id);
   const expires = contentUrl === string(asset.url)
     ? string(asset.url_expires_at) || string(body.content_url_expires_at) || string(task.content_url_expires_at)
@@ -109,6 +109,14 @@ export const isVideoContentNotReady = (value: unknown) => {
   const code = codeFrom(value).toLowerCase();
   const message = messageFrom(value).toLowerCase();
   return code === "media_asset_not_ready" || /media asset is not ready|asset not ready|content is not ready/.test(message);
+};
+const retryableVideoContentFailure = (value: unknown) => {
+  if (isVideoContentNotReady(value)) return true;
+  const status = statusCode(value);
+  // A signed URL can expire between task completion and the browser read. A
+  // bounded retry refreshes task metadata and obtains the current URL, while
+  // permanent authorization or malformed-content errors surface immediately.
+  return status === 403 || status === 404 || status === 408 || status === 425 || status === 429 || status >= 500 || value instanceof TypeError;
 };
 
 function inspectVideoContainer(bytes: Uint8Array): VideoContainer | null {
@@ -171,7 +179,7 @@ export function videoContentDiagnostic(blob: Blob): string | undefined {
   return `接口成功 · ${value.contentType} · ${size} · ${value.container} · ${value.codec}${signature}`;
 }
 
-/** Shared validation for proxy compatibility reads and direct object-store downloads. */
+/** Validate bytes downloaded directly from object storage before handing them to the decoder. */
 export async function validateVideoContentBlob(value: Blob): Promise<Blob> {
   if (typeof Blob === "undefined" || !(value instanceof Blob) || value.size === 0) throw new Error("视频内容为空或不可用");
   return (await inspectVideoBlob(value)).blob;
@@ -249,30 +257,33 @@ export async function readVideoTaskByIdempotencyKey(request: VideoRequest, key: 
   return taskSnapshot(value, taskId);
 }
 
-/** Fetch completed video bytes for a player. Generation deliberately never downloads bytes. */
+/** Fetch completed video bytes directly from the signed object-storage URL. */
 export async function readVideoContent(request: VideoRequest, taskId: string, options: VideoContentOptions = {}): Promise<Blob> {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(taskId)) throw new Error("视频任务 ID 无效");
   const attempts = Math.max(1, Math.min(8, Math.floor(options.attempts ?? 8)));
   const delay = options.delay || ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  const fetchResource = options.fetchResource || fetch;
+  let deliveryURL = /^https?:\/\//i.test(options.contentUrl || "") ? options.contentUrl! : "";
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (options.signal?.aborted) throw options.signal.reason || new DOMException("The operation was aborted.", "AbortError");
     if (attempt > 0) await delay(Math.min(3000, 500 * attempt));
     try {
-      const value = await request(`/videos/${taskId}/content`, { responseType: "blob" });
+      if (!deliveryURL || attempt > 0) deliveryURL = (await readVideoTask(request, taskId)).contentUrl;
+      if (!/^https?:\/\//i.test(deliveryURL)) throw new Error("视频任务没有可用的对象存储地址");
+      const response = await fetchResource(deliveryURL, { credentials: "omit", signal: options.signal });
+      if (!response.ok) throw Object.assign(new Error(`video object download failed (${response.status})`), { status: response.status });
       // Some providers omit or mislabel the MIME type. Detect common containers
       // from a bounded prefix before handing bytes to the browser decoder.
-      return await validateVideoContentBlob(value as Blob);
+      return await validateVideoContentBlob(await response.blob());
     } catch (error) {
       lastError = error;
-      // The task can be completed before the object store/CDN is readable.
-      // Retry this explicit consistency window, while surfacing auth, access,
-      // and permanent task errors immediately.
-      if (!isVideoContentNotReady(error) || attempt === attempts - 1) throw error;
+      if (options.signal?.aborted || attempt === attempts - 1 || !retryableVideoContentFailure(error)) throw error;
     }
   }
   throw lastError instanceof Error ? lastError : new Error("视频内容为空或不可用");
 }
-/** Request cancellation. The key makes retries of DELETE idempotent. */
+/** Request cancellation for a queued task. The key makes retries of DELETE idempotent. */
 export async function cancelVideo(request: VideoRequest, taskId: string, idempotencyKey?: string): Promise<VideoTaskSnapshot> {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(taskId)) throw new VideoGenerationError("视频任务 ID 无效", { code: "VIDEO_TASK_INVALID_ID" });
   return taskSnapshot(await request(`/videos/${taskId}`, { method: "DELETE", headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined }), taskId);
@@ -350,6 +361,10 @@ export async function generateVideo(request: VideoRequest, input: VideoGeneratio
       // concurrent original POST could still settle after this read. Keep the
       // frozen identity in the canvas so every later retry checks it again.
       throw new VideoGenerationError("参考图片缺失，请恢复原图片后重试。", { code: "VIDEO_SUBMISSION_INPUT_MISSING" });
+    } else if (options.recovery.allowResubmit === false) {
+      throw new VideoGenerationError("原视频提交暂未查到，已停止自动重提，请稍后重试。", {
+        pending: true, code: "VIDEO_SUBMISSION_NOT_FOUND",
+      });
     }
   }
   if (!taskId) {

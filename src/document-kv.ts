@@ -21,11 +21,39 @@ export type CloudStorage = {
 };
 export type CloudCanvasDocument = Record<string, unknown> & { id: string };
 export const DOCUMENT_PREFIX = "canvas:doc:v1:";
+export const DOCUMENT_SYNC_PREFIX = "canvas:sync:v1:";
+
+export type CanvasSyncMarker = {
+  version: 1;
+  documentUpdatedAt: string;
+  syncId: string;
+};
 
 export function canvasStorageKey(id: string): string {
   if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(id) || id.includes(".."))
     throw new Error("画布 ID 无效，无法访问云端存储。");
   return `${DOCUMENT_PREFIX}${id}`;
+}
+
+export function canvasSyncMarkerKey(id: string): string {
+  canvasStorageKey(id);
+  return `${DOCUMENT_SYNC_PREFIX}${id}`;
+}
+
+export function syncMarkerFromValue(value: unknown, id: string): CanvasSyncMarker {
+  canvasSyncMarkerKey(id);
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error(`云端画布 ${id} 的同步标记格式无效。`);
+  const marker = value as Partial<CanvasSyncMarker>;
+  if (marker.version !== 1 || typeof marker.documentUpdatedAt !== "string" ||
+    typeof marker.syncId !== "string" || !marker.syncId) {
+    throw new Error(`云端画布 ${id} 的同步标记格式无效。`);
+  }
+  return {
+    version: 1,
+    documentUpdatedAt: marker.documentUpdatedAt,
+    syncId: marker.syncId,
+  };
 }
 
 export function documentFromValue(value: unknown, id: string): CloudCanvasDocument {
